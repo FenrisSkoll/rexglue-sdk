@@ -16,6 +16,12 @@
 
 namespace rex::diagnostics {
 
+enum class FaultWalkMode : uint8_t {
+  Off,
+  DispatchOnly,
+  Full,
+};
+
 enum class FaultWalkPolicy : uint8_t {
   Normal,
   ReturnR3Zero,
@@ -33,11 +39,27 @@ struct FaultWalkFunctionDescriptor {
 };
 
 struct FaultWalkStats {
+  FaultWalkMode mode;
   uint32_t unique_faults;
   uint32_t poisoned_functions;
   uint64_t total_fault_hits;
   uint64_t total_suppressed_invocations;
 };
+
+/**
+ * Activates one explicit diagnostic mode for this process.
+ *
+ * DispatchOnly intercepts only invalid/unregistered FunctionDispatcher
+ * targets. It does not wrap generated guest functions and therefore cannot
+ * recover host faults. Full additionally enables the generated-function
+ * boundary, complete PPCContext checkpoints, nested attribution, and the
+ * conservative Windows SEH allowlist.
+ *
+ * Mode changes may only preserve or increase diagnostic coverage. In
+ * particular, a process cannot silently return to Off after activation.
+ */
+void InitializeFaultWalk(FaultWalkMode mode);
+FaultWalkMode GetFaultWalkMode();
 
 struct FaultWalkFunctionStats {
   bool found;
@@ -58,8 +80,9 @@ void FaultWalkInvoke(PPCContext& ctx, uint8_t* base, const FaultWalkFunctionDesc
 
 /**
  * Handles the specific invalid/unregistered indirect-dispatch fatal while an
- * enabled fault-walk process is active. Returns false in normal builds and for
- * an explicit NORMAL policy so the caller preserves the original REX_FATAL.
+ * DispatchOnly or Full fault-walk process is active. Returns false in normal
+ * builds and for an explicit NORMAL policy so the caller preserves the
+ * original REX_FATAL.
  */
 bool FaultWalkHandleInvalidFunction(PPCContext& ctx);
 

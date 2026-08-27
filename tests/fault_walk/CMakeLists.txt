@@ -30,3 +30,16 @@ set_tests_properties(fault_walk.synthetic_disabled PROPERTIES
     LABELS "fault_walk;synthetic"
     TIMEOUT 30
 )
+
+add_executable(fault_walk_dispatch
+    fault_walk_dispatch_test.cpp
+)
+target_link_libraries(fault_walk_dispatch PRIVATE rexruntime)
+set_target_properties(fault_walk_dispatch PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>
+)
+add_test(NAME fault_walk.dispatch_only COMMAND fault_walk_dispatch)
+set_tests_properties(fault_walk.dispatch_only PROPERTIES
+    LABELS "fault_walk;synthetic"
+    TIMEOUT 30
+)

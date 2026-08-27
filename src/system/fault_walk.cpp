@@ -75,7 +75,6 @@ struct CapturedException {
   uintptr_t fault_address = 0;
   uintptr_t host_exception_address = 0;
   uintptr_t host_module_base = 0;
-  PPCContext context{};
 };
 
 struct ThreadFrame {
@@ -127,7 +126,8 @@ struct FaultRecord {
 };
 
 struct ProcessState {
-  std::atomic<bool> active{false};
+  std::atomic<FaultWalkMode> mode{FaultWalkMode::Off};
+  std::atomic<uint32_t> generated_fault_records{0};
   std::mutex mutex;
   Configuration config;
   std::once_flag initialize_once;
@@ -157,6 +157,18 @@ const char* PolicyName(FaultWalkPolicy policy) {
       return "STOP";
   }
   return "STOP";
+}
+
+const char* ModeName(FaultWalkMode mode) {
+  switch (mode) {
+    case FaultWalkMode::Off:
+      return "OFF";
+    case FaultWalkMode::DispatchOnly:
+      return "DISPATCH_ONLY";
+    case FaultWalkMode::Full:
+      return "FULL";
+  }
+  return "OFF";
 }
 
 const char* AccessTypeName(AccessType access_type) {
@@ -263,17 +275,6 @@ uint64_t CurrentThreadIdValue() {
 #endif
 }
 
-bool IsReportMilestone(uint64_t count) {
-  if (count <= 10) {
-    return true;
-  }
-  uint64_t value = count;
-  while (value > 1 && value % 10 == 0) {
-    value /= 10;
-  }
-  return value == 1;
-}
-
 void WriteReportLocked(const ProcessState& state) {
   std::ofstream report(state.config.report_path, std::ios::out | std::ios::trunc);
   if (!report) {
@@ -286,10 +287,17 @@ void WriteReportLocked(const ProcessState& state) {
     poisoned_count += fault.poisoned ? 1u : 0u;
   }
 
+  const FaultWalkMode mode = state.mode.load(std::memory_order_relaxed);
+  const char* warning =
+      mode == FaultWalkMode::Full
+          ? "PPCContext only was restored; guest memory writes before a suppressed fault remain "
+            "visible"
+          : "Invalid target bodies were not executed; synthetic returns can alter later guest "
+            "state";
   report << "{\n"
          << "  \"fault_walk\": true,\n"
-         << "  \"warning\": \"PPCContext only was restored; guest memory writes before a "
-            "suppressed fault remain visible\",\n"
+         << "  \"mode\": \"" << ModeName(mode) << "\",\n"
+         << "  \"warning\": \"" << warning << "\",\n"
          << "  \"unique_faults\": " << state.faults.size() << ",\n"
          << "  \"poisoned_functions\": " << poisoned_count << ",\n"
          << "  \"total_fault_hits\": " << state.total_fault_hits << ",\n"
@@ -412,7 +420,7 @@ void AtExitReport() {
   PrintSummaryLocked(state);
 }
 
-void InitializeState() {
+void InitializeConfiguration() {
   auto& state = GetProcessState();
   std::call_once(state.initialize_once, [&state]() {
     const uint64_t max_unique =
@@ -427,19 +435,10 @@ void InitializeState() {
         report_path && !report_path->empty()) {
       state.config.report_path = *report_path;
     }
+    state.faults.reserve(state.config.max_unique);
+    state.fault_indices.reserve(state.config.max_unique);
     std::atexit(AtExitReport);
-    REXLOG_CRITICAL("[FWT] EXPERIMENTAL FAULT WALKING IS ENABLED");
-    REXLOG_CRITICAL(
-        "[FWT] WARNING: Fault-walk execution restores PPCContext only. Guest memory writes "
-        "performed before a suppressed fault remain visible.");
-    REXLOG_CRITICAL("[FWT] Later discovered faults may therefore be secondary/corruption-induced.");
-    REXLOG_CRITICAL(
-        "[FWT] guardrails: max_unique={} max_total_suppressions={} "
-        "max_function_suppressions={} report='{}'",
-        state.config.max_unique, state.config.max_total_suppressions,
-        state.config.max_function_suppressions, state.config.report_path);
   });
-  state.active.store(true, std::memory_order_release);
 }
 
 ThreadFrame* GetThreadFrame(FrameToken token) {
@@ -518,23 +517,33 @@ void ApplyPolicy(PPCContext& ctx, FaultWalkPolicy policy) {
   std::abort();
 }
 
-bool TrySuppressPoisonedInvocation(PPCContext& ctx, const FaultWalkFunctionDescriptor& descriptor) {
+enum class InvocationDisposition : uint8_t {
+  ExecuteWrapped,
+  ExecuteNormal,
+  Suppressed,
+};
+
+InvocationDisposition PrepareGeneratedInvocation(PPCContext& ctx,
+                                                 const FaultWalkFunctionDescriptor& descriptor) {
   auto& state = GetProcessState();
+  if (state.generated_fault_records.load(std::memory_order_acquire) == 0) {
+    return InvocationDisposition::ExecuteWrapped;
+  }
+
   FaultWalkPolicy policy = FaultWalkPolicy::Normal;
   uint64_t function_suppressions = 0;
   uint64_t total_suppressions = 0;
-  bool write_report = false;
 
   {
     std::lock_guard lock(state.mutex);
     const auto index_it = state.fault_indices.find(descriptor.guest_address);
     if (index_it == state.fault_indices.end()) {
-      return false;
+      return InvocationDisposition::ExecuteWrapped;
     }
     auto& fault = state.faults[index_it->second];
     policy = fault.policy;
     if (!fault.poisoned || policy == FaultWalkPolicy::Normal) {
-      return false;
+      return InvocationDisposition::ExecuteNormal;
     }
     if (policy == FaultWalkPolicy::Stop) {
       // Report outside the locked region.
@@ -542,10 +551,6 @@ bool TrySuppressPoisonedInvocation(PPCContext& ctx, const FaultWalkFunctionDescr
       function_suppressions = ++fault.suppressed_invocations;
       total_suppressions = ++state.total_suppressed_invocations;
       state.summary_printed = false;
-      write_report = IsReportMilestone(function_suppressions);
-      if (write_report) {
-        WriteReportLocked(state);
-      }
     }
   }
 
@@ -562,17 +567,7 @@ bool TrySuppressPoisonedInvocation(PPCContext& ctx, const FaultWalkFunctionDescr
   }
 
   ApplyPolicy(ctx, policy);
-  return true;
-}
-
-bool HasExplicitNormalPolicy(const FaultWalkFunctionDescriptor& descriptor) {
-  auto& state = GetProcessState();
-  std::lock_guard lock(state.mutex);
-  const auto index_it = state.fault_indices.find(descriptor.guest_address);
-  if (index_it == state.fault_indices.end()) {
-    return false;
-  }
-  return state.faults[index_it->second].policy == FaultWalkPolicy::Normal;
+  return InvocationDisposition::Suppressed;
 }
 
 #if REX_PLATFORM_WIN32
@@ -637,9 +632,6 @@ int FaultWalkExceptionFilter(FrameToken token, uint32_t code, void* exception_po
   frame->exception.fault_address = fault_address;
   frame->exception.host_exception_address = reinterpret_cast<uintptr_t>(record->ExceptionAddress);
   frame->exception.host_module_base = reinterpret_cast<uintptr_t>(body_module);
-  // Capture fault-time guest registers before the handler restores the entry
-  // checkpoint. The checkpoint itself remains a complete byte-for-byte copy.
-  std::memcpy(&frame->exception.context, &frame->checkpoint, sizeof(PPCContext));
   return EXCEPTION_EXECUTE_HANDLER;
 }
 #endif
@@ -653,8 +645,6 @@ void HandleFault(FrameToken token, PPCContext& ctx) {
   // The context may have been partially mutated by the body. Capture it now,
   // then restore every field represented by PPCContext. Guest memory is not
   // restored and remains a known source of secondary observations.
-  std::memcpy(&frame->exception.context, &ctx, sizeof(PPCContext));
-
   auto& state = GetProcessState();
   FaultRecord record_for_log;
   bool new_fault = false;
@@ -681,8 +671,8 @@ void HandleFault(FrameToken token, PPCContext& ctx) {
           token.depth > 0 && tls_frames.storage[token.depth - 1].descriptor
               ? tls_frames.storage[token.depth - 1].descriptor->guest_address
               : 0;
-      record.last_indirect_target = frame->exception.context.last_indirect_target;
-      std::memcpy(&record.fault_context, &frame->exception.context, sizeof(PPCContext));
+      record.last_indirect_target = ctx.last_indirect_target;
+      std::memcpy(&record.fault_context, &ctx, sizeof(PPCContext));
       record.fault_hits = 1;
       record.poisoned = state.faults.size() < state.config.max_unique;
       record.policy = record.poisoned ? FaultWalkPolicy::ReturnR3Zero : FaultWalkPolicy::Stop;
@@ -701,6 +691,7 @@ void HandleFault(FrameToken token, PPCContext& ctx) {
       stop_after_record = !record.poisoned;
       state.fault_indices.emplace(record.guest_address, state.faults.size());
       state.faults.push_back(std::move(record));
+      state.generated_fault_records.fetch_add(1, std::memory_order_release);
       new_fault = true;
     } else {
       auto& record = state.faults[index_it->second];
@@ -712,7 +703,6 @@ void HandleFault(FrameToken token, PPCContext& ctx) {
     if (new_fault) {
       record_for_log = state.faults.back();
     }
-    WriteReportLocked(state);
   }
 
   if (new_fault) {
@@ -748,10 +738,6 @@ void HandleFault(FrameToken token, PPCContext& ctx) {
                     record_for_log.poisoned ? "function poisoned" : "function NOT poisoned");
     REXLOG_CRITICAL(
         "[FWT] WARNING: PPCContext only was restored; guest memory writes were not rolled back");
-  } else if (IsReportMilestone(record_for_log.fault_hits)) {
-    REXLOG_WARN("[FWT] repeated fault guest=0x{:08X} fingerprint={} hits={}",
-                record_for_log.guest_address, record_for_log.fingerprint,
-                record_for_log.fault_hits);
   }
 
   if (stop_after_record) {
@@ -768,13 +754,64 @@ void HandleFault(FrameToken token, PPCContext& ctx) {
 
 }  // namespace
 
-void FaultWalkInvoke(PPCContext& ctx, uint8_t* base,
-                     const FaultWalkFunctionDescriptor& descriptor) {
-  InitializeState();
-  if (TrySuppressPoisonedInvocation(ctx, descriptor)) {
+void InitializeFaultWalk(FaultWalkMode requested_mode) {
+  if (requested_mode == FaultWalkMode::Off) {
     return;
   }
-  if (HasExplicitNormalPolicy(descriptor)) {
+
+  auto& state = GetProcessState();
+  FaultWalkMode current_mode = state.mode.load(std::memory_order_acquire);
+  if (static_cast<uint8_t>(current_mode) >= static_cast<uint8_t>(requested_mode)) {
+    return;
+  }
+
+  // FaultWalkInvoke reaches this function at every generated boundary in FULL
+  // builds. Keep the already-initialized path to one atomic load; entering the
+  // call_once machinery for every guest function is measurable hot-path work.
+  InitializeConfiguration();
+  current_mode = state.mode.load(std::memory_order_acquire);
+  while (static_cast<uint8_t>(current_mode) < static_cast<uint8_t>(requested_mode) &&
+         !state.mode.compare_exchange_weak(current_mode, requested_mode, std::memory_order_acq_rel,
+                                           std::memory_order_acquire)) {}
+  if (static_cast<uint8_t>(current_mode) >= static_cast<uint8_t>(requested_mode)) {
+    return;
+  }
+
+  REXLOG_CRITICAL("[FWT] EXPERIMENTAL FAULT WALKING IS ENABLED mode={}", ModeName(requested_mode));
+  if (requested_mode == FaultWalkMode::Full) {
+    REXLOG_CRITICAL(
+        "[FWT] FULL mode: generated boundaries, {}-byte PPCContext checkpoints, and the "
+        "allowlisted Windows SEH recovery path are enabled",
+        sizeof(PPCContext));
+    REXLOG_CRITICAL(
+        "[FWT] WARNING: Fault-walk execution restores PPCContext only. Guest memory writes "
+        "performed before a suppressed host fault remain visible.");
+  } else {
+    REXLOG_CRITICAL(
+        "[FWT] DISPATCH_ONLY mode: generated boundaries and host-fault recovery are disabled");
+  }
+  REXLOG_CRITICAL(
+      "[FWT] Synthetic invalid-target returns can corrupt later guest state; later discoveries "
+      "may therefore be secondary.");
+  REXLOG_CRITICAL(
+      "[FWT] guardrails: max_unique={} max_total_suppressions={} "
+      "max_function_suppressions={} report='{}'",
+      state.config.max_unique, state.config.max_total_suppressions,
+      state.config.max_function_suppressions, state.config.report_path);
+}
+
+FaultWalkMode GetFaultWalkMode() {
+  return GetProcessState().mode.load(std::memory_order_acquire);
+}
+
+void FaultWalkInvoke(PPCContext& ctx, uint8_t* base,
+                     const FaultWalkFunctionDescriptor& descriptor) {
+  InitializeFaultWalk(FaultWalkMode::Full);
+  const InvocationDisposition disposition = PrepareGeneratedInvocation(ctx, descriptor);
+  if (disposition == InvocationDisposition::Suppressed) {
+    return;
+  }
+  if (disposition == InvocationDisposition::ExecuteNormal) {
     // NORMAL is an explicit request for unmodified execution. In particular,
     // another exception propagates normally rather than being restored and
     // returned without a synthetic result.
@@ -812,21 +849,17 @@ void FaultWalkInvoke(PPCContext& ctx, uint8_t* base,
 
 bool FaultWalkHandleInvalidFunction(PPCContext& ctx) {
   auto& state = GetProcessState();
-  if (!state.active.load(std::memory_order_acquire)) {
+  if (state.mode.load(std::memory_order_acquire) == FaultWalkMode::Off) {
     return false;
   }
 
   const uint32_t target = ctx.last_indirect_target;
   const uint32_t guest_lr = static_cast<uint32_t>(ctx.lr);
-  const std::string original_fatal = fmt::format(
-      "Call to invalid or unregistered function: target=0x{:08X}, ctx.lr=0x{:08X}, "
-      "probable caller=0x{:08X}, ctx.ctr=0x{:08X}",
-      target, guest_lr, guest_lr - 4, ctx.ctr.u32);
 
   FaultRecord record_for_log;
+  FaultWalkPolicy policy = FaultWalkPolicy::Normal;
   bool new_fault = false;
   bool stop_after_record = false;
-  bool write_report = false;
   uint64_t function_suppressions = 0;
   uint64_t total_suppressions = 0;
   {
@@ -848,7 +881,10 @@ bool FaultWalkHandleInvalidFunction(PPCContext& ctx) {
       record.poisoned = state.faults.size() < state.config.max_unique;
       record.policy = record.poisoned ? FaultWalkPolicy::ReturnR3Zero : FaultWalkPolicy::Stop;
       record.fingerprint = fmt::format("INVALID_UNREGISTERED_FUNCTION-{:08X}", target);
-      record.original_fatal = original_fatal;
+      record.original_fatal = fmt::format(
+          "Call to invalid or unregistered function: target=0x{:08X}, ctx.lr=0x{:08X}, "
+          "probable caller=0x{:08X}, ctx.ctr=0x{:08X}",
+          target, guest_lr, guest_lr - 4, ctx.ctr.u32);
       const uint32_t first_stack_index =
           tls_frames.depth > kMaxReportedGuestStack
               ? tls_frames.depth - static_cast<uint32_t>(kMaxReportedGuestStack)
@@ -864,24 +900,19 @@ bool FaultWalkHandleInvalidFunction(PPCContext& ctx) {
       ++state.total_fault_hits;
       state.summary_printed = false;
       record_for_log = state.faults.back();
+      policy = record_for_log.policy;
       new_fault = true;
-      WriteReportLocked(state);
     } else {
       auto& record = state.faults[index_it->second];
       if (record.kind != FaultKind::InvalidUnregisteredFunction ||
           record.policy == FaultWalkPolicy::Normal) {
         return false;
       }
-      record_for_log = record;
+      policy = record.policy;
       if (record.policy != FaultWalkPolicy::Stop) {
         function_suppressions = ++record.suppressed_invocations;
         total_suppressions = ++state.total_suppressed_invocations;
         state.summary_printed = false;
-        record_for_log = record;
-        write_report = IsReportMilestone(function_suppressions);
-        if (write_report) {
-          WriteReportLocked(state);
-        }
       }
     }
   }
@@ -889,7 +920,7 @@ bool FaultWalkHandleInvalidFunction(PPCContext& ctx) {
   if (new_fault) {
     REXLOG_CRITICAL("[FWT] #{:03}", record_for_log.sequence);
     REXLOG_CRITICAL("[FWT] event=INVALID_UNREGISTERED_FUNCTION target=0x{:08X}", target);
-    REXLOG_CRITICAL("[FWT] original_fatal={}", original_fatal);
+    REXLOG_CRITICAL("[FWT] original_fatal={}", record_for_log.original_fatal);
     REXLOG_CRITICAL("[FWT] lr=0x{:08X} caller=0x{:08X} ctr=0x{:08X}", guest_lr, guest_lr - 4,
                     ctx.ctr.u32);
     REXLOG_CRITICAL("[FWT] r1=0x{:016X} r2=0x{:016X} r3=0x{:016X}", ctx.r1.u64, ctx.r2.u64,
@@ -903,8 +934,6 @@ bool FaultWalkHandleInvalidFunction(PPCContext& ctx) {
                     record_for_log.last_indirect_target);
     REXLOG_CRITICAL("[FWT] policy={}", PolicyName(record_for_log.policy));
     REXLOG_CRITICAL("[FWT] target poisoned; no target body executed");
-  } else if (write_report) {
-    REXLOG_WARN("[FWT] suppressed invalid target=0x{:08X} count={}", target, function_suppressions);
   }
 
   if (stop_after_record) {
@@ -913,7 +942,7 @@ bool FaultWalkHandleInvalidFunction(PPCContext& ctx) {
                     "0x{:08X}",
                     state.config.max_unique, target));
   }
-  if (record_for_log.policy == FaultWalkPolicy::Stop) {
+  if (policy == FaultWalkPolicy::Stop) {
     StopAtGuardrail(fmt::format("policy STOP reached for invalid target 0x{:08X}", target));
   }
   if (function_suppressions >= state.config.max_function_suppressions) {
@@ -926,12 +955,11 @@ bool FaultWalkHandleInvalidFunction(PPCContext& ctx) {
     StopAtGuardrail(fmt::format("total suppression limit reached ({})", total_suppressions));
   }
 
-  ApplyPolicy(ctx, record_for_log.policy);
+  ApplyPolicy(ctx, policy);
   return true;
 }
 
 FaultWalkStats GetFaultWalkStats() {
-  InitializeState();
   auto& state = GetProcessState();
   std::lock_guard lock(state.mutex);
   uint32_t poisoned_count = 0;
@@ -939,6 +967,7 @@ FaultWalkStats GetFaultWalkStats() {
     poisoned_count += fault.poisoned ? 1u : 0u;
   }
   return {
+      .mode = state.mode.load(std::memory_order_relaxed),
       .unique_faults = static_cast<uint32_t>(state.faults.size()),
       .poisoned_functions = poisoned_count,
       .total_fault_hits = state.total_fault_hits,
@@ -947,7 +976,6 @@ FaultWalkStats GetFaultWalkStats() {
 }
 
 FaultWalkFunctionStats GetFaultWalkFunctionStats(uint32_t guest_address) {
-  InitializeState();
   auto& state = GetProcessState();
   std::lock_guard lock(state.mutex);
   const auto it = state.fault_indices.find(guest_address);
@@ -965,7 +993,6 @@ FaultWalkFunctionStats GetFaultWalkFunctionStats(uint32_t guest_address) {
 }
 
 bool SetFaultWalkPolicy(uint32_t guest_address, FaultWalkPolicy policy) {
-  InitializeState();
   auto& state = GetProcessState();
   std::lock_guard lock(state.mutex);
   const auto it = state.fault_indices.find(guest_address);
@@ -981,14 +1008,12 @@ bool SetFaultWalkPolicy(uint32_t guest_address, FaultWalkPolicy policy) {
 }
 
 void WriteFaultWalkReport() {
-  InitializeState();
   auto& state = GetProcessState();
   std::lock_guard lock(state.mutex);
   WriteReportLocked(state);
 }
 
 void PrintFaultWalkSummary() {
-  InitializeState();
   auto& state = GetProcessState();
   std::lock_guard lock(state.mutex);
   PrintSummaryLocked(state);
@@ -1019,7 +1044,7 @@ int FaultWalkCompleteSetJmp(uint32_t guest_buffer_address, int setjmp_result) {
 }
 
 void ResetFaultWalkStateForTesting() {
-  InitializeState();
+  InitializeConfiguration();
   auto& state = GetProcessState();
   {
     std::lock_guard lock(state.mutex);
@@ -1027,8 +1052,8 @@ void ResetFaultWalkStateForTesting() {
     state.fault_indices.clear();
     state.total_fault_hits = 0;
     state.total_suppressed_invocations = 0;
+    state.generated_fault_records.store(0, std::memory_order_release);
     state.summary_printed = false;
-    WriteReportLocked(state);
   }
   tls_frames.depth = 0;
   tls_frames.setjmp_depths.clear();
