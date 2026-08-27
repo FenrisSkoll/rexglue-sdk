@@ -367,7 +367,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     }
 
     emit_println(out, "// STUB: Function at 0x{:08X} has no discovered code blocks", base());
-    emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
+    emit_println(out, "DEFINE_REX_FUNC({}, 0x{:08X}, false) {{", name, base());
     emit_println(out, "\tREX_FUNC_PROLOGUE();");
     emit_println(out, "}}\n");
     return out;
@@ -381,6 +381,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       REXCODEGEN_TRACE("Function 0x{:08X} has {} SEH scopes", base(), sehInfo->scopes.size());
     }
   }
+  const bool generateSeh =
+      sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers;
 
   // --- First pass: collect labels from all blocks ---
   std::unordered_set<size_t> labels;
@@ -479,7 +481,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   }
 
   // Function signature with weak/alias pattern
-  emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
+  emit_println(out, "DEFINE_REX_FUNC({}, 0x{:08X}, {}) {{", name, base(), generateSeh);
   emit_println(out, "\tREX_FUNC_PROLOGUE();");
 
   // --- Second pass: emit instruction code ---
@@ -604,7 +606,6 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   }
 
   // --- Close function body (or SEH try block) ---
-  bool generateSeh = sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers;
   if (generateSeh) {
     emit_println(body, "\t\t}} SEH_CATCH_ALL {{");
     emit_println(body, "\t\t\tREXLOG_WARN(\"SEH exception caught in sub_{:08X}\");", base());
