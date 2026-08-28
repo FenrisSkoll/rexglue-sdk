@@ -111,7 +111,8 @@ uint32_t GetFaultWalkThreadDepthForTesting();
 // wrapped; a title-provided strong hook continues to override the weak alias.
 #define REX_DEFINE_FAULT_WALK_FUNC(name, guest_address, has_guest_seh)                            \
   static REX_FUNC(__rex_fault_walk_body_##name);                                                  \
-  __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name);                                    \
+  __attribute__((alias("__imp__" #name)))                                                        \
+  __attribute__((weak, noinline)) extern "C" REX_FUNC(name);                                     \
   REX_EXTERN(__imp__##name) {                                                                     \
     static constexpr ::rex::diagnostics::FaultWalkFunctionDescriptor __rex_fault_walk_descriptor{ \
         static_cast<uint32_t>(guest_address), #name,           __FILE__,                          \

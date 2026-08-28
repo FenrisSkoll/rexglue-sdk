@@ -52,8 +52,9 @@ bool guest_longjmp_depth_correct = false;
 #define DEFINE_TEST_REX_FUNC(name, guest_address, has_guest_seh) \
   REX_DEFINE_FAULT_WALK_FUNC(name, guest_address, has_guest_seh)
 #else
-#define DEFINE_TEST_REX_FUNC(name, guest_address, has_guest_seh) \
-  __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name);   \
+#define DEFINE_TEST_REX_FUNC(name, guest_address, has_guest_seh)  \
+  __attribute__((alias("__imp__" #name)))                        \
+  __attribute__((weak, noinline)) extern "C" REX_FUNC(name);     \
   REX_EXTERN(__imp__##name)
 #endif
 
