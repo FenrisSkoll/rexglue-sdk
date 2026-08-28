@@ -85,10 +85,10 @@ target_link_libraries(rexruntime
         spdlog::spdlog
         tomlplusplus
         SDL3::SDL3
+        xxHash::xxhash
     PRIVATE
         aes128
         mspack
-        xxHash::xxhash
 )
 
 if(REXGLUE_ENABLE_TRACY)
