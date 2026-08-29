@@ -128,6 +128,10 @@ class FunctionGraph {
   // Add a jump table to a function
   void addJumpTableToFunction(uint32_t entry, JumpTable jt);
 
+  // Attach the complete indirect-site classification produced during discovery.
+  void setJumpTableRecoveryForFunction(uint32_t entry, std::vector<IndirectSiteAnalysis> sites,
+                                       std::vector<Block> preliminaryBlocks);
+
   // Add an unresolved jump to a function
   // isCall: true for bl (call), false for b (tail call)
   void addUnresolvedJumpToFunction(uint32_t entry, uint32_t site, uint32_t target, bool isCall,

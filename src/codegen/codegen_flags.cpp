@@ -81,6 +81,21 @@ REXCVAR_DEFINE_UINT32(max_jump_table_entries, 512, "Codegen",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)
     .range(1, 100000);
 
+REXCVAR_DEFINE_UINT32(jump_table_max_predecessors, 64, "Codegen",
+                      "Max CFG predecessors explored per jump-table reaching definition")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly)
+    .range(1, 100000);
+
+REXCVAR_DEFINE_UINT32(jump_table_max_states, 512, "Codegen",
+                      "Max local dataflow/CFG states explored per indirect site")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly)
+    .range(8, 1000000);
+
+REXCVAR_DEFINE_UINT32(jump_table_fixpoint_iterations, 8, "Codegen",
+                      "Max case-edge expansion iterations per function")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly)
+    .range(1, 1000);
+
 REXCVAR_DEFINE_UINT32(max_blocks_per_function, 10000, "Codegen",
                       "Safety limit on blocks per function")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)

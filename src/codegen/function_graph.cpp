@@ -146,22 +146,20 @@ void FunctionNode::addBlock(Block block) {
 }
 
 bool FunctionNode::containsAddress(uint32_t addr) const {
-  // First check overall bounds
-  if (addr < base_ || addr >= base_ + size_) {
-    return false;
-  }
-
-  // If no blocks defined, use linear range
-  if (blocks_.empty()) {
-    return true;
-  }
-
-  // Check individual blocks
+  // Exact owned fragments take precedence over the min/max extent. A switch
+  // case can be emitted before the callable entry point.
   for (const auto& block : blocks_) {
     if (block.contains(addr)) {
       return true;
     }
   }
+
+  if (addr < base_ || addr >= base_ + size_)
+    return false;
+
+  // If no blocks are available yet, use the registered linear range.
+  if (blocks_.empty())
+    return true;
 
   // For CONFIG and PDATA functions, trust the declared size even if blocks don't cover it
   // This handles out-of-line switch cases where compiler places code after epilogue
@@ -190,6 +188,12 @@ void FunctionNode::addJumpTable(JumpTable jt) {
     labels_.insert(target);
   }
   jumpTables_.push_back(std::move(jt));
+}
+
+void FunctionNode::setJumpTableRecovery(std::vector<IndirectSiteAnalysis> sites,
+                                        std::vector<Block> preliminaryBlocks) {
+  indirectSites_ = std::move(sites);
+  jumpTablePreliminaryBlocks_ = std::move(preliminaryBlocks);
 }
 
 void FunctionNode::addUnresolvedJump(uint32_t site, uint32_t target, bool isCall,
@@ -490,9 +494,6 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   CSRState csrState = CSRState::Unknown;
   RecompilerLocalVariables localVariables;
 
-  // Local map for late-detected jump tables (can't mutate const config)
-  std::unordered_map<uint32_t, JumpTable> lateJumpTables;
-
   std::string body;
   body.reserve(4096);
 
@@ -522,10 +523,11 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       if (stIt != ctx.config.switchTables.end()) {
         activeJt = &stIt->second;
       } else {
-        auto lateIt = lateJumpTables.find(blockBase);
-        if (lateIt != lateJumpTables.end()) {
-          activeJt = &lateIt->second;
-        }
+        auto analyzedIt = std::find_if(
+            jumpTables().begin(), jumpTables().end(),
+            [blockBase](const JumpTable& table) { return table.bctrAddress == blockBase; });
+        if (analyzedIt != jumpTables().end())
+          activeJt = &*analyzedIt;
       }
 
       Disassemble(data, 4, blockBase, insn);
@@ -535,43 +537,6 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         if (*data != 0)
           REXCODEGEN_WARN("Unable to decode instruction {:X} at {:X}", *data, blockBase);
       } else {
-        // Late jump table detection for bctr
-        if (insn.opcode->id == PPC_INST_BCTR && !activeJt) {
-          bool is_switch_pattern = false;
-          constexpr uint32_t MTCTR_MASK = 0xFC1FFFFF;
-          constexpr uint32_t MTCTR_OPCODE = 0x7C0003A6;
-          constexpr uint32_t NOP = 0x60000000;
-
-          for (int i = 1; i <= 3 && !is_switch_pattern; i++) {
-            uint32_t prev_insn = load_and_swap<uint32_t>(data - i);
-            if ((prev_insn & MTCTR_MASK) == MTCTR_OPCODE) {
-              is_switch_pattern = true;
-              for (int j = 1; j < i; j++) {
-                if (load_and_swap<uint32_t>(data - j) != NOP) {
-                  is_switch_pattern = false;
-                  break;
-                }
-              }
-            } else if (prev_insn != NOP) {
-              break;
-            }
-          }
-
-          if (is_switch_pattern) {
-            FunctionScanner scanner(ctx.binary);
-            auto jt_opt = scanner.detect_jump_table(blockBase);
-            if (jt_opt.has_value()) {
-              lateJumpTables.emplace(blockBase, std::move(*jt_opt));
-              activeJt = &lateJumpTables.at(blockBase);
-              for (auto label : activeJt->targets) {
-                labels.emplace(label);
-              }
-              REXCODEGEN_TRACE("Late-detected jump table at 0x{:08X} with {} entries", blockBase,
-                               activeJt->targets.size());
-            }
-          }
-        }
-
         // Emit comment with instruction disassembly
         emit_println(body, "\t// {} {}", insn.opcode->name, insn.op_str);
 
@@ -926,6 +891,14 @@ void FunctionGraph::addTailCallToFunction(uint32_t entry, uint32_t site, CallTar
 void FunctionGraph::addJumpTableToFunction(uint32_t entry, JumpTable jt) {
   if (auto* node = getFunction(entry)) {
     node->addJumpTable(std::move(jt));
+  }
+}
+
+void FunctionGraph::setJumpTableRecoveryForFunction(
+    uint32_t entry, std::vector<IndirectSiteAnalysis> sites,
+    std::vector<Block> preliminaryBlocks) {
+  if (auto* node = getFunction(entry)) {
+    node->setJumpTableRecovery(std::move(sites), std::move(preliminaryBlocks));
   }
 }
 

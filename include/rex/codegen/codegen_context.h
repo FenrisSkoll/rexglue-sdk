@@ -71,6 +71,12 @@ struct AnalysisState {
   std::unordered_set<uint32_t> knownIndirectCalls;             ///< bctr addresses
   std::vector<uint32_t> exceptionHandlerFuncs;                 ///< Handler addresses
   std::vector<uint32_t> ehDiscoveredFuncs;                     ///< EH-discovered function addresses
+
+  // Production jump-table pass measurements and safety status. The detailed,
+  // per-site evidence is owned by FunctionNode so codegen and report-only
+  // consumers see the same decisions.
+  JumpTableRecoveryStats jumpTableRecovery;
+  JumpTableRecoveryLimits jumpTableLimits;
 };
 
 /**

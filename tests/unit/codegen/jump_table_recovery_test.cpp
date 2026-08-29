@@ -7,6 +7,7 @@
 
 #include <rex/codegen/binary_view.h>
 #include <rex/codegen/jump_table_recovery.h>
+#include <rex/codegen/function_scanner.h>
 
 #include "codegen/decoded_binary.h"
 
@@ -342,4 +343,25 @@ TEST_CASE("jump-table recovery reports an analysis safety limit", "[codegen][jum
   auto analysis = Analyze(image, kTextBase + 0x18, nullptr, limits);
   CHECK_FALSE(analysis.selectedTable);
   CHECK(HasFailure(analysis, JumpTableFailure::AnalysisLimit));
+}
+
+TEST_CASE("block discovery expands recovered switch cases before final boundaries",
+          "[codegen][jump-table][integration]") {
+  AbsoluteSwitch image;
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+  const std::unordered_set<uint32_t> functions{kTextBase};
+
+  auto result = discoverBlocks(decoded, kTextBase, *region, functions, 0x1C);
+  REQUIRE(result.jumpTables.size() == 1);
+  CHECK(result.jumpTableRecovery.fixpointIterations == 2);
+  CHECK(result.jumpTableRecovery.recoveredTables == 1);
+  CHECK(result.labels.contains(kTextBase + 0x40));
+  CHECK(result.labels.contains(kTextBase + 0x50));
+  CHECK(result.labels.contains(kTextBase + 0x60));
+  CHECK(std::any_of(result.blocks.begin(), result.blocks.end(),
+                    [](const Block& block) { return block.contains(kTextBase + 0x60); }));
 }

@@ -221,8 +221,12 @@ struct UnresolvedBranch {
 
 struct BlockDiscoveryResult {
   std::vector<Block> blocks;
+  std::vector<Block> preliminaryBlocks;
   std::vector<UnresolvedBranch> unresolvedBranches;
   std::vector<JumpTable> jumpTables;
+  std::vector<IndirectSiteAnalysis> indirectSites;
+  JumpTableRecoveryLimits jumpTableLimits;
+  JumpTableRecoveryStats jumpTableRecovery;
   std::set<uint32_t> labels;
 
   // Collected instruction pointers (for FunctionNode ownership)

@@ -103,9 +103,24 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
     return;
   }
 
+  graph.setJumpTableRecoveryForFunction(funcAddr, std::move(result.indirectSites),
+                                        std::move(result.preliminaryBlocks));
+
   // snooper the function with the discovered blocks and instructions
   node->discover(std::move(result.blocks), std::move(result.instructions),
                  std::move(result.labels));
+  auto& recovery = ctx.analysisState().jumpTableRecovery;
+  ctx.analysisState().jumpTableLimits = result.jumpTableLimits;
+  recovery.elapsedMicroseconds += result.jumpTableRecovery.elapsedMicroseconds;
+  recovery.decodedInstructions += result.jumpTableRecovery.decodedInstructions;
+  recovery.fixpointIterations =
+      std::max(recovery.fixpointIterations, result.jumpTableRecovery.fixpointIterations);
+  recovery.indirectSites += result.jumpTableRecovery.indirectSites;
+  recovery.recoveredTables += result.jumpTableRecovery.recoveredTables;
+  recovery.manualTables += result.jumpTableRecovery.manualTables;
+  recovery.unresolvedSites += result.jumpTableRecovery.unresolvedSites;
+  recovery.analysisLimitHit =
+      recovery.analysisLimitHit || result.jumpTableRecovery.analysisLimitHit;
 
   // Add jump tables (targets become labels in the function)
   for (const auto& jt : result.jumpTables) {

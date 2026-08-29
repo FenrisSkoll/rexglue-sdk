@@ -24,6 +24,7 @@
 #include <rex/codegen/binary_view.h>
 #include <rex/codegen/codegen_context.h>
 #include <rex/codegen/function_scanner.h>
+#include <rex/codegen/jump_table_recovery.h>
 #include <rex/logging.h>
 
 #include "codegen_logging.h"
@@ -1812,13 +1813,14 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
 // Block Discovery
 //=============================================================================
 
-BlockDiscoveryResult discoverBlocks(
+static BlockDiscoveryResult discoverBlocksPass(
     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize,
-    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables) {
+    const std::unordered_map<uint32_t, JumpTable>* activeSwitchTables) {
   BlockDiscoveryResult result;
   std::unordered_set<uint32_t> visited;
   std::unordered_set<uint32_t> blockStarts;
+  std::unordered_set<uint32_t> outOfLineBlockStarts;
   std::queue<uint32_t> worklist;
 
   // Function extent - use pdataSize when available
@@ -1843,7 +1845,8 @@ BlockDiscoveryResult discoverBlocks(
 
     if (visited.contains(blockStart))
       continue;
-    if (!isWithinFunction(blockStart))
+    const bool outOfLineBlock = outOfLineBlockStarts.contains(blockStart);
+    if (!isWithinFunction(blockStart) && !outOfLineBlock)
       continue;
 
     // Linear scan until terminator
@@ -1852,7 +1855,9 @@ BlockDiscoveryResult discoverBlocks(
     block.base = blockStart;
     block.size = 0;
 
-    while (isWithinFunction(addr)) {
+    while (isWithinFunction(addr) ||
+           (outOfLineBlock && containingRegion.contains(addr) &&
+            (addr == blockStart || !knownFunctions.contains(addr)))) {
       auto* insn = decoded.get(addr);
       if (!insn) {
         REXCODEGEN_TRACE("discoverBlocks: 0x{:08X} no instruction at addr, breaking", entryPoint);
@@ -1873,7 +1878,7 @@ BlockDiscoveryResult discoverBlocks(
         // Uses funcEnd (from pdataSize or region) defined at top of function
         auto isInternalTarget = [&](uint32_t t) -> bool {
           // Must be within function bounds
-          if (t < entryPoint || t >= funcEnd) {
+          if (!isWithinFunction(t) && !(outOfLineBlock && containingRegion.contains(t))) {
             return false;
           }
           // Must not be a known function entry (except our own entry point)
@@ -1916,26 +1921,21 @@ BlockDiscoveryResult discoverBlocks(
           }
           // Do not break: continue scanning the fall-through path.
         } else if (insn->opcode == rex::codegen::ppc::Opcode::bcctr) {
-          // Unconditional bctr - prefer a manually configured table, then try
-          // automatic detection. Manual tables are authoritative because they
-          // are commonly needed when the compiler emits a table without an
-          // adjacent bounds check.
+          // Unconditional bctr. The outer discovery fixpoint supplies only
+          // manual tables or tables already validated by the recovery pass.
           REXCODEGEN_TRACE("discoverBlocks: bctr at 0x{:08X} in func 0x{:08X}, funcEnd=0x{:08X}",
                            addr, entryPoint, funcEnd);
           std::optional<JumpTable> jt;
           bool jtIsManual = false;
-          if (manualSwitchTables) {
-            auto manualIt = manualSwitchTables->find(addr);
-            if (manualIt != manualSwitchTables->end()) {
+          if (activeSwitchTables) {
+            auto manualIt = activeSwitchTables->find(addr);
+            if (manualIt != activeSwitchTables->end()) {
               jt = manualIt->second;
-              jtIsManual = true;
+              jtIsManual = jt->origin == JumpTableOrigin::Manual;
               REXCODEGEN_TRACE(
-                  "discoverBlocks: using manual jump table at bctr 0x{:08X} with {} targets", addr,
-                  jt->targets.size());
+                  "discoverBlocks: using {} jump table at bctr 0x{:08X} with {} targets",
+                  JumpTableOriginName(jt->origin), addr, jt->targets.size());
             }
-          }
-          if (!jt) {
-            jt = detectJumpTable(decoded, addr, containingRegion, entryPoint, funcEnd);
           }
           if (jt) {
             REXCODEGEN_TRACE("discoverBlocks: detected jump table at bctr 0x{:08X} with {} targets",
@@ -1974,6 +1974,8 @@ BlockDiscoveryResult discoverBlocks(
               if (t >= funcEnd && t < containingRegion.end) {
                 funcEnd = t + 4;  // Extend to include this target
               }
+              if (!isWithinFunction(t))
+                outOfLineBlockStarts.insert(t);
               result.labels.insert(t);
               if (!visited.contains(t) && !blockStarts.contains(t)) {
                 blockStarts.insert(t);
@@ -2064,6 +2066,118 @@ BlockDiscoveryResult discoverBlocks(
   REXCODEGEN_TRACE("discoverBlocks: entry=0x{:08X} blocks={} instructions={} labels={}", entryPoint,
                    result.blocks.size(), result.instructions.size(), result.labels.size());
 
+  return result;
+}
+
+BlockDiscoveryResult discoverBlocks(
+    DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
+    const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize,
+    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables) {
+  std::unordered_map<uint32_t, JumpTable> selectedTables;
+  if (manualSwitchTables) {
+    for (const auto& [site, configured] : *manualSwitchTables) {
+      JumpTable manual = configured;
+      manual.origin = JumpTableOrigin::Manual;
+      manual.bctrAddress = site;
+      selectedTables.emplace(site, std::move(manual));
+    }
+  }
+
+  JumpTableRecoveryStats aggregate;
+  BlockDiscoveryResult result;
+  std::vector<Block> preliminaryBlocks;
+  JumpTableRecoveryLimits limits;
+  limits.maxBackwardInstructions = REXCVAR_GET(backward_scan_limit);
+  limits.maxEntries = REXCVAR_GET(max_jump_table_entries);
+  limits.maxPredecessors = REXCVAR_GET(jump_table_max_predecessors);
+  limits.maxStates = REXCVAR_GET(jump_table_max_states);
+  limits.maxFixpointIterations = REXCVAR_GET(jump_table_fixpoint_iterations);
+
+  for (uint32_t iteration = 1; iteration <= limits.maxFixpointIterations; ++iteration) {
+    result = discoverBlocksPass(decoded, entryPoint, containingRegion, knownFunctions, pdataSize,
+                                selectedTables.empty() ? nullptr : &selectedTables);
+    if (iteration == 1)
+      preliminaryBlocks = result.blocks;
+
+    std::vector<uint32_t> sites;
+    for (const auto* instruction : result.instructions) {
+      if (instruction && instruction->is_indirect_branch())
+        sites.push_back(instruction->address);
+    }
+    std::sort(sites.begin(), sites.end());
+    sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
+
+    std::vector<IndirectSiteAnalysis> analyses;
+    std::unordered_map<uint32_t, JumpTable> nextTables = selectedTables;
+    JumpTableRecoveryStats iterationStats;
+    bool changed = false;
+
+    for (uint32_t site : sites) {
+      const JumpTable* manual = nullptr;
+      if (manualSwitchTables) {
+        auto manualIt = manualSwitchTables->find(site);
+        if (manualIt != manualSwitchTables->end())
+          manual = &manualIt->second;
+      }
+      JumpTableRecoveryInput input;
+      input.site = site;
+      input.ownerAddress = entryPoint;
+      input.preliminaryBlocks = result.blocks;
+      input.containingRegion = &containingRegion;
+      input.independentlyCallableEntries = &knownFunctions;
+      input.manualTable = manual;
+      input.limits = limits;
+      auto analysis = AnalyzeIndirectSite(decoded, input, &iterationStats);
+      if (analysis.selectedTable) {
+        auto existing = selectedTables.find(site);
+        if (existing == selectedTables.end() ||
+            existing->second.targets != analysis.selectedTable->targets ||
+            existing->second.tableAddress != analysis.selectedTable->tableAddress) {
+          changed = true;
+        }
+        nextTables[site] = *analysis.selectedTable;
+      }
+      analyses.push_back(std::move(analysis));
+    }
+
+    aggregate.elapsedMicroseconds += iterationStats.elapsedMicroseconds;
+    aggregate.decodedInstructions += iterationStats.decodedInstructions;
+    aggregate.analysisLimitHit = aggregate.analysisLimitHit || iterationStats.analysisLimitHit;
+    aggregate.fixpointIterations = iteration;
+    result.indirectSites = std::move(analyses);
+    selectedTables = std::move(nextTables);
+
+    if (!changed) {
+      aggregate.indirectSites = static_cast<uint32_t>(result.indirectSites.size());
+      aggregate.recoveredTables = static_cast<uint32_t>(std::count_if(
+          result.indirectSites.begin(), result.indirectSites.end(),
+          [](const auto& site) { return site.automaticTable.has_value(); }));
+      aggregate.manualTables = static_cast<uint32_t>(std::count_if(
+          result.indirectSites.begin(), result.indirectSites.end(), [](const auto& site) {
+            return site.selectedTable && site.selectedTable->origin == JumpTableOrigin::Manual;
+          }));
+      aggregate.unresolvedSites = static_cast<uint32_t>(std::count_if(
+          result.indirectSites.begin(), result.indirectSites.end(),
+          [](const auto& site) {
+            return site.usesCtr && !site.link && !site.selectedTable.has_value();
+          }));
+      result.jumpTableRecovery = aggregate;
+      result.jumpTableLimits = limits;
+      result.preliminaryBlocks = std::move(preliminaryBlocks);
+      return result;
+    }
+  }
+
+  aggregate.analysisLimitHit = true;
+  result.jumpTableRecovery = aggregate;
+  result.jumpTableLimits = limits;
+  result.preliminaryBlocks = std::move(preliminaryBlocks);
+  for (auto& site : result.indirectSites) {
+    if (std::find(site.failures.begin(), site.failures.end(), JumpTableFailure::AnalysisLimit) ==
+        site.failures.end()) {
+      site.failures.push_back(JumpTableFailure::AnalysisLimit);
+    }
+  }
   return result;
 }
 
