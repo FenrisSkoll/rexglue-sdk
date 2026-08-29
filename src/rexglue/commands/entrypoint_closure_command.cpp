@@ -259,9 +259,9 @@ Result<ProvenanceConfig> LoadProvenance(const fs::path& path) {
         fmt::format("Unable to parse provenance '{}': {}", path.string(), error.what()));
   }
   const uint32_t schemaVersion = root.value("schema_version", 0);
-  if (schemaVersion != 1 && schemaVersion != 2) {
+  if (schemaVersion != 1 && schemaVersion != 2 && schemaVersion != 3) {
     return Err<ProvenanceConfig>(rex::ErrorCategory::Config,
-                                 "Unsupported provenance schema_version (expected 1 or 2)");
+                                 "Unsupported provenance schema_version (expected 1, 2 or 3)");
   }
 
   const auto& identity = root.value("expected_image_identity", Json::object());
