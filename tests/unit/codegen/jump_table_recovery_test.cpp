@@ -28,8 +28,7 @@ void StoreBe32(std::vector<uint8_t>& bytes, uint32_t offset, uint32_t value) {
 
 uint32_t Bc(uint32_t site, uint32_t target, uint8_t bo, uint8_t bi) {
   const int32_t displacement = static_cast<int32_t>(target - site);
-  return 0x40000000u | (static_cast<uint32_t>(bo) << 21) |
-         (static_cast<uint32_t>(bi) << 16) |
+  return 0x40000000u | (static_cast<uint32_t>(bo) << 21) | (static_cast<uint32_t>(bi) << 16) |
          (static_cast<uint32_t>(displacement) & 0x0000FFFCu);
 }
 
@@ -39,57 +38,62 @@ uint32_t B(uint32_t site, uint32_t target) {
 }
 
 uint32_t Rlwinm(uint8_t ra, uint8_t rs, uint8_t sh, uint8_t mb, uint8_t me) {
-  return 0x54000000u | (static_cast<uint32_t>(rs) << 21) |
-         (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(sh) << 11) |
-         (static_cast<uint32_t>(mb) << 6) | (static_cast<uint32_t>(me) << 1);
+  return 0x54000000u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint32_t>(sh) << 11) | (static_cast<uint32_t>(mb) << 6) |
+         (static_cast<uint32_t>(me) << 1);
+}
+
+uint32_t Srawi(uint8_t ra, uint8_t rs, uint8_t sh) {
+  return 0x7C000670u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint32_t>(sh) << 11);
 }
 
 uint32_t Lwzx(uint8_t rt, uint8_t ra, uint8_t rb) {
-  return 0x7C00002Eu | (static_cast<uint32_t>(rt) << 21) |
-         (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(rb) << 11);
+  return 0x7C00002Eu | (static_cast<uint32_t>(rt) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint32_t>(rb) << 11);
 }
 
 uint32_t Lbzx(uint8_t rt, uint8_t ra, uint8_t rb) {
-  return 0x7C0000AEu | (static_cast<uint32_t>(rt) << 21) |
-         (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(rb) << 11);
+  return 0x7C0000AEu | (static_cast<uint32_t>(rt) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint32_t>(rb) << 11);
 }
 
 uint32_t Lhzx(uint8_t rt, uint8_t ra, uint8_t rb) {
-  return 0x7C00022Eu | (static_cast<uint32_t>(rt) << 21) |
-         (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(rb) << 11);
+  return 0x7C00022Eu | (static_cast<uint32_t>(rt) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint32_t>(rb) << 11);
 }
 
 uint32_t Ldx(uint8_t rt, uint8_t ra, uint8_t rb) {
-  return 0x7C00002Au | (static_cast<uint32_t>(rt) << 21) |
-         (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(rb) << 11);
+  return 0x7C00002Au | (static_cast<uint32_t>(rt) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint32_t>(rb) << 11);
 }
 
 uint32_t Add(uint8_t rt, uint8_t ra, uint8_t rb) {
-  return 0x7C000214u | (static_cast<uint32_t>(rt) << 21) |
-         (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(rb) << 11);
+  return 0x7C000214u | (static_cast<uint32_t>(rt) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint32_t>(rb) << 11);
 }
 
 uint32_t Extsb(uint8_t ra, uint8_t rs) {
-  return 0x7C000774u | (static_cast<uint32_t>(rs) << 21) |
-         (static_cast<uint32_t>(ra) << 16);
+  return 0x7C000774u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16);
 }
 
 uint32_t Extsh(uint8_t ra, uint8_t rs) {
-  return 0x7C000734u | (static_cast<uint32_t>(rs) << 21) |
-         (static_cast<uint32_t>(ra) << 16);
+  return 0x7C000734u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16);
 }
 
 uint32_t Mr(uint8_t ra, uint8_t rs) {
-  return 0x7C000378u | (static_cast<uint32_t>(rs) << 21) |
-         (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(rs) << 11);
+  return 0x7C000378u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint32_t>(rs) << 11);
 }
 
 uint32_t Bclr(uint8_t bo, uint8_t bi, bool link = false) {
-  return 0x4C000020u | (static_cast<uint32_t>(bo) << 21) |
-         (static_cast<uint32_t>(bi) << 16) | (link ? 1u : 0u);
+  return 0x4C000020u | (static_cast<uint32_t>(bo) << 21) | (static_cast<uint32_t>(bi) << 16) |
+         (link ? 1u : 0u);
 }
 
-uint32_t Mtctr(uint8_t rs) { return 0x7C0903A6u | (static_cast<uint32_t>(rs) << 21); }
+uint32_t Mtctr(uint8_t rs) {
+  return 0x7C0903A6u | (static_cast<uint32_t>(rs) << 21);
+}
 
 struct AbsoluteSwitch {
   std::vector<uint8_t> text = std::vector<uint8_t>(0x100, 0);
@@ -99,10 +103,10 @@ struct AbsoluteSwitch {
     for (uint32_t offset = 0; offset < text.size(); offset += 4)
       StoreBe32(text, offset, 0x60000000);  // nop, keep one executable region
 
-    StoreBe32(text, 0x00, 0x28030002);  // cmplwi r3, 2
+    StoreBe32(text, 0x00, 0x28030002);                                  // cmplwi r3, 2
     StoreBe32(text, 0x04, Bc(kTextBase + 4, kTextBase + 0x30, 12, 1));  // bgt default
-    StoreBe32(text, 0x08, 0x3C802000);  // lis r4, 0x2000
-    StoreBe32(text, 0x0C, Rlwinm(3, 3, 2, 0, 29));  // slwi r3, r3, 2
+    StoreBe32(text, 0x08, 0x3C802000);                                  // lis r4, 0x2000
+    StoreBe32(text, 0x0C, Rlwinm(3, 3, 2, 0, 29));                      // slwi r3, r3, 2
     StoreBe32(text, 0x10, Lwzx(5, 4, 3));
     StoreBe32(text, 0x14, Mtctr(5));
     StoreBe32(text, 0x18, 0x4E800420);  // bctr
@@ -122,10 +126,8 @@ struct AbsoluteSwitch {
                            .data = text,
                            .executable = true,
                            .readable = true},
-        BinarySectionInput{.name = ".rdata",
-                           .baseAddress = kTableBase,
-                           .data = table,
-                           .readable = true},
+        BinarySectionInput{
+            .name = ".rdata", .baseAddress = kTableBase, .data = table, .readable = true},
     };
     return BinaryView::fromSections(kTextBase, 0x10000100, kTextBase, sections);
   }
@@ -201,10 +203,8 @@ struct RelativeSwitch {
                            .data = text,
                            .executable = true,
                            .readable = true},
-        BinarySectionInput{.name = ".rdata",
-                           .baseAddress = kTableBase,
-                           .data = table,
-                           .readable = true},
+        BinarySectionInput{
+            .name = ".rdata", .baseAddress = kTableBase, .data = table, .readable = true},
     };
     return BinaryView::fromSections(kTextBase, 0x10000100, kTextBase, sections);
   }
@@ -255,8 +255,7 @@ TEST_CASE("jump-table recovery validates a bounded absolute Xenon switch",
   CHECK(analysis.selectedTable->defaultTarget == kTextBase + 0x30);
   CHECK(analysis.selectedTable->targets ==
         std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
-  CHECK(analysis.selectedTable->manualComparison ==
-        JumpTableManualComparison::NewAutomaticTable);
+  CHECK(analysis.selectedTable->manualComparison == JumpTableManualComparison::NewAutomaticTable);
   REQUIRE_FALSE(analysis.evidence.empty());
   CHECK(analysis.evidence.front().rawInstruction == 0x4E800420);
 }
@@ -281,8 +280,7 @@ TEST_CASE("manual jump tables remain authoritative and are compared with automat
   REQUIRE(analysis.automaticTable);
   REQUIRE(analysis.selectedTable);
   CHECK(analysis.selectedTable->origin == JumpTableOrigin::Manual);
-  CHECK(analysis.selectedTable->manualComparison ==
-        JumpTableManualComparison::ExactEquivalent);
+  CHECK(analysis.selectedTable->manualComparison == JumpTableManualComparison::ExactEquivalent);
 }
 
 TEST_CASE("manual comparison distinguishes bounds, target order and set containment",
@@ -305,8 +303,7 @@ TEST_CASE("manual comparison distinguishes bounds, target order and set containm
   CHECK(Analyze(image, kTextBase + 0x18, &manual).selectedTable->manualComparison ==
         JumpTableManualComparison::AutomaticSuperset);
 
-  manual.targets = {kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60,
-                    kTextBase + 0x70};
+  manual.targets = {kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60, kTextBase + 0x70};
   CHECK(Analyze(image, kTextBase + 0x18, &manual).selectedTable->manualComparison ==
         JumpTableManualComparison::AutomaticSubset);
 }
@@ -428,6 +425,41 @@ TEST_CASE("jump-table recovery matches equivalent index reloads by memory lineag
   CHECK(analysis.selectedTable->targets.size() == 3);
 }
 
+TEST_CASE("jump-table recovery preserves a bounded index defined by srawi",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 12, 2));
+  StoreBe32(image.text, 0x04, 0x38600000);  // li r3, 0
+  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
+  StoreBe32(image.text, 0x0C, 0x38600020);  // li r3, 32
+  StoreBe32(image.text, 0x10, Srawi(3, 3, 4));
+  StoreBe32(image.text, 0x14, 0x28030002);  // cmplwi r3, 2
+  StoreBe32(image.text, 0x18, Bc(kTextBase + 0x18, kTextBase + 0x50, 12, 1));
+  StoreBe32(image.text, 0x1C, Mr(7, 3));
+  StoreBe32(image.text, 0x20, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x24, Rlwinm(7, 7, 2, 0, 29));
+  StoreBe32(image.text, 0x28, Lwzx(5, 4, 7));
+  StoreBe32(image.text, 0x2C, Mtctr(5));
+  StoreBe32(image.text, 0x30, 0x60000000);  // nop
+  StoreBe32(image.text, 0x34, 0x4E800420);  // bctr
+  StoreBe32(image.text, 0x50, B(kTextBase + 0x50, kTextBase + 0x10));
+
+  JumpTableRecoveryLimits limits;
+  limits.maxStates = 16;
+  auto analysis = Analyze(image, kTextBase + 0x34, nullptr, limits);
+  REQUIRE(analysis.selectedTable);
+  CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AnalysisLimit));
+  CHECK(analysis.selectedTable->caseCount == 3);
+  CHECK(analysis.selectedTable->tableAddress == kTableBase);
+  CHECK(analysis.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
+  CHECK(std::any_of(analysis.selectedTable->evidence.begin(),
+                    analysis.selectedTable->evidence.end(), [](const auto& evidence) {
+                      return evidence.address == kTextBase + 0x10 &&
+                             evidence.role == "reaching_definition";
+                    }));
+}
+
 TEST_CASE("jump-table recovery reports ambiguous CFG reaching definitions",
           "[codegen][jump-table]") {
   AbsoluteSwitch image;
@@ -458,8 +490,7 @@ TEST_CASE("jump-table recovery decodes signed byte relative offsets and scaling"
         std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
 }
 
-TEST_CASE("jump-table recovery folds a nested lis/addi relative anchor",
-          "[codegen][jump-table]") {
+TEST_CASE("jump-table recovery folds a nested lis/addi relative anchor", "[codegen][jump-table]") {
   RelativeSwitch image;
   StoreBe32(image.text, 0x04, Bc(kTextBase + 4, kTextBase + 0x38, 12, 1));
   StoreBe32(image.text, 0x1C, 0x3CC01000);  // lis r6, anchor@ha
@@ -479,8 +510,7 @@ TEST_CASE("jump-table recovery folds a nested lis/addi relative anchor",
         std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
 }
 
-TEST_CASE("jump-table recovery decodes signed halfword relative offsets",
-          "[codegen][jump-table]") {
+TEST_CASE("jump-table recovery decodes signed halfword relative offsets", "[codegen][jump-table]") {
   RelativeSwitch image(true);
   auto analysis = Analyze(image);
   REQUIRE(analysis.selectedTable);
@@ -502,8 +532,7 @@ TEST_CASE("jump-table recovery accepts compare plus conditional-return default",
   CHECK(analysis.selectedTable->defaultTarget == 0);
 }
 
-TEST_CASE("jump-table recovery evaluates two-level relative tables",
-          "[codegen][jump-table]") {
+TEST_CASE("jump-table recovery evaluates two-level relative tables", "[codegen][jump-table]") {
   RelativeSwitch image;
   StoreBe32(image.text, 0x08, 0x3C802000);
   StoreBe32(image.text, 0x0C, 0x60840000);
@@ -533,8 +562,7 @@ TEST_CASE("jump-table recovery evaluates two-level relative tables",
         std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
 }
 
-TEST_CASE("jump-table recovery accepts inline executable table storage",
-          "[codegen][jump-table]") {
+TEST_CASE("jump-table recovery accepts inline executable table storage", "[codegen][jump-table]") {
   AbsoluteSwitch image;
   std::vector<uint8_t> text(0x140);
   for (uint32_t offset = 0; offset < text.size(); offset += 4)
@@ -589,8 +617,7 @@ TEST_CASE("jump-table recovery preserves overlapping and shared table storage",
   const Block secondBlock{kTextBase + 0x80, 0x34};
   JumpTableRecoveryInput input{.site = kTextBase + 0x9C,
                                .ownerAddress = kTextBase + 0x80,
-                               .preliminaryBlocks =
-                                   std::span<const Block>(&secondBlock, 1),
+                               .preliminaryBlocks = std::span<const Block>(&secondBlock, 1),
                                .containingRegion = decoded.regionContaining(kTextBase + 0x80),
                                .limits = {}};
   auto second = AnalyzeIndirectSite(decoded, input);
@@ -599,8 +626,7 @@ TEST_CASE("jump-table recovery preserves overlapping and shared table storage",
   CHECK(first.selectedTable->tableAddress == kTableBase);
   CHECK(second.selectedTable->tableAddress == kTableBase + 4);
   CHECK(first.selectedTable->storageEnd > second.selectedTable->tableAddress);
-  CHECK(second.selectedTable->targets ==
-        std::vector<uint32_t>{kTextBase + 0x50, kTextBase + 0x60});
+  CHECK(second.selectedTable->targets == std::vector<uint32_t>{kTextBase + 0x50, kTextBase + 0x60});
 }
 
 TEST_CASE("jump-table recovery reports an analysis safety limit", "[codegen][jump-table]") {

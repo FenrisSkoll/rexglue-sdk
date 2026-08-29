@@ -40,6 +40,7 @@ enum class ExprKind : uint8_t {
   Unknown,
   Constant,
   InputRegister,
+  SymbolicDefinition,
   Add,
   ShiftLeft,
   Load,
@@ -59,7 +60,9 @@ struct Expr {
   ExprPtr rhs;
 };
 
-ExprPtr MakeUnknown() { return std::make_shared<Expr>(); }
+ExprPtr MakeUnknown() {
+  return std::make_shared<Expr>();
+}
 
 ExprPtr MakeConstant(uint32_t value) {
   auto expression = std::make_shared<Expr>();
@@ -72,6 +75,13 @@ ExprPtr MakeInputRegister(uint8_t reg) {
   auto expression = std::make_shared<Expr>();
   expression->kind = ExprKind::InputRegister;
   expression->reg = reg;
+  return expression;
+}
+
+ExprPtr MakeSymbolicDefinition(uint32_t origin) {
+  auto expression = std::make_shared<Expr>();
+  expression->kind = ExprKind::SymbolicDefinition;
+  expression->origin = origin;
   return expression;
 }
 
@@ -105,6 +115,8 @@ std::string ExprKey(const ExprPtr& expression) {
       return "c" + std::to_string(expression->value);
     case ExprKind::InputRegister:
       return "r" + std::to_string(expression->reg);
+    case ExprKind::SymbolicDefinition:
+      return "d" + std::to_string(expression->origin);
     case ExprKind::Add: {
       auto lhs = ExprKey(expression->lhs);
       auto rhs = ExprKey(expression->rhs);
@@ -131,8 +143,7 @@ bool ContainsExpression(const ExprPtr& expression, const std::string& needle) {
     return false;
   if (ExprKey(expression) == needle)
     return true;
-  return ContainsExpression(expression->lhs, needle) ||
-         ContainsExpression(expression->rhs, needle);
+  return ContainsExpression(expression->lhs, needle) || ContainsExpression(expression->rhs, needle);
 }
 
 bool ContainsLoad(const ExprPtr& expression) {
@@ -290,6 +301,8 @@ bool WritesRegister(const Instruction& instruction, uint8_t reg) {
       return instruction.XO.RT == reg;
     case Opcode::rlwinm:
       return instruction.M.RA == reg;
+    case Opcode::srawi:
+      return instruction.X.RA == reg;
     default:
       return false;
   }
@@ -404,18 +417,17 @@ class Resolver {
         if (instruction.D.RA == 0) {
           result.expression = MakeConstant(immediate);
         } else {
-          result.expression = MakeBinary(ExprKind::Add,
-                                         operand(static_cast<uint8_t>(instruction.D.RA)),
-                                         MakeConstant(immediate), instruction.address);
+          result.expression =
+              MakeBinary(ExprKind::Add, operand(static_cast<uint8_t>(instruction.D.RA)),
+                         MakeConstant(immediate), instruction.address);
         }
         break;
       }
       case Opcode::ori:
       case Opcode::oris: {
         auto source = operand(static_cast<uint8_t>(instruction.D.RT));
-        const uint32_t immediate = instruction.opcode == Opcode::oris
-                                       ? instruction.D.UIMM() << 16
-                                       : instruction.D.UIMM();
+        const uint32_t immediate =
+            instruction.opcode == Opcode::oris ? instruction.D.UIMM() << 16 : instruction.D.UIMM();
         if (source && source->kind == ExprKind::Constant) {
           result.expression = MakeConstant(source->value | immediate);
         } else if (immediate == 0) {
@@ -435,10 +447,9 @@ class Resolver {
         result.expression = operand(static_cast<uint8_t>(instruction.X.RT));
         break;
       case Opcode::add: {
-        result.expression = MakeBinary(ExprKind::Add,
-                                       operand(static_cast<uint8_t>(instruction.XO.RA)),
-                                       operand(static_cast<uint8_t>(instruction.XO.RB)),
-                                       instruction.address);
+        result.expression =
+            MakeBinary(ExprKind::Add, operand(static_cast<uint8_t>(instruction.XO.RA)),
+                       operand(static_cast<uint8_t>(instruction.XO.RB)), instruction.address);
         break;
       }
       case Opcode::rlwinm: {
@@ -446,8 +457,8 @@ class Resolver {
         // The common slwi alias: rlwinm rA,rS,SH,0,31-SH.
         if (instruction.M.MB == 0 && instruction.M.SH <= 31 &&
             instruction.M.ME == 31 - instruction.M.SH) {
-          result.expression = MakeUnary(ExprKind::ShiftLeft, source, instruction.M.SH, 0,
-                                        instruction.address);
+          result.expression =
+              MakeUnary(ExprKind::ShiftLeft, source, instruction.M.SH, 0, instruction.address);
         } else if (instruction.M.SH == 0 && instruction.M.ME == 31) {
           // clrlwi preserves the index lineage. Its range is considered by
           // bound recovery; it is not itself sufficient authority for a table.
@@ -457,20 +468,24 @@ class Resolver {
         }
         break;
       }
+      case Opcode::srawi:
+        // Preserve the identity of the exact reaching definition without
+        // claiming that the recovery evaluator models PPC arithmetic shifts.
+        // A dominating bound and an indexed load may still prove that they use
+        // this same value. Separately recomputed shifts retain distinct keys.
+        result.expression = MakeSymbolicDefinition(instruction.address);
+        break;
       case Opcode::lwz:
       case Opcode::lhz:
       case Opcode::lbz: {
-        const uint8_t width = instruction.opcode == Opcode::lwz
-                                  ? 4
-                                  : (instruction.opcode == Opcode::lhz ? 2 : 1);
-        ExprPtr base = instruction.D.RA == 0
-                           ? MakeConstant(0)
-                           : operand(static_cast<uint8_t>(instruction.D.RA));
+        const uint8_t width =
+            instruction.opcode == Opcode::lwz ? 4 : (instruction.opcode == Opcode::lhz ? 2 : 1);
+        ExprPtr base = instruction.D.RA == 0 ? MakeConstant(0)
+                                             : operand(static_cast<uint8_t>(instruction.D.RA));
         auto address = MakeBinary(ExprKind::Add, base,
                                   MakeConstant(static_cast<uint32_t>(instruction.D.SIMM())),
                                   instruction.address);
-        result.expression =
-            MakeUnary(ExprKind::Load, address, 0, width, instruction.address);
+        result.expression = MakeUnary(ExprKind::Load, address, 0, width, instruction.address);
         break;
       }
       case Opcode::lwzx:
@@ -482,22 +497,20 @@ class Resolver {
                                   : (instruction.opcode == Opcode::lhzx
                                          ? 2
                                          : (instruction.opcode == Opcode::lbzx ? 1 : 8));
-        ExprPtr base = instruction.X.RA == 0
-                           ? MakeConstant(0)
-                           : operand(static_cast<uint8_t>(instruction.X.RA));
-        auto address = MakeBinary(ExprKind::Add, base,
-                                  operand(static_cast<uint8_t>(instruction.X.RB)),
-                                  instruction.address);
-        result.expression =
-            MakeUnary(ExprKind::Load, address, 0, width, instruction.address);
+        ExprPtr base = instruction.X.RA == 0 ? MakeConstant(0)
+                                             : operand(static_cast<uint8_t>(instruction.X.RA));
+        auto address =
+            MakeBinary(ExprKind::Add, base, operand(static_cast<uint8_t>(instruction.X.RB)),
+                       instruction.address);
+        result.expression = MakeUnary(ExprKind::Load, address, 0, width, instruction.address);
         break;
       }
       case Opcode::extsb:
       case Opcode::extsh: {
         const uint8_t width = instruction.opcode == Opcode::extsb ? 1 : 2;
-        result.expression = MakeUnary(ExprKind::SignExtend,
-                                      operand(static_cast<uint8_t>(instruction.X.RT)), 0, width,
-                                      instruction.address);
+        result.expression =
+            MakeUnary(ExprKind::SignExtend, operand(static_cast<uint8_t>(instruction.X.RT)), 0,
+                      width, instruction.address);
         break;
       }
       default:
@@ -538,9 +551,8 @@ std::optional<bool> BranchWhenCrBitTrue(const Instruction& instruction) {
 }
 
 uint8_t BranchConditionBit(const Instruction& instruction) {
-  return static_cast<uint8_t>((instruction.format == ppc::InstrFormat::kB ? instruction.B.BI
-                                                                         : instruction.XL.BI) %
-                              4);
+  return static_cast<uint8_t>(
+      (instruction.format == ppc::InstrFormat::kB ? instruction.B.BI : instruction.XL.BI) % 4);
 }
 
 std::vector<uint32_t> BackwardReachable(const LocalCfg& cfg, uint32_t site,
@@ -561,6 +573,60 @@ std::vector<uint32_t> BackwardReachable(const LocalCfg& cfg, uint32_t site,
       pending.emplace_back(predecessor, depth + 1);
   }
   return {addresses.begin(), addresses.end()};
+}
+
+struct ReachingCtrDefinitions {
+  std::vector<const Instruction*> instructions;
+  bool incompletePath = false;
+};
+
+ReachingCtrDefinitions FindReachingCtrDefinitions(DecodedBinary& decoded, const LocalCfg& cfg,
+                                                  uint32_t site,
+                                                  const JumpTableRecoveryLimits& limits,
+                                                  bool* limitHit) {
+  std::deque<uint32_t> pending;
+  for (uint32_t predecessor : cfg.predecessors(site))
+    pending.push_back(predecessor);
+
+  std::unordered_set<uint32_t> visited;
+  std::map<uint32_t, const Instruction*> definitions;
+  ReachingCtrDefinitions result;
+  while (!pending.empty()) {
+    const uint32_t address = pending.front();
+    pending.pop_front();
+    if (!visited.insert(address).second)
+      continue;
+    if (visited.size() > limits.maxStates) {
+      if (limitHit)
+        *limitHit = true;
+      result.incompletePath = true;
+      break;
+    }
+
+    const auto* instruction = decoded.get(address);
+    if (instruction && instruction->opcode == Opcode::mtctr) {
+      definitions.emplace(address, instruction);
+      continue;
+    }
+
+    const auto& predecessors = cfg.predecessors(address);
+    if (predecessors.empty()) {
+      result.incompletePath = true;
+      continue;
+    }
+    if (predecessors.size() > limits.maxPredecessors) {
+      if (limitHit)
+        *limitHit = true;
+      result.incompletePath = true;
+      continue;
+    }
+    for (uint32_t predecessor : predecessors)
+      pending.push_back(predecessor);
+  }
+
+  for (const auto& definition : definitions)
+    result.instructions.push_back(definition.second);
+  return result;
 }
 
 std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& cfg,
@@ -606,10 +672,14 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
     bool defaultIsReturn = false;
     if (guard->opcode == Opcode::bclr || guard->opcode == Opcode::bclrl) {
       defaultIsReturn = true;
-      fallthroughReachesSite = cfg.Reaches(guard->address + 4, site, 0, limits, limitHit);
+      fallthroughReachesSite = cfg.Reaches(guard->address + 4, site, address, limits, limitHit);
     } else if (guard->branch_target) {
-      takenReachesSite = cfg.Reaches(*guard->branch_target, site, 0, limits, limitHit);
-      fallthroughReachesSite = cfg.Reaches(guard->address + 4, site, 0, limits, limitHit);
+      // Judge the two successors for this dynamic guard occurrence. A default
+      // path may loop through the compare and reach the dispatch in a later
+      // iteration after recomputing the index; that does not make it a case
+      // path for the current bounded transfer.
+      takenReachesSite = cfg.Reaches(*guard->branch_target, site, address, limits, limitHit);
+      fallthroughReachesSite = cfg.Reaches(guard->address + 4, site, address, limits, limitHit);
     }
     if (takenReachesSite == fallthroughReachesSite)
       continue;
@@ -621,9 +691,8 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
     BoundCandidate candidate;
     candidate.compareAddress = address;
     candidate.guardAddress = guard->address;
-    candidate.value = compare->opcode == Opcode::cmpli
-                          ? compare->D.UIMM()
-                          : static_cast<uint32_t>(compare->D.SIMM());
+    candidate.value = compare->opcode == Opcode::cmpli ? compare->D.UIMM()
+                                                       : static_cast<uint32_t>(compare->D.SIMM());
     candidate.indexRegister = static_cast<uint8_t>(compare->D.RA);
     candidate.defaultIsReturn = defaultIsReturn;
     if (!defaultIsReturn) {
@@ -731,6 +800,7 @@ Evaluation Evaluate(const ExprPtr& expression, const std::string& indexKey, uint
     }
     case ExprKind::Unknown:
     case ExprKind::InputRegister:
+    case ExprKind::SymbolicDefinition:
       return {};
   }
   return {};
@@ -748,7 +818,8 @@ const Expr* FindPrimaryLoad(const ExprPtr& expression, const std::string& indexK
   return nullptr;
 }
 
-bool LoadIsSignExtended(const ExprPtr& expression, uint32_t loadOrigin, bool underSignExtend = false) {
+bool LoadIsSignExtended(const ExprPtr& expression, uint32_t loadOrigin,
+                        bool underSignExtend = false) {
   if (!expression)
     return false;
   const bool nowSigned = underSignExtend || expression->kind == ExprKind::SignExtend;
@@ -923,10 +994,10 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
 
   const auto finish = [&]() {
     if (stats) {
-      stats->elapsedMicroseconds += static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
-                                                               started)
-              .count());
+      stats->elapsedMicroseconds +=
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - started)
+                                    .count());
       if (!analysis.selectedTable)
         ++stats->unresolvedSites;
     }
@@ -969,20 +1040,15 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
   LocalCfg cfg(decoded, input.preliminaryBlocks, input.ownerAddress);
   Resolver resolver(decoded, cfg, input.limits, stats);
 
-  const Instruction* mtctr = nullptr;
   bool limitHit = false;
-  for (uint32_t address : BackwardReachable(cfg, input.site, input.limits, &limitHit)) {
-    const auto* instruction = decoded.get(address);
-    if (instruction && instruction->opcode == Opcode::mtctr &&
-        cfg.Dominates(address, input.site, input.limits, &limitHit)) {
-      if (mtctr) {
-        mtctr = nullptr;
-        AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
-        break;
-      }
-      mtctr = instruction;
-    }
-  }
+  auto ctrDefinitions =
+      FindReachingCtrDefinitions(decoded, cfg, input.site, input.limits, &limitHit);
+  const Instruction* mtctr =
+      ctrDefinitions.instructions.size() == 1 && !ctrDefinitions.incompletePath
+          ? ctrDefinitions.instructions.front()
+          : nullptr;
+  if (ctrDefinitions.instructions.size() > 1 || ctrDefinitions.incompletePath)
+    AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
   if (limitHit) {
     AddFailure(analysis, JumpTableFailure::AnalysisLimit);
     if (stats)
@@ -995,7 +1061,8 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
   } else {
     analysis.evidence.push_back(Evidence(*mtctr, "ctr_definition"));
     auto target = resolver.Resolve(static_cast<uint8_t>(mtctr->XFX.RS()), mtctr->address);
-    analysis.evidence.insert(analysis.evidence.end(), target.evidence.begin(), target.evidence.end());
+    analysis.evidence.insert(analysis.evidence.end(), target.evidence.begin(),
+                             target.evidence.end());
     if (target.limitHit) {
       AddFailure(analysis, JumpTableFailure::AnalysisLimit);
       if (stats)
@@ -1022,8 +1089,8 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
         auto& bound = matchingBounds.front();
         const std::string indexKey = ExprKey(bound.indexExpression);
         const Expr* primaryLoad = FindPrimaryLoad(target.expression, indexKey);
-        if (!primaryLoad || (primaryLoad->width != 1 && primaryLoad->width != 2 &&
-                             primaryLoad->width != 4)) {
+        if (!primaryLoad ||
+            (primaryLoad->width != 1 && primaryLoad->width != 2 && primaryLoad->width != 4)) {
           AddFailure(analysis, JumpTableFailure::InvalidElementWidth);
         } else {
           JumpTable table;
@@ -1033,19 +1100,17 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
           table.boundValue = bound.value;
           table.caseCount = bound.caseCount;
           table.boundInclusive = bound.inclusive;
-          table.boundSemantics = bound.inclusive ? "unsigned_index <= bound"
-                                                  : "unsigned_index < bound";
+          table.boundSemantics =
+              bound.inclusive ? "unsigned_index <= bound" : "unsigned_index < bound";
           table.defaultTarget = bound.defaultTarget;
           table.defaultIsReturn = bound.defaultIsReturn;
           table.elementWidth = primaryLoad->width;
-          table.elementSigned =
-              LoadIsSignExtended(target.expression, primaryLoad->origin);
+          table.elementSigned = LoadIsSignExtended(target.expression, primaryLoad->origin);
           table.anchorAddress = ConstantAnchor(target.expression).value_or(0);
           table.targetScale = LoadTargetScale(target.expression, primaryLoad->origin);
           if (table.targetScale == 0)
             table.targetScale = 1;
-          table.kind = primaryLoad->width == 4 && table.anchorAddress == 0 &&
-                               table.targetScale == 1
+          table.kind = primaryLoad->width == 4 && table.anchorAddress == 0 && table.targetScale == 1
                            ? JumpTableKind::AbsolutePointer
                            : JumpTableKind::RelativeOffset;
           table.confidence = "validated_bound_and_all_targets";
@@ -1099,8 +1164,8 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
               break;
             }
             const auto* targetInstruction = decoded.get(caseTarget);
-            if (!targetInstruction || isInvalid(*targetInstruction) ||
-                !input.containingRegion || !input.containingRegion->contains(caseTarget)) {
+            if (!targetInstruction || isInvalid(*targetInstruction) || !input.containingRegion ||
+                !input.containingRegion->contains(caseTarget)) {
               invalid = true;
               targetFailure = JumpTableFailure::TargetOutOfRange;
               break;
@@ -1113,12 +1178,11 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
             AddFailure(analysis, table.targets.empty() ? targetFailure
                                                        : JumpTableFailure::MixedValidityTargets);
           } else {
-            const uint32_t stride = bound.caseCount > 1
-                                        ? table.rawEntries[1].storageAddress -
-                                              table.rawEntries[0].storageAddress
-                                        : primaryLoad->width;
-            table.storageEnd = table.tableAddress +
-                               (bound.caseCount - 1) * stride + primaryLoad->width;
+            const uint32_t stride = bound.caseCount > 1 ? table.rawEntries[1].storageAddress -
+                                                              table.rawEntries[0].storageAddress
+                                                        : primaryLoad->width;
+            table.storageEnd =
+                table.tableAddress + (bound.caseCount - 1) * stride + primaryLoad->width;
             table.tableInExecutableSection = decoded.get(table.tableAddress) != nullptr;
             table.manualComparison = input.manualTable
                                          ? CompareManual(table, *input.manualTable)
@@ -1151,8 +1215,8 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
     analysis.selectedTable = analysis.automaticTable;
   }
 
-  if (!analysis.selectedTable && analysis.classification ==
-                                     IndirectSiteClassification::OpaqueIndirectTransfer &&
+  if (!analysis.selectedTable &&
+      analysis.classification == IndirectSiteClassification::OpaqueIndirectTransfer &&
       dispatch->opcode == Opcode::bcctr) {
     analysis.classification = IndirectSiteClassification::ComputedTailBctr;
   }
