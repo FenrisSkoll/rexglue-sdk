@@ -618,6 +618,8 @@ Opcode lookup_opcode(u32 code) {
     switch (extended) {
       case 0:
         return Opcode::cmp;
+      case 21:
+        return Opcode::ldx;
       case 4:
         return Opcode::tw;
       case 11:

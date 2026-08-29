@@ -33,6 +33,11 @@ uint32_t Bc(uint32_t site, uint32_t target, uint8_t bo, uint8_t bi) {
          (static_cast<uint32_t>(displacement) & 0x0000FFFCu);
 }
 
+uint32_t B(uint32_t site, uint32_t target) {
+  const int32_t displacement = static_cast<int32_t>(target - site);
+  return 0x48000000u | (static_cast<uint32_t>(displacement) & 0x03FFFFFCu);
+}
+
 uint32_t Rlwinm(uint8_t ra, uint8_t rs, uint8_t sh, uint8_t mb, uint8_t me) {
   return 0x54000000u | (static_cast<uint32_t>(rs) << 21) |
          (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(sh) << 11) |
@@ -51,6 +56,11 @@ uint32_t Lbzx(uint8_t rt, uint8_t ra, uint8_t rb) {
 
 uint32_t Lhzx(uint8_t rt, uint8_t ra, uint8_t rb) {
   return 0x7C00022Eu | (static_cast<uint32_t>(rt) << 21) |
+         (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(rb) << 11);
+}
+
+uint32_t Ldx(uint8_t rt, uint8_t ra, uint8_t rb) {
+  return 0x7C00002Au | (static_cast<uint32_t>(rt) << 21) |
          (static_cast<uint32_t>(ra) << 16) | (static_cast<uint32_t>(rb) << 11);
 }
 
@@ -218,6 +228,16 @@ bool HasFailure(const IndirectSiteAnalysis& analysis, JumpTableFailure failure) 
          analysis.failures.end();
 }
 
+std::string FailureNames(const IndirectSiteAnalysis& analysis) {
+  std::string result;
+  for (auto failure : analysis.failures) {
+    if (!result.empty())
+      result += ',';
+    result += JumpTableFailureName(failure);
+  }
+  return result;
+}
+
 }  // namespace
 
 TEST_CASE("jump-table recovery validates a bounded absolute Xenon switch",
@@ -237,6 +257,8 @@ TEST_CASE("jump-table recovery validates a bounded absolute Xenon switch",
         std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
   CHECK(analysis.selectedTable->manualComparison ==
         JumpTableManualComparison::NewAutomaticTable);
+  REQUIRE_FALSE(analysis.evidence.empty());
+  CHECK(analysis.evidence.front().rawInstruction == 0x4E800420);
 }
 
 TEST_CASE("jump-table recovery rejects a mixed-validity table as a whole",
@@ -263,6 +285,32 @@ TEST_CASE("manual jump tables remain authoritative and are compared with automat
         JumpTableManualComparison::ExactEquivalent);
 }
 
+TEST_CASE("manual comparison distinguishes bounds, target order and set containment",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  JumpTable manual;
+  manual.bctrAddress = kTextBase + 0x18;
+  manual.tableAddress = kTableBase;
+  manual.targets = {kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60};
+  manual.caseCount = 4;
+  CHECK(Analyze(image, kTextBase + 0x18, &manual).selectedTable->manualComparison ==
+        JumpTableManualComparison::ConflictingBounds);
+
+  manual.caseCount = 0;
+  manual.targets = {kTextBase + 0x50, kTextBase + 0x40, kTextBase + 0x60};
+  CHECK(Analyze(image, kTextBase + 0x18, &manual).selectedTable->manualComparison ==
+        JumpTableManualComparison::ConflictingTargets);
+
+  manual.targets = {kTextBase + 0x40, kTextBase + 0x50};
+  CHECK(Analyze(image, kTextBase + 0x18, &manual).selectedTable->manualComparison ==
+        JumpTableManualComparison::AutomaticSuperset);
+
+  manual.targets = {kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60,
+                    kTextBase + 0x70};
+  CHECK(Analyze(image, kTextBase + 0x18, &manual).selectedTable->manualComparison ==
+        JumpTableManualComparison::AutomaticSubset);
+}
+
 TEST_CASE("indirect-site classification excludes calls and returns from switches",
           "[codegen][jump-table]") {
   AbsoluteSwitch image;
@@ -286,6 +334,70 @@ TEST_CASE("jump-table recovery reports a missing dominating bound", "[codegen][j
   CHECK(HasFailure(analysis, JumpTableFailure::MissingBound));
 }
 
+TEST_CASE("jump-table recovery reports unknown index and ambiguous bounds",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, 0x28070002);  // bound uses unrelated r7
+  auto unknown = Analyze(image);
+  CHECK_FALSE(unknown.selectedTable);
+  CHECK(HasFailure(unknown, JumpTableFailure::UnknownIndex));
+
+  image = AbsoluteSwitch{};
+  StoreBe32(image.text, 0x00, 0x28030004);
+  StoreBe32(image.text, 0x04, Bc(kTextBase + 0x04, kTextBase + 0x30, 12, 1));
+  StoreBe32(image.text, 0x08, 0x28030002);
+  StoreBe32(image.text, 0x0C, Bc(kTextBase + 0x0C, kTextBase + 0x30, 12, 1));
+  StoreBe32(image.text, 0x10, 0x3C802000);
+  StoreBe32(image.text, 0x14, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x18, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x1C, Mtctr(5));
+  StoreBe32(image.text, 0x20, 0x4E800420);
+  auto ambiguous = Analyze(image, kTextBase + 0x20);
+  CHECK_FALSE(ambiguous.selectedTable);
+  CHECK(HasFailure(ambiguous, JumpTableFailure::AmbiguousBound));
+}
+
+TEST_CASE("jump-table recovery reports target validation failures without accepting prefixes",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.table, 0x00, 0x30000000);
+  auto outside = Analyze(image);
+  INFO(FailureNames(outside));
+  CHECK(HasFailure(outside, JumpTableFailure::TargetOutOfRange));
+  CHECK_FALSE(outside.selectedTable);
+
+  image = AbsoluteSwitch{};
+  StoreBe32(image.table, 0x00, kTextBase + 0x41);
+  auto unaligned = Analyze(image);
+  INFO(FailureNames(unaligned));
+  CHECK(HasFailure(unaligned, JumpTableFailure::TargetUnaligned));
+  CHECK_FALSE(unaligned.selectedTable);
+}
+
+TEST_CASE("jump-table recovery reports unknown bases and invalid element widths",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x10, Add(5, 4, 3));
+  auto noLoad = Analyze(image);
+  CHECK(HasFailure(noLoad, JumpTableFailure::UnknownTableBase));
+
+  image = AbsoluteSwitch{};
+  CHECK(ppc::decode_instruction(kTextBase + 0x10, Ldx(5, 4, 3)).opcode == ppc::Opcode::ldx);
+  StoreBe32(image.text, 0x10, Ldx(5, 4, 3));
+  auto invalidWidth = Analyze(image);
+  INFO(FailureNames(invalidWidth));
+  CHECK(HasFailure(invalidWidth, JumpTableFailure::InvalidElementWidth));
+}
+
+TEST_CASE("jump-table recovery refuses byte offsets without a relative anchor",
+          "[codegen][jump-table]") {
+  RelativeSwitch image;
+  StoreBe32(image.text, 0x1C, Mr(5, 5));
+  auto analysis = Analyze(image);
+  CHECK_FALSE(analysis.selectedTable);
+  CHECK(HasFailure(analysis, JumpTableFailure::UnsupportedRelativeForm));
+}
+
 TEST_CASE("jump-table recovery follows register copies between bound and indexed load",
           "[codegen][jump-table]") {
   AbsoluteSwitch image;
@@ -297,6 +409,39 @@ TEST_CASE("jump-table recovery follows register copies between bound and indexed
   auto analysis = Analyze(image, kTextBase + 0x1C);
   REQUIRE(analysis.selectedTable);
   CHECK(analysis.selectedTable->targets.size() == 3);
+}
+
+TEST_CASE("jump-table recovery matches equivalent index reloads by memory lineage",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, 0x80610020);  // lwz r3, 0x20(r1)
+  StoreBe32(image.text, 0x04, 0x28030002);  // cmplwi r3, 2
+  StoreBe32(image.text, 0x08, Bc(kTextBase + 0x08, kTextBase + 0x30, 12, 1));
+  StoreBe32(image.text, 0x0C, 0x3C802000);
+  StoreBe32(image.text, 0x10, 0x80E10020);  // lwz r7, 0x20(r1)
+  StoreBe32(image.text, 0x14, Rlwinm(7, 7, 2, 0, 29));
+  StoreBe32(image.text, 0x18, Lwzx(5, 4, 7));
+  StoreBe32(image.text, 0x1C, Mtctr(5));
+  StoreBe32(image.text, 0x20, 0x4E800420);
+  auto analysis = Analyze(image, kTextBase + 0x20);
+  REQUIRE(analysis.selectedTable);
+  CHECK(analysis.selectedTable->targets.size() == 3);
+}
+
+TEST_CASE("jump-table recovery reports ambiguous CFG reaching definitions",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x10, 12, 2));
+  StoreBe32(image.text, 0x04, 0x3C802000);  // path A table base
+  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x14));
+  StoreBe32(image.text, 0x10, 0x3C802001);  // path B conflicting table base
+  StoreBe32(image.text, 0x14, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x18, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x1C, Mtctr(5));
+  StoreBe32(image.text, 0x20, 0x4E800420);
+  auto analysis = Analyze(image, kTextBase + 0x20);
+  CHECK_FALSE(analysis.selectedTable);
+  CHECK(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
 }
 
 TEST_CASE("jump-table recovery decodes signed byte relative offsets and scaling",
@@ -336,6 +481,107 @@ TEST_CASE("jump-table recovery accepts compare plus conditional-return default",
   CHECK(analysis.selectedTable->defaultTarget == 0);
 }
 
+TEST_CASE("jump-table recovery evaluates two-level relative tables",
+          "[codegen][jump-table]") {
+  RelativeSwitch image;
+  StoreBe32(image.text, 0x08, 0x3C802000);
+  StoreBe32(image.text, 0x0C, 0x60840000);
+  StoreBe32(image.text, 0x10, Lbzx(5, 4, 3));
+  StoreBe32(image.text, 0x14, 0x3CC02000);
+  StoreBe32(image.text, 0x18, 0x60C60020);
+  StoreBe32(image.text, 0x1C, Lhzx(5, 6, 5));
+  StoreBe32(image.text, 0x20, 0x3CC01000);
+  StoreBe32(image.text, 0x24, Add(5, 6, 5));
+  StoreBe32(image.text, 0x28, Mtctr(5));
+  StoreBe32(image.text, 0x2C, 0x4E800420);
+  image.site = kTextBase + 0x2C;
+  image.table[0] = 0;
+  image.table[1] = 2;
+  image.table[2] = 4;
+  image.table[0x20] = 0;
+  image.table[0x21] = 0x40;
+  image.table[0x22] = 0;
+  image.table[0x23] = 0x50;
+  image.table[0x24] = 0;
+  image.table[0x25] = 0x60;
+  auto analysis = Analyze(image);
+  REQUIRE(analysis.selectedTable);
+  CHECK(analysis.selectedTable->tableAddress == kTableBase);
+  CHECK(analysis.selectedTable->elementWidth == 1);
+  CHECK(analysis.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
+}
+
+TEST_CASE("jump-table recovery accepts inline executable table storage",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  std::vector<uint8_t> text(0x140);
+  for (uint32_t offset = 0; offset < text.size(); offset += 4)
+    StoreBe32(text, offset, 0x60000000);
+  std::copy(image.text.begin(), image.text.end(), text.begin());
+  StoreBe32(text, 0x08, 0x3C801000);
+  StoreBe32(text, 0x0C, 0x60840080);
+  StoreBe32(text, 0x10, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(text, 0x14, Lwzx(5, 4, 3));
+  StoreBe32(text, 0x18, Mtctr(5));
+  StoreBe32(text, 0x1C, 0x4E800420);
+  StoreBe32(text, 0x80, kTextBase + 0x40);
+  StoreBe32(text, 0x84, kTextBase + 0x50);
+  StoreBe32(text, 0x88, kTextBase + 0x60);
+  const std::array sections{BinarySectionInput{.name = ".text",
+                                               .baseAddress = kTextBase,
+                                               .data = text,
+                                               .executable = true,
+                                               .readable = true}};
+  auto view = BinaryView::fromSections(kTextBase, 0x140, kTextBase, sections);
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const Block block{kTextBase, 0x70};
+  JumpTableRecoveryInput input{.site = kTextBase + 0x1C,
+                               .ownerAddress = kTextBase,
+                               .preliminaryBlocks = std::span<const Block>(&block, 1),
+                               .containingRegion = decoded.regionContaining(kTextBase),
+                               .limits = {}};
+  auto analysis = AnalyzeIndirectSite(decoded, input);
+  REQUIRE(analysis.selectedTable);
+  CHECK(analysis.selectedTable->tableAddress == kTextBase + 0x80);
+  CHECK(analysis.selectedTable->tableInExecutableSection);
+}
+
+TEST_CASE("jump-table recovery preserves overlapping and shared table storage",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x80, 0x28030001);  // cmplwi r3, 1
+  StoreBe32(image.text, 0x84, Bc(kTextBase + 0x84, kTextBase + 0xB0, 12, 1));
+  StoreBe32(image.text, 0x88, 0x3C802000);
+  StoreBe32(image.text, 0x8C, 0x60840004);  // start at the second shared entry
+  StoreBe32(image.text, 0x90, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x94, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x98, Mtctr(5));
+  StoreBe32(image.text, 0x9C, 0x4E800420);
+  StoreBe32(image.text, 0xB0, 0x4E800020);
+
+  auto first = Analyze(image);
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const Block secondBlock{kTextBase + 0x80, 0x34};
+  JumpTableRecoveryInput input{.site = kTextBase + 0x9C,
+                               .ownerAddress = kTextBase + 0x80,
+                               .preliminaryBlocks =
+                                   std::span<const Block>(&secondBlock, 1),
+                               .containingRegion = decoded.regionContaining(kTextBase + 0x80),
+                               .limits = {}};
+  auto second = AnalyzeIndirectSite(decoded, input);
+  REQUIRE(first.selectedTable);
+  REQUIRE(second.selectedTable);
+  CHECK(first.selectedTable->tableAddress == kTableBase);
+  CHECK(second.selectedTable->tableAddress == kTableBase + 4);
+  CHECK(first.selectedTable->storageEnd > second.selectedTable->tableAddress);
+  CHECK(second.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x50, kTextBase + 0x60});
+}
+
 TEST_CASE("jump-table recovery reports an analysis safety limit", "[codegen][jump-table]") {
   AbsoluteSwitch image;
   JumpTableRecoveryLimits limits;
@@ -364,4 +610,76 @@ TEST_CASE("block discovery expands recovered switch cases before final boundarie
   CHECK(result.labels.contains(kTextBase + 0x60));
   CHECK(std::any_of(result.blocks.begin(), result.blocks.end(),
                     [](const Block& block) { return block.contains(kTextBase + 0x60); }));
+}
+
+TEST_CASE("case expansion exposes and recovers another indirect site at fixpoint",
+          "[codegen][jump-table][integration]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.table, 0x00, kTextBase + 0x40);
+  StoreBe32(image.table, 0x04, kTextBase + 0x70);
+  StoreBe32(image.table, 0x08, kTextBase + 0x78);
+  StoreBe32(image.table, 0x10, kTextBase + 0x90);
+  StoreBe32(image.table, 0x14, kTextBase + 0xA0);
+  StoreBe32(image.text, 0x40, 0x28080001);  // cmplwi r8, 1
+  StoreBe32(image.text, 0x44, Bc(kTextBase + 0x44, kTextBase + 0x78, 12, 1));
+  StoreBe32(image.text, 0x48, 0x3D202000);  // lis r9, 0x2000
+  StoreBe32(image.text, 0x4C, 0x61290010);  // ori r9, r9, 0x10
+  StoreBe32(image.text, 0x50, Rlwinm(8, 8, 2, 0, 29));
+  StoreBe32(image.text, 0x54, Lwzx(10, 9, 8));
+  StoreBe32(image.text, 0x58, Mtctr(10));
+  StoreBe32(image.text, 0x5C, 0x4E800420);
+  StoreBe32(image.text, 0x70, 0x4E800020);
+  StoreBe32(image.text, 0x78, 0x4E800020);
+  StoreBe32(image.text, 0x90, 0x4E800020);
+  StoreBe32(image.text, 0xA0, 0x4E800020);
+
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+  const std::unordered_set<uint32_t> functions{kTextBase};
+  auto result = discoverBlocks(decoded, kTextBase, *region, functions, 0x1C);
+  CHECK(result.jumpTableRecovery.fixpointIterations == 3);
+  CHECK(result.jumpTableRecovery.recoveredTables == 2);
+  CHECK(result.jumpTables.size() == 2);
+  CHECK(result.labels.contains(kTextBase + 0x90));
+  CHECK(result.labels.contains(kTextBase + 0xA0));
+}
+
+TEST_CASE("independent callable evidence keeps a case as a separate function entry",
+          "[codegen][jump-table][integration]") {
+  AbsoluteSwitch image;
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+  const std::unordered_set<uint32_t> functions{kTextBase, kTextBase + 0x50};
+  auto result = discoverBlocks(decoded, kTextBase, *region, functions, 0x1C);
+  REQUIRE(result.jumpTables.size() == 1);
+  CHECK(std::find(result.jumpTables[0].targets.begin(), result.jumpTables[0].targets.end(),
+                  kTextBase + 0x50) != result.jumpTables[0].targets.end());
+  CHECK_FALSE(std::any_of(result.blocks.begin(), result.blocks.end(),
+                          [](const Block& block) { return block.contains(kTextBase + 0x50); }));
+}
+
+TEST_CASE("a table invalidated by expanded CFG is quarantined instead of oscillating",
+          "[codegen][jump-table][integration]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x40, B(kTextBase + 0x40, kTextBase + 0x14));
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+  const std::unordered_set<uint32_t> functions{kTextBase};
+  auto result = discoverBlocks(decoded, kTextBase, *region, functions, 0x1C);
+  CHECK(result.jumpTables.empty());
+  auto dispatch = std::find_if(result.indirectSites.begin(), result.indirectSites.end(),
+                               [](const auto& site) { return site.site == kTextBase + 0x18; });
+  REQUIRE(dispatch != result.indirectSites.end());
+  CHECK_FALSE(dispatch->selectedTable);
+  CHECK(HasFailure(*dispatch, JumpTableFailure::AmbiguousReachingDefinition));
+  CHECK_FALSE(result.jumpTableRecovery.analysisLimitHit);
 }

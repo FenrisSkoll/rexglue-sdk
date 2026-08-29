@@ -446,6 +446,89 @@ std::vector<EntrypointFunctionSeed> BuildFunctionSeeds(
   return seeds;
 }
 
+std::optional<EntrypointAddressRange> BlockExtent(
+    const std::vector<EntrypointAddressRange>& blocks) {
+  if (blocks.empty())
+    return std::nullopt;
+  uint32_t start = blocks.front().start;
+  uint32_t end = blocks.front().end;
+  for (const auto& block : blocks) {
+    start = std::min(start, block.start);
+    end = std::max(end, block.end);
+  }
+  return EntrypointAddressRange{start, end};
+}
+
+EntrypointJumpTableRecovery BuildJumpTableRecovery(const CodegenContext& context) {
+  EntrypointJumpTableRecovery report;
+  report.limits = context.analysisState().jumpTableLimits;
+  report.stats = context.analysisState().jumpTableRecovery;
+
+  for (const auto& [owner, ownedNode] : context.graph.functions()) {
+    const auto& node = *ownedNode;
+    report.indirectSites.insert(report.indirectSites.end(), node.indirectSites().begin(),
+                                node.indirectSites().end());
+    if (node.jumpTables().empty())
+      continue;
+
+    JumpTableBoundaryEffect effect;
+    effect.ownerAddress = owner;
+    effect.ownerAuthority = AuthorityName(node.authority());
+    effect.pdataAssociated = context.scan.pdataSizes.contains(owner);
+    for (const auto& block : node.jumpTablePreliminaryBlocks())
+      effect.preliminaryBlocks.push_back({block.base, block.end()});
+    for (const auto& block : node.blocks())
+      effect.finalBlocks.push_back({block.base, block.end()});
+    std::sort(effect.preliminaryBlocks.begin(), effect.preliminaryBlocks.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.start < rhs.start; });
+    std::sort(effect.finalBlocks.begin(), effect.finalBlocks.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.start < rhs.start; });
+    effect.preliminaryExtent = BlockExtent(effect.preliminaryBlocks);
+    effect.finalExtent = BlockExtent(effect.finalBlocks);
+    effect.changed = effect.preliminaryBlocks != effect.finalBlocks;
+
+    std::set<uint32_t> targets;
+    std::set<uint32_t> callable;
+    for (const auto& table : node.jumpTables()) {
+      for (uint32_t target : table.targets) {
+        targets.insert(target);
+        if (target != owner && context.graph.isEntryPoint(target))
+          callable.insert(target);
+      }
+    }
+    effect.caseTargets.assign(targets.begin(), targets.end());
+    effect.independentlyCallableCases.assign(callable.begin(), callable.end());
+    report.boundaryEffects.push_back(std::move(effect));
+  }
+
+  std::sort(report.indirectSites.begin(), report.indirectSites.end(),
+            [](const auto& lhs, const auto& rhs) {
+              if (lhs.site != rhs.site)
+                return lhs.site < rhs.site;
+              return lhs.ownerAddress < rhs.ownerAddress;
+            });
+  std::sort(report.boundaryEffects.begin(), report.boundaryEffects.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return lhs.ownerAddress < rhs.ownerAddress;
+            });
+  report.stats.indirectSites = static_cast<uint32_t>(report.indirectSites.size());
+  report.stats.recoveredTables = static_cast<uint32_t>(std::count_if(
+      report.indirectSites.begin(), report.indirectSites.end(),
+      [](const auto& site) {
+        return site.selectedTable &&
+               site.selectedTable->origin == JumpTableOrigin::Automatic;
+      }));
+  report.stats.manualTables = static_cast<uint32_t>(std::count_if(
+      report.indirectSites.begin(), report.indirectSites.end(), [](const auto& site) {
+        return site.selectedTable && site.selectedTable->origin == JumpTableOrigin::Manual;
+      }));
+  report.stats.unresolvedSites = static_cast<uint32_t>(std::count_if(
+      report.indirectSites.begin(), report.indirectSites.end(), [](const auto& site) {
+        return site.usesCtr && !site.link && !site.selectedTable;
+      }));
+  return report;
+}
+
 Result<void> VerifyIdentity(const EntrypointImageIdentity& actual,
                             const ProvenanceConfig& expected) {
   auto compareString = [&](std::string_view field, const std::string& wanted,
@@ -603,6 +686,7 @@ Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
       .functionSeeds = BuildFunctionSeeds(pipeline->context()),
       .manualEvidence = provenance->manualEvidence,
       .fixtures = provenance->fixtures,
+      .jumpTableRecovery = BuildJumpTableRecovery(pipeline->context()),
   };
   input.relocationStorageAddresses.insert(module->relocation_storage_addresses().begin(),
                                           module->relocation_storage_addresses().end());

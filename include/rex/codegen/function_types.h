@@ -305,6 +305,7 @@ struct JumpTableRawEntry {
 
 struct JumpTableInstructionEvidence {
   uint32_t address = 0;
+  uint32_t rawInstruction = 0;
   std::string role;
   std::string instruction;
 };

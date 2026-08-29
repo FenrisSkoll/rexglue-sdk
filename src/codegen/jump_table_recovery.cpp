@@ -152,7 +152,8 @@ void AddFailure(IndirectSiteAnalysis& analysis, JumpTableFailure failure) {
 }
 
 JumpTableInstructionEvidence Evidence(const Instruction& instruction, std::string role) {
-  return {instruction.address, std::move(role), instruction.to_string()};
+  return {instruction.address, static_cast<uint32_t>(instruction.code), std::move(role),
+          instruction.to_string()};
 }
 
 class LocalCfg {
@@ -276,6 +277,7 @@ bool WritesRegister(const Instruction& instruction, uint8_t reg) {
     case Opcode::lwzx:
     case Opcode::lhzx:
     case Opcode::lbzx:
+    case Opcode::ldx:
       return instruction.D.RT == reg;
     case Opcode::ori:
     case Opcode::oris:
@@ -473,10 +475,13 @@ class Resolver {
       }
       case Opcode::lwzx:
       case Opcode::lhzx:
-      case Opcode::lbzx: {
+      case Opcode::lbzx:
+      case Opcode::ldx: {
         const uint8_t width = instruction.opcode == Opcode::lwzx
                                   ? 4
-                                  : (instruction.opcode == Opcode::lhzx ? 2 : 1);
+                                  : (instruction.opcode == Opcode::lhzx
+                                         ? 2
+                                         : (instruction.opcode == Opcode::lbzx ? 1 : 8));
         ExprPtr base = instruction.X.RA == 0
                            ? MakeConstant(0)
                            : operand(static_cast<uint8_t>(instruction.X.RA));
@@ -788,6 +793,8 @@ JumpTableManualComparison CompareManual(const JumpTable& automatic, const JumpTa
   }
   std::set<uint32_t> automaticTargets(automatic.targets.begin(), automatic.targets.end());
   std::set<uint32_t> manualTargets(manual.targets.begin(), manual.targets.end());
+  if (automaticTargets == manualTargets)
+    return JumpTableManualComparison::ConflictingTargets;
   if (std::includes(automaticTargets.begin(), automaticTargets.end(), manualTargets.begin(),
                     manualTargets.end()))
     return JumpTableManualComparison::AutomaticSuperset;
@@ -1030,11 +1037,15 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
           table.evidence = analysis.evidence;
           table.evidence.insert(table.evidence.end(), bound.evidence.begin(), bound.evidence.end());
 
-          bool invalid = false;
+          if (primaryLoad->width < 4 && table.anchorAddress == 0) {
+            AddFailure(analysis, JumpTableFailure::UnsupportedRelativeForm);
+          }
+
+          bool invalid = !analysis.failures.empty();
           JumpTableFailure targetFailure = JumpTableFailure::None;
           uint32_t previousStorage = 0;
           uint32_t storageStride = 0;
-          for (uint32_t index = 0; index < bound.caseCount; ++index) {
+          for (uint32_t index = 0; index < bound.caseCount && !invalid; ++index) {
             auto evaluated = Evaluate(target.expression, indexKey, index, decoded);
             auto loadIt = evaluated.loads.find(primaryLoad->origin);
             if (!evaluated.ok || loadIt == evaluated.loads.end()) {
@@ -1067,7 +1078,6 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
 
             const uint32_t caseTarget = evaluated.value;
             table.rawEntries.push_back({storage, rawValue, caseTarget});
-            table.targets.push_back(caseTarget);
             if ((caseTarget & 3) != 0) {
               invalid = true;
               targetFailure = JumpTableFailure::TargetUnaligned;
@@ -1080,6 +1090,7 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
               targetFailure = JumpTableFailure::TargetOutOfRange;
               break;
             }
+            table.targets.push_back(caseTarget);
           }
 
           if (invalid) {

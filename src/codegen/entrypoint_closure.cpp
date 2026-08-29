@@ -1099,6 +1099,7 @@ static EntrypointClosureReport AnalyzeEntrypointClosureDecoded(const BinaryView&
                                                                EntrypointClosureInput input) {
   EntrypointClosureReport report;
   report.image = std::move(input.image);
+  report.jumpTableRecovery = std::move(input.jumpTableRecovery);
   report.limits = input.limits;
   report.limitDiagnostics = input.producerDiagnostics;
   report.counts.relocationStorageSites =
@@ -1222,6 +1223,10 @@ static EntrypointClosureReport AnalyzeEntrypointClosureDecoded(const BinaryView&
   std::sort(report.candidates.begin(), report.candidates.end(),
             [](const auto& a, const auto& b) { return a.address < b.address; });
   report.counts.candidateOverlapPairs = RecordCandidateOverlapConflicts(report.candidates);
+  for (const auto& candidate : report.candidates) {
+    if (candidate.classification == EntrypointClassification::JumpTableCase)
+      report.jumpTableRecovery.staticCandidatesReclassifiedAsCases.push_back(candidate.address);
+  }
 
   report.functionRanges = std::move(input.functionSeeds);
   for (const auto& seed : report.functionRanges) {
@@ -1327,6 +1332,147 @@ Json IndirectSiteJson(const EntrypointIndirectSite& site) {
               {"owner_address", Hex(site.ownerAddress)},
               {"link", site.link},
               {"kind", site.kind}};
+}
+
+Json JumpInstructionEvidenceJson(const JumpTableInstructionEvidence& evidence) {
+  return Json{{"address", Hex(evidence.address)},
+              {"raw_instruction", Hex(evidence.rawInstruction)},
+              {"role", evidence.role},
+              {"instruction", evidence.instruction}};
+}
+
+Json JumpTableJson(const JumpTable& table) {
+  Json targets = Json::array();
+  for (uint32_t target : table.targets)
+    targets.push_back(Hex(target));
+  Json rawEntries = Json::array();
+  for (const auto& entry : table.rawEntries) {
+    rawEntries.push_back(Json{{"storage_address", Hex(entry.storageAddress)},
+                              {"raw_value", Hex(entry.rawValue)},
+                              {"target", Hex(entry.target)}});
+  }
+  Json evidence = Json::array();
+  for (const auto& item : table.evidence)
+    evidence.push_back(JumpInstructionEvidenceJson(item));
+  return Json{{"dispatch_address", Hex(table.bctrAddress)},
+              {"owner_address", Hex(table.ownerAddress)},
+              {"origin", JumpTableOriginName(table.origin)},
+              {"manual_comparison", JumpTableManualComparisonName(table.manualComparison)},
+              {"kind", JumpTableKindName(table.kind)},
+              {"table_address", Hex(table.tableAddress)},
+              {"storage_end", Hex(table.storageEnd)},
+              {"storage_size", Hex(table.storageEnd - table.tableAddress)},
+              {"table_in_executable_section", table.tableInExecutableSection},
+              {"index_register", table.indexRegister},
+              {"bound_value", table.boundValue},
+              {"bound_inclusive", table.boundInclusive},
+              {"bound_semantics", table.boundSemantics},
+              {"case_count", table.caseCount},
+              {"default_target", table.defaultTarget ? Json(Hex(table.defaultTarget)) : Json(nullptr)},
+              {"default_is_return", table.defaultIsReturn},
+              {"element_width", table.elementWidth},
+              {"element_signed", table.elementSigned},
+              {"anchor_address", table.anchorAddress ? Json(Hex(table.anchorAddress)) : Json(nullptr)},
+              {"target_scale", table.targetScale},
+              {"targets", std::move(targets)},
+              {"raw_entries", std::move(rawEntries)},
+              {"instruction_evidence", std::move(evidence)},
+              {"confidence", table.confidence},
+              {"conflicts", table.conflicts}};
+}
+
+Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
+  Json failures = Json::array();
+  for (auto failure : site.failures)
+    failures.push_back(JumpTableFailureName(failure));
+  Json evidence = Json::array();
+  for (const auto& item : site.evidence)
+    evidence.push_back(JumpInstructionEvidenceJson(item));
+  return Json{{"site", Hex(site.site)},
+              {"owner_address", Hex(site.ownerAddress)},
+              {"classification", IndirectSiteClassificationName(site.classification)},
+              {"link", site.link},
+              {"conditional", site.conditional},
+              {"uses_ctr", site.usesCtr},
+              {"failures", std::move(failures)},
+              {"instruction_evidence", std::move(evidence)},
+              {"automatic_table", site.automaticTable ? JumpTableJson(*site.automaticTable)
+                                                        : Json(nullptr)},
+              {"selected_table", site.selectedTable ? JumpTableJson(*site.selectedTable)
+                                                      : Json(nullptr)}};
+}
+
+Json BoundaryEffectJson(const JumpTableBoundaryEffect& effect) {
+  Json preliminaryBlocks = Json::array();
+  for (const auto& block : effect.preliminaryBlocks)
+    preliminaryBlocks.push_back(RangeJson(block));
+  Json finalBlocks = Json::array();
+  for (const auto& block : effect.finalBlocks)
+    finalBlocks.push_back(RangeJson(block));
+  Json cases = Json::array();
+  for (uint32_t target : effect.caseTargets)
+    cases.push_back(Hex(target));
+  Json callable = Json::array();
+  for (uint32_t target : effect.independentlyCallableCases)
+    callable.push_back(Hex(target));
+  return Json{{"owner_address", Hex(effect.ownerAddress)},
+              {"owner_authority", effect.ownerAuthority},
+              {"pdata_associated", effect.pdataAssociated},
+              {"changed", effect.changed},
+              {"preliminary_extent", effect.preliminaryExtent
+                                             ? RangeJson(*effect.preliminaryExtent)
+                                             : Json(nullptr)},
+              {"final_extent", effect.finalExtent ? RangeJson(*effect.finalExtent) : Json(nullptr)},
+              {"preliminary_blocks", std::move(preliminaryBlocks)},
+              {"final_blocks", std::move(finalBlocks)},
+              {"case_targets", std::move(cases)},
+              {"independently_callable_cases", std::move(callable)}};
+}
+
+Json JumpTableRecoveryJson(const EntrypointJumpTableRecovery& recovery,
+                           const EntrypointImageIdentity& image) {
+  Json sites = Json::array();
+  for (const auto& site : recovery.indirectSites)
+    sites.push_back(JumpIndirectSiteJson(site));
+  Json effects = Json::array();
+  for (const auto& effect : recovery.boundaryEffects)
+    effects.push_back(BoundaryEffectJson(effect));
+  Json reclassified = Json::array();
+  for (uint32_t address : recovery.staticCandidatesReclassifiedAsCases)
+    reclassified.push_back(Hex(address));
+  return Json{
+      {"schema_version", recovery.schemaVersion},
+      {"analyzer_version", recovery.analyzerVersion},
+      {"image_identity",
+       Json{{"patched_image_sha256", image.patchedImageSha256},
+            {"executable_memory_fingerprint_algorithm",
+             image.executableMemoryFingerprintAlgorithm},
+            {"executable_memory_fingerprint", image.executableMemoryFingerprint},
+            {"image_base", Hex(image.imageBase)},
+            {"image_size", Hex(image.imageSize)},
+            {"title_id", Hex(image.titleId)},
+            {"media_id", Hex(image.mediaId)},
+            {"version", image.version}}},
+      {"limits",
+       Json{{"max_backward_instructions", recovery.limits.maxBackwardInstructions},
+            {"max_predecessors", recovery.limits.maxPredecessors},
+            {"max_states", recovery.limits.maxStates},
+            {"max_entries", recovery.limits.maxEntries},
+            {"max_fixpoint_iterations", recovery.limits.maxFixpointIterations}}},
+      {"stats",
+       Json{{"pass_elapsed_microseconds", recovery.stats.elapsedMicroseconds},
+            {"decoded_instructions", recovery.stats.decodedInstructions},
+            {"max_function_fixpoint_iterations", recovery.stats.fixpointIterations},
+            {"indirect_sites", recovery.stats.indirectSites},
+            {"recovered_tables", recovery.stats.recoveredTables},
+            {"manual_tables", recovery.stats.manualTables},
+            {"unresolved_relevant_ctr_sites", recovery.stats.unresolvedSites},
+            {"analysis_limit_hit", recovery.stats.analysisLimitHit}}},
+      {"indirect_sites", std::move(sites)},
+      {"boundary_effects", std::move(effects)},
+      {"static_candidates_reclassified_as_cases", std::move(reclassified)},
+      {"manual_tables_authoritative", true},
+      {"case_targets_are_functions_by_default", false}};
 }
 
 Json FunctionSeedJson(const EntrypointFunctionSeed& seed) {
@@ -1559,6 +1705,8 @@ void StreamEntrypointClosureJson(std::ostream& output, const EntrypointClosureRe
   output << ",\"indirect_sites\":";
   StreamJsonArray(output, report.indirectSites,
                   [](const auto& site) { return IndirectSiteJson(site); });
+  output << ",\"jump_table_recovery\":"
+         << JumpTableRecoveryJson(report.jumpTableRecovery, report.image).dump();
   output << ",\"candidates\":";
   StreamJsonArray(output, report.candidates,
                   [](const auto& candidate) { return CandidateJson(candidate); });
@@ -1707,6 +1855,114 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
     return Err(ErrorCategory::IO, "Unable to write entrypoint-closure.md");
   }
 
+  const auto jumpJson = JumpTableRecoveryJson(report.jumpTableRecovery, report.image);
+  if (!WriteReportFile(outputDirectory / "jump-table-recovery.json", jumpJson.dump(2) + '\n')) {
+    return Err(ErrorCategory::IO, "Unable to write jump-table-recovery.json");
+  }
+
+  std::ostringstream jumpCsv;
+  jumpCsv << "site,owner,classification,link,conditional,uses_ctr,recovered,origin,kind,"
+             "table_start,table_end,case_count,targets,failures,manual_comparison\n";
+  for (const auto& site : report.jumpTableRecovery.indirectSites) {
+    const JumpTable* table = site.selectedTable ? &*site.selectedTable : nullptr;
+    std::ostringstream targets;
+    if (table) {
+      for (size_t index = 0; index < table->targets.size(); ++index) {
+        if (index)
+          targets << ';';
+        targets << Hex(table->targets[index]);
+      }
+    }
+    std::ostringstream failures;
+    for (size_t index = 0; index < site.failures.size(); ++index) {
+      if (index)
+        failures << ';';
+      failures << JumpTableFailureName(site.failures[index]);
+    }
+    jumpCsv << Hex(site.site) << ',' << Hex(site.ownerAddress) << ','
+            << IndirectSiteClassificationName(site.classification) << ','
+            << (site.link ? "true" : "false") << ','
+            << (site.conditional ? "true" : "false") << ','
+            << (site.usesCtr ? "true" : "false") << ',' << (table ? "true" : "false") << ','
+            << (table ? JumpTableOriginName(table->origin) : "") << ','
+            << (table ? JumpTableKindName(table->kind) : "") << ','
+            << (table ? Hex(table->tableAddress) : "") << ','
+            << (table ? Hex(table->storageEnd) : "") << ','
+            << (table ? std::to_string(table->caseCount) : "") << ','
+            << CsvEscape(targets.str()) << ',' << CsvEscape(failures.str()) << ','
+            << (table ? JumpTableManualComparisonName(table->manualComparison) : "") << '\n';
+  }
+  if (!WriteReportFile(outputDirectory / "jump-table-recovery.csv", jumpCsv.str())) {
+    return Err(ErrorCategory::IO, "Unable to write jump-table-recovery.csv");
+  }
+
+  std::map<std::string, uint32_t> classifications;
+  std::map<std::string, uint32_t> failures;
+  for (const auto& site : report.jumpTableRecovery.indirectSites) {
+    classifications[IndirectSiteClassificationName(site.classification)]++;
+    for (auto failure : site.failures)
+      failures[JumpTableFailureName(failure)]++;
+  }
+  std::ostringstream jumpMarkdown;
+  jumpMarkdown << "# PPC jump-table recovery report\n\n"
+               << "Authoritative data: `jump-table-recovery.json` (schema "
+               << report.jumpTableRecovery.schemaVersion << ", analyser "
+               << report.jumpTableRecovery.analyzerVersion << ").\n\n"
+               << "- Patched image SHA-256: `" << report.image.patchedImageSha256 << "`\n"
+               << "- Relevant indirect sites: " << report.jumpTableRecovery.stats.indirectSites
+               << "\n"
+               << "- Automatically recovered tables: "
+               << report.jumpTableRecovery.stats.recoveredTables << "\n"
+               << "- Manual selected tables: " << report.jumpTableRecovery.stats.manualTables
+               << "\n"
+               << "- Unresolved relevant CTR sites: "
+               << report.jumpTableRecovery.stats.unresolvedSites << "\n"
+               << "- Max per-function fixpoint iterations: "
+               << report.jumpTableRecovery.stats.fixpointIterations << "\n"
+               << "- Recovery pass time: "
+               << report.jumpTableRecovery.stats.elapsedMicroseconds << " us\n"
+               << "- Decoded instructions visited by recovery: "
+               << report.jumpTableRecovery.stats.decodedInstructions << "\n"
+               << "- Boundary effects: " << report.jumpTableRecovery.boundaryEffects.size()
+               << " ("
+               << std::count_if(report.jumpTableRecovery.boundaryEffects.begin(),
+                                report.jumpTableRecovery.boundaryEffects.end(),
+                                [](const auto& effect) { return effect.changed; })
+               << " changed)\n\n## Classifications\n\n";
+  for (const auto& [name, count] : classifications)
+    jumpMarkdown << "- `" << name << "`: " << count << "\n";
+  jumpMarkdown << "\n## Unresolved reasons\n\n";
+  for (const auto& [name, count] : failures)
+    jumpMarkdown << "- `" << name << "`: " << count << "\n";
+  jumpMarkdown << "\n## Recovered tables\n\n"
+                  "| Dispatch | Owner | Kind | Cases | Storage | Manual comparison |\n"
+                  "|---|---|---|---:|---|---|\n";
+  for (const auto& site : report.jumpTableRecovery.indirectSites) {
+    if (!site.selectedTable)
+      continue;
+    const auto& table = *site.selectedTable;
+    jumpMarkdown << "| `" << Hex(site.site) << "` | `" << Hex(site.ownerAddress) << "` | `"
+                 << JumpTableKindName(table.kind) << "` | " << table.caseCount << " | `"
+                 << Hex(table.tableAddress) << "-" << Hex(table.storageEnd) << "` | `"
+                 << JumpTableManualComparisonName(table.manualComparison) << "` |\n";
+  }
+  jumpMarkdown << "\n## Unresolved relevant CTR sites\n\n"
+                  "| Site | Owner | Classification | Reasons |\n"
+                  "|---|---|---|---|\n";
+  for (const auto& site : report.jumpTableRecovery.indirectSites) {
+    if (!site.usesCtr || site.link || site.selectedTable)
+      continue;
+    std::ostringstream reasons;
+    for (auto failure : site.failures)
+      reasons << JumpTableFailureName(failure) << ' ';
+    jumpMarkdown << "| `" << Hex(site.site) << "` | `" << Hex(site.ownerAddress) << "` | `"
+                 << IndirectSiteClassificationName(site.classification) << "` | `"
+                 << reasons.str() << "` |\n";
+  }
+  if (!WriteReportFile(outputDirectory / "jump-table-recovery.md", jumpMarkdown.str())) {
+    return Err(ErrorCategory::IO, "Unable to write jump-table-recovery.md");
+  }
+
   Json volatileJson{{"schema_version", 1},
                     {"authoritative_report", "entrypoint-closure.json"},
                     {"elapsed_milliseconds", runMetadata.elapsedMilliseconds},
@@ -1715,6 +1971,17 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
   if (!WriteReportFile(outputDirectory / "entrypoint-closure-run.json",
                        volatileJson.dump(2) + '\n')) {
     return Err(ErrorCategory::IO, "Unable to write entrypoint-closure-run.json");
+  }
+  Json jumpVolatileJson{{"schema_version", 1},
+                        {"authoritative_report", "jump-table-recovery.json"},
+                        {"pipeline_elapsed_milliseconds", runMetadata.elapsedMilliseconds},
+                        {"recovery_pass_elapsed_microseconds",
+                         report.jumpTableRecovery.stats.elapsedMicroseconds},
+                        {"peak_working_set_bytes", runMetadata.peakWorkingSetBytes},
+                        {"command_line", runMetadata.commandLine}};
+  if (!WriteReportFile(outputDirectory / "jump-table-recovery-run.json",
+                       jumpVolatileJson.dump(2) + '\n')) {
+    return Err(ErrorCategory::IO, "Unable to write jump-table-recovery-run.json");
   }
 
   if (writeReviewToml) {

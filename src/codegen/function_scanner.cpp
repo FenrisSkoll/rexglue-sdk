@@ -2086,6 +2086,8 @@ BlockDiscoveryResult discoverBlocks(
   JumpTableRecoveryStats aggregate;
   BlockDiscoveryResult result;
   std::vector<Block> preliminaryBlocks;
+  std::unordered_set<uint32_t> rejectedAutomaticSites;
+  std::unordered_map<uint32_t, std::vector<JumpTableFailure>> rejectionReasons;
   JumpTableRecoveryLimits limits;
   limits.maxBackwardInstructions = REXCVAR_GET(backward_scan_limit);
   limits.maxEntries = REXCVAR_GET(max_jump_table_entries);
@@ -2108,9 +2110,16 @@ BlockDiscoveryResult discoverBlocks(
     sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
 
     std::vector<IndirectSiteAnalysis> analyses;
-    std::unordered_map<uint32_t, JumpTable> nextTables = selectedTables;
+    std::unordered_map<uint32_t, JumpTable> nextTables;
+    if (manualSwitchTables) {
+      for (const auto& [site, configured] : *manualSwitchTables) {
+        JumpTable manual = configured;
+        manual.origin = JumpTableOrigin::Manual;
+        manual.bctrAddress = site;
+        nextTables.emplace(site, std::move(manual));
+      }
+    }
     JumpTableRecoveryStats iterationStats;
-    bool changed = false;
 
     for (uint32_t site : sites) {
       const JumpTable* manual = nullptr;
@@ -2128,13 +2137,24 @@ BlockDiscoveryResult discoverBlocks(
       input.manualTable = manual;
       input.limits = limits;
       auto analysis = AnalyzeIndirectSite(decoded, input, &iterationStats);
-      if (analysis.selectedTable) {
-        auto existing = selectedTables.find(site);
-        if (existing == selectedTables.end() ||
-            existing->second.targets != analysis.selectedTable->targets ||
-            existing->second.tableAddress != analysis.selectedTable->tableAddress) {
-          changed = true;
+      auto previous = selectedTables.find(site);
+      if (!analysis.selectedTable && previous != selectedTables.end() &&
+          previous->second.origin == JumpTableOrigin::Automatic) {
+        rejectedAutomaticSites.insert(site);
+        rejectionReasons[site] = analysis.failures;
+      }
+      if (rejectedAutomaticSites.contains(site) && analysis.selectedTable &&
+          analysis.selectedTable->origin == JumpTableOrigin::Automatic) {
+        if (analysis.automaticTable) {
+          analysis.automaticTable->confidence = "rejected_after_cfg_expansion";
+          for (auto failure : rejectionReasons[site])
+            analysis.automaticTable->conflicts.push_back(JumpTableFailureName(failure));
         }
+        analysis.selectedTable.reset();
+        analysis.failures = rejectionReasons[site];
+        analysis.classification = IndirectSiteClassification::ComputedTailBctr;
+      }
+      if (analysis.selectedTable) {
         nextTables[site] = *analysis.selectedTable;
       }
       analyses.push_back(std::move(analysis));
@@ -2145,13 +2165,28 @@ BlockDiscoveryResult discoverBlocks(
     aggregate.analysisLimitHit = aggregate.analysisLimitHit || iterationStats.analysisLimitHit;
     aggregate.fixpointIterations = iteration;
     result.indirectSites = std::move(analyses);
+    bool changed = selectedTables.size() != nextTables.size();
+    if (!changed) {
+      for (const auto& [site, table] : selectedTables) {
+        auto next = nextTables.find(site);
+        if (next == nextTables.end() || next->second.targets != table.targets ||
+            next->second.tableAddress != table.tableAddress ||
+            next->second.origin != table.origin) {
+          changed = true;
+          break;
+        }
+      }
+    }
     selectedTables = std::move(nextTables);
 
     if (!changed) {
       aggregate.indirectSites = static_cast<uint32_t>(result.indirectSites.size());
       aggregate.recoveredTables = static_cast<uint32_t>(std::count_if(
           result.indirectSites.begin(), result.indirectSites.end(),
-          [](const auto& site) { return site.automaticTable.has_value(); }));
+          [](const auto& site) {
+            return site.selectedTable &&
+                   site.selectedTable->origin == JumpTableOrigin::Automatic;
+          }));
       aggregate.manualTables = static_cast<uint32_t>(std::count_if(
           result.indirectSites.begin(), result.indirectSites.end(), [](const auto& site) {
             return site.selectedTable && site.selectedTable->origin == JumpTableOrigin::Manual;

@@ -22,14 +22,15 @@
 #include <vector>
 
 #include <rex/codegen/binary_view.h>
+#include <rex/codegen/function_types.h>
 #include <rex/result.h>
 
 namespace rex::codegen {
 
 class CodegenContext;
 
-inline constexpr uint32_t kEntrypointClosureSchemaVersion = 2;
-inline constexpr std::string_view kEntrypointClosureAnalyzerVersion = "1.1.0";
+inline constexpr uint32_t kEntrypointClosureSchemaVersion = 3;
+inline constexpr std::string_view kEntrypointClosureAnalyzerVersion = "2.0.0";
 inline constexpr std::string_view kExecutableMemoryFingerprintAlgorithm =
     "fable2-executable-memory-sha256-v1";
 
@@ -93,6 +94,7 @@ struct EntrypointAddressRange {
   bool overlaps(const EntrypointAddressRange& other) const {
     return start < other.end && other.start < end;
   }
+  bool operator==(const EntrypointAddressRange&) const = default;
 };
 
 struct EntrypointEvidence {
@@ -252,6 +254,29 @@ struct EntrypointClosureCounts {
   uint32_t candidateOverlapPairs = 0;
 };
 
+struct JumpTableBoundaryEffect {
+  uint32_t ownerAddress = 0;
+  std::string ownerAuthority;
+  bool pdataAssociated = false;
+  std::vector<EntrypointAddressRange> preliminaryBlocks;
+  std::vector<EntrypointAddressRange> finalBlocks;
+  std::optional<EntrypointAddressRange> preliminaryExtent;
+  std::optional<EntrypointAddressRange> finalExtent;
+  std::vector<uint32_t> caseTargets;
+  std::vector<uint32_t> independentlyCallableCases;
+  bool changed = false;
+};
+
+struct EntrypointJumpTableRecovery {
+  uint32_t schemaVersion = 1;
+  std::string analyzerVersion = "1.0.0";
+  JumpTableRecoveryLimits limits;
+  JumpTableRecoveryStats stats;
+  std::vector<IndirectSiteAnalysis> indirectSites;
+  std::vector<JumpTableBoundaryEffect> boundaryEffects;
+  std::vector<uint32_t> staticCandidatesReclassifiedAsCases;
+};
+
 struct EntrypointClosureReport {
   uint32_t schemaVersion = kEntrypointClosureSchemaVersion;
   std::string analyzerVersion = std::string(kEntrypointClosureAnalyzerVersion);
@@ -266,6 +291,7 @@ struct EntrypointClosureReport {
   std::vector<EntrypointLimitDiagnostic> limitDiagnostics;
   std::vector<EntrypointFixtureResult> fixtureResults;
   EntrypointClosureCounts counts;
+  EntrypointJumpTableRecovery jumpTableRecovery;
   bool fixpointReached = false;
   bool manifestMutationAttempted = false;
 };
@@ -280,6 +306,7 @@ struct EntrypointClosureInput {
   std::vector<std::pair<uint32_t, std::string>> peExports;
   std::vector<uint32_t> tlsCallbacks;
   std::vector<EntrypointLimitDiagnostic> producerDiagnostics;
+  EntrypointJumpTableRecovery jumpTableRecovery;
 };
 
 struct EntrypointClosureRunMetadata {

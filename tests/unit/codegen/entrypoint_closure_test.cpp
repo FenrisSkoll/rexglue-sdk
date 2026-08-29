@@ -398,5 +398,9 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
     CHECK(after == sentinel);
   }
   CHECK(fs::exists(directory / "analysis" / "entrypoint-closure.json"));
+  CHECK(fs::exists(directory / "analysis" / "jump-table-recovery.json"));
+  CHECK(fs::exists(directory / "analysis" / "jump-table-recovery.csv"));
+  CHECK(fs::exists(directory / "analysis" / "jump-table-recovery.md"));
+  CHECK(fs::exists(directory / "analysis" / "jump-table-recovery-run.json"));
   fs::remove_all(directory);
 }
