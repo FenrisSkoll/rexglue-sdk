@@ -45,6 +45,16 @@ struct FunctionConfig;
  * Separates analysis state from user-provided config.
  */
 struct AnalysisState {
+  struct StageTimings {
+    uint64_t decodeMicroseconds = 0;
+    uint64_t registerMicroseconds = 0;
+    uint64_t scanMicroseconds = 0;
+    uint64_t discoverMicroseconds = 0;
+    uint64_t gapFillMicroseconds = 0;
+    uint64_t mergeMicroseconds = 0;
+    uint64_t validateMicroseconds = 0;
+  } stageTimings;
+
   // Binary-derived (set once from BinaryView)
   std::string format;        ///< "xex" or "elf"
   uint64_t loadAddress = 0;  ///< Image base address

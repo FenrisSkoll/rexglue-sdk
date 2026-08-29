@@ -390,7 +390,10 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
     std::ofstream output(manifest, std::ios::binary);
     output << sentinel;
   }
-  auto result = WriteEntrypointClosureReports(report, {}, directory / "analysis");
+  EntrypointClosureRunMetadata runMetadata;
+  runMetadata.elapsedMilliseconds = 123;
+  runMetadata.stageTimings.gapFillMicroseconds = 456;
+  auto result = WriteEntrypointClosureReports(report, runMetadata, directory / "analysis");
   REQUIRE(result);
   {
     std::ifstream input(manifest, std::ios::binary);
@@ -402,5 +405,13 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
   CHECK(fs::exists(directory / "analysis" / "jump-table-recovery.csv"));
   CHECK(fs::exists(directory / "analysis" / "jump-table-recovery.md"));
   CHECK(fs::exists(directory / "analysis" / "jump-table-recovery-run.json"));
+  {
+    std::ifstream input(directory / "analysis" / "entrypoint-closure-run.json", std::ios::binary);
+    const auto volatileReport = nlohmann::json::parse(input);
+    CHECK(volatileReport.at("schema_version") == 2);
+    CHECK(volatileReport.at("elapsed_milliseconds") == 123);
+    CHECK(volatileReport.at("stage_elapsed_microseconds").at("gap_fill_phase") == 456);
+    CHECK(volatileReport.at("serialization_elapsed_microseconds").contains("total"));
+  }
   fs::remove_all(directory);
 }

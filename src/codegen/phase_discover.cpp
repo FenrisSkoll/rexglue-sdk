@@ -112,6 +112,12 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
   auto& recovery = ctx.analysisState().jumpTableRecovery;
   ctx.analysisState().jumpTableLimits = result.jumpTableLimits;
   recovery.elapsedMicroseconds += result.jumpTableRecovery.elapsedMicroseconds;
+  recovery.preliminaryCfgMicroseconds += result.jumpTableRecovery.preliminaryCfgMicroseconds;
+  recovery.caseExpansionCfgMicroseconds += result.jumpTableRecovery.caseExpansionCfgMicroseconds;
+  recovery.indirectSiteClassificationMicroseconds +=
+      result.jumpTableRecovery.indirectSiteClassificationMicroseconds;
+  recovery.fixpointOverheadMicroseconds += result.jumpTableRecovery.fixpointOverheadMicroseconds;
+  recovery.functionFixpointMicroseconds += result.jumpTableRecovery.functionFixpointMicroseconds;
   recovery.decodedInstructions += result.jumpTableRecovery.decodedInstructions;
   recovery.fixpointIterations =
       std::max(recovery.fixpointIterations, result.jumpTableRecovery.fixpointIterations);

@@ -310,6 +310,29 @@ struct EntrypointClosureInput {
 };
 
 struct EntrypointClosureRunMetadata {
+  struct StageTimings {
+    uint64_t imageLoadMicroseconds = 0;
+    uint64_t identityVerificationMicroseconds = 0;
+    uint64_t instructionDecodeMicroseconds = 0;
+    uint64_t registerMicroseconds = 0;
+    uint64_t scanMicroseconds = 0;
+    uint64_t discoverMicroseconds = 0;
+    uint64_t gapFillMicroseconds = 0;
+    uint64_t finalOwnershipMicroseconds = 0;
+    uint64_t validateMicroseconds = 0;
+    uint64_t preliminaryCfgMicroseconds = 0;
+    uint64_t indirectSiteClassificationMicroseconds = 0;
+    uint64_t jumpTableDataflowRecoveryMicroseconds = 0;
+    uint64_t caseTargetCfgExpansionMicroseconds = 0;
+    uint64_t perFunctionFixpointMicroseconds = 0;
+    uint64_t fixpointOverheadMicroseconds = 0;
+    uint64_t functionSeedConstructionMicroseconds = 0;
+    uint64_t jumpTableReportConstructionMicroseconds = 0;
+    uint64_t closureAnalysisMicroseconds = 0;
+    uint64_t sectionHashingMicroseconds = 0;
+    uint64_t ghidraIntegrationMicroseconds = 0;
+  } stageTimings;
+
   uint64_t elapsedMilliseconds = 0;
   uint64_t peakWorkingSetBytes = 0;
   std::string commandLine;

@@ -12,6 +12,7 @@
 #include "decoded_binary.h"
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 
 #include <rex/codegen/analysis_errors.h>
@@ -26,14 +27,25 @@ namespace rex::codegen {
 Result<void> Analyze(CodegenContext& ctx, ProgressReporter* reporter) {
   REXCODEGEN_TRACE("Analyze: starting analysis...");
 
+  using Clock = std::chrono::steady_clock;
+  auto elapsedMicroseconds = [](Clock::time_point started) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
+  };
+  auto& timings = ctx.analysisState().stageTimings;
+
+  auto stageStarted = Clock::now();
   ctx.initDecoded();
+  timings.decodeMicroseconds += elapsedMicroseconds(stageStarted);
   REXCODEGEN_TRACE("Analyze: decoded {} instructions across {} code regions",
                    ctx.decoded().instructionCount(), ctx.decoded().codeRegions().size());
 
   // 1. Register entry points (imports, helpers, config, pdata)
   if (reporter)
     reporter->phaseChanged("Register");
+  stageStarted = Clock::now();
   auto regResult = phases::Register(ctx, reporter);
+  timings.registerMicroseconds += elapsedMicroseconds(stageStarted);
   if (!regResult) {
     return regResult;
   }
@@ -41,7 +53,9 @@ Result<void> Analyze(CodegenContext& ctx, ProgressReporter* reporter) {
   // 2. Scan binary into code/data regions
   if (reporter)
     reporter->phaseChanged("Scan");
+  stageStarted = Clock::now();
   auto scanResult = phases::Scan(ctx, reporter);
+  timings.scanMicroseconds += elapsedMicroseconds(stageStarted);
   if (!scanResult) {
     return scanResult;
   }
@@ -49,7 +63,9 @@ Result<void> Analyze(CodegenContext& ctx, ProgressReporter* reporter) {
   // 3. Discover function blocks iteratively (includes vtable scan)
   if (reporter)
     reporter->phaseChanged("Discover");
+  stageStarted = Clock::now();
   auto discoverResult = phases::Discover(ctx, reporter);
+  timings.discoverMicroseconds += elapsedMicroseconds(stageStarted);
   if (!discoverResult) {
     return discoverResult;
   }
@@ -61,7 +77,9 @@ Result<void> Analyze(CodegenContext& ctx, ProgressReporter* reporter) {
   // 4. Gap fill uncovered regions + discover blocks for gap-filled functions + cleanup
   if (reporter)
     reporter->phaseChanged("GapFill");
+  stageStarted = Clock::now();
   auto gapFillResult = phases::GapFill(ctx, reporter);
+  timings.gapFillMicroseconds += elapsedMicroseconds(stageStarted);
   if (!gapFillResult) {
     return gapFillResult;
   }
@@ -69,7 +87,9 @@ Result<void> Analyze(CodegenContext& ctx, ProgressReporter* reporter) {
   // 5. Merge: resolve jumps and seal functions
   if (reporter)
     reporter->phaseChanged("Merge");
+  stageStarted = Clock::now();
   auto mergeResult = phases::Merge(ctx, reporter);
+  timings.mergeMicroseconds += elapsedMicroseconds(stageStarted);
   if (!mergeResult) {
     return mergeResult;
   }
@@ -77,7 +97,9 @@ Result<void> Analyze(CodegenContext& ctx, ProgressReporter* reporter) {
   // 6. Validate
   if (reporter)
     reporter->phaseChanged("Validate");
+  stageStarted = Clock::now();
   auto validateResult = phases::Validate(ctx, reporter);
+  timings.validateMicroseconds += elapsedMicroseconds(stageStarted);
   if (!validateResult) {
     return validateResult;
   }

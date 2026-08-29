@@ -16,6 +16,7 @@
 #include "file_io.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <deque>
 #include <fstream>
 #include <limits>
@@ -1354,31 +1355,32 @@ Json JumpTableJson(const JumpTable& table) {
   Json evidence = Json::array();
   for (const auto& item : table.evidence)
     evidence.push_back(JumpInstructionEvidenceJson(item));
-  return Json{{"dispatch_address", Hex(table.bctrAddress)},
-              {"owner_address", Hex(table.ownerAddress)},
-              {"origin", JumpTableOriginName(table.origin)},
-              {"manual_comparison", JumpTableManualComparisonName(table.manualComparison)},
-              {"kind", JumpTableKindName(table.kind)},
-              {"table_address", Hex(table.tableAddress)},
-              {"storage_end", Hex(table.storageEnd)},
-              {"storage_size", Hex(table.storageEnd - table.tableAddress)},
-              {"table_in_executable_section", table.tableInExecutableSection},
-              {"index_register", table.indexRegister},
-              {"bound_value", table.boundValue},
-              {"bound_inclusive", table.boundInclusive},
-              {"bound_semantics", table.boundSemantics},
-              {"case_count", table.caseCount},
-              {"default_target", table.defaultTarget ? Json(Hex(table.defaultTarget)) : Json(nullptr)},
-              {"default_is_return", table.defaultIsReturn},
-              {"element_width", table.elementWidth},
-              {"element_signed", table.elementSigned},
-              {"anchor_address", table.anchorAddress ? Json(Hex(table.anchorAddress)) : Json(nullptr)},
-              {"target_scale", table.targetScale},
-              {"targets", std::move(targets)},
-              {"raw_entries", std::move(rawEntries)},
-              {"instruction_evidence", std::move(evidence)},
-              {"confidence", table.confidence},
-              {"conflicts", table.conflicts}};
+  return Json{
+      {"dispatch_address", Hex(table.bctrAddress)},
+      {"owner_address", Hex(table.ownerAddress)},
+      {"origin", JumpTableOriginName(table.origin)},
+      {"manual_comparison", JumpTableManualComparisonName(table.manualComparison)},
+      {"kind", JumpTableKindName(table.kind)},
+      {"table_address", Hex(table.tableAddress)},
+      {"storage_end", Hex(table.storageEnd)},
+      {"storage_size", Hex(table.storageEnd - table.tableAddress)},
+      {"table_in_executable_section", table.tableInExecutableSection},
+      {"index_register", table.indexRegister},
+      {"bound_value", table.boundValue},
+      {"bound_inclusive", table.boundInclusive},
+      {"bound_semantics", table.boundSemantics},
+      {"case_count", table.caseCount},
+      {"default_target", table.defaultTarget ? Json(Hex(table.defaultTarget)) : Json(nullptr)},
+      {"default_is_return", table.defaultIsReturn},
+      {"element_width", table.elementWidth},
+      {"element_signed", table.elementSigned},
+      {"anchor_address", table.anchorAddress ? Json(Hex(table.anchorAddress)) : Json(nullptr)},
+      {"target_scale", table.targetScale},
+      {"targets", std::move(targets)},
+      {"raw_entries", std::move(rawEntries)},
+      {"instruction_evidence", std::move(evidence)},
+      {"confidence", table.confidence},
+      {"conflicts", table.conflicts}};
 }
 
 Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
@@ -1388,18 +1390,18 @@ Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
   Json evidence = Json::array();
   for (const auto& item : site.evidence)
     evidence.push_back(JumpInstructionEvidenceJson(item));
-  return Json{{"site", Hex(site.site)},
-              {"owner_address", Hex(site.ownerAddress)},
-              {"classification", IndirectSiteClassificationName(site.classification)},
-              {"link", site.link},
-              {"conditional", site.conditional},
-              {"uses_ctr", site.usesCtr},
-              {"failures", std::move(failures)},
-              {"instruction_evidence", std::move(evidence)},
-              {"automatic_table", site.automaticTable ? JumpTableJson(*site.automaticTable)
-                                                        : Json(nullptr)},
-              {"selected_table", site.selectedTable ? JumpTableJson(*site.selectedTable)
-                                                      : Json(nullptr)}};
+  return Json{
+      {"site", Hex(site.site)},
+      {"owner_address", Hex(site.ownerAddress)},
+      {"classification", IndirectSiteClassificationName(site.classification)},
+      {"link", site.link},
+      {"conditional", site.conditional},
+      {"uses_ctr", site.usesCtr},
+      {"failures", std::move(failures)},
+      {"instruction_evidence", std::move(evidence)},
+      {"automatic_table",
+       site.automaticTable ? JumpTableJson(*site.automaticTable) : Json(nullptr)},
+      {"selected_table", site.selectedTable ? JumpTableJson(*site.selectedTable) : Json(nullptr)}};
 }
 
 Json BoundaryEffectJson(const JumpTableBoundaryEffect& effect) {
@@ -1419,9 +1421,8 @@ Json BoundaryEffectJson(const JumpTableBoundaryEffect& effect) {
               {"owner_authority", effect.ownerAuthority},
               {"pdata_associated", effect.pdataAssociated},
               {"changed", effect.changed},
-              {"preliminary_extent", effect.preliminaryExtent
-                                             ? RangeJson(*effect.preliminaryExtent)
-                                             : Json(nullptr)},
+              {"preliminary_extent",
+               effect.preliminaryExtent ? RangeJson(*effect.preliminaryExtent) : Json(nullptr)},
               {"final_extent", effect.finalExtent ? RangeJson(*effect.finalExtent) : Json(nullptr)},
               {"preliminary_blocks", std::move(preliminaryBlocks)},
               {"final_blocks", std::move(finalBlocks)},
@@ -1445,28 +1446,25 @@ Json JumpTableRecoveryJson(const EntrypointJumpTableRecovery& recovery,
       {"analyzer_version", recovery.analyzerVersion},
       {"image_identity",
        Json{{"patched_image_sha256", image.patchedImageSha256},
-            {"executable_memory_fingerprint_algorithm",
-             image.executableMemoryFingerprintAlgorithm},
+            {"executable_memory_fingerprint_algorithm", image.executableMemoryFingerprintAlgorithm},
             {"executable_memory_fingerprint", image.executableMemoryFingerprint},
             {"image_base", Hex(image.imageBase)},
             {"image_size", Hex(image.imageSize)},
             {"title_id", Hex(image.titleId)},
             {"media_id", Hex(image.mediaId)},
             {"version", image.version}}},
-      {"limits",
-       Json{{"max_backward_instructions", recovery.limits.maxBackwardInstructions},
-            {"max_predecessors", recovery.limits.maxPredecessors},
-            {"max_states", recovery.limits.maxStates},
-            {"max_entries", recovery.limits.maxEntries},
-            {"max_fixpoint_iterations", recovery.limits.maxFixpointIterations}}},
-      {"stats",
-       Json{{"decoded_instructions", recovery.stats.decodedInstructions},
-            {"max_function_fixpoint_iterations", recovery.stats.fixpointIterations},
-            {"indirect_sites", recovery.stats.indirectSites},
-            {"recovered_tables", recovery.stats.recoveredTables},
-            {"manual_tables", recovery.stats.manualTables},
-            {"unresolved_relevant_ctr_sites", recovery.stats.unresolvedSites},
-            {"analysis_limit_hit", recovery.stats.analysisLimitHit}}},
+      {"limits", Json{{"max_backward_instructions", recovery.limits.maxBackwardInstructions},
+                      {"max_predecessors", recovery.limits.maxPredecessors},
+                      {"max_states", recovery.limits.maxStates},
+                      {"max_entries", recovery.limits.maxEntries},
+                      {"max_fixpoint_iterations", recovery.limits.maxFixpointIterations}}},
+      {"stats", Json{{"decoded_instructions", recovery.stats.decodedInstructions},
+                     {"max_function_fixpoint_iterations", recovery.stats.fixpointIterations},
+                     {"indirect_sites", recovery.stats.indirectSites},
+                     {"recovered_tables", recovery.stats.recoveredTables},
+                     {"manual_tables", recovery.stats.manualTables},
+                     {"unresolved_relevant_ctr_sites", recovery.stats.unresolvedSites},
+                     {"analysis_limit_hit", recovery.stats.analysisLimitHit}}},
       {"indirect_sites", std::move(sites)},
       {"boundary_effects", std::move(effects)},
       {"static_candidates_reclassified_as_cases", std::move(reclassified)},
@@ -1759,6 +1757,17 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
                                            const EntrypointClosureRunMetadata& runMetadata,
                                            const std::filesystem::path& outputDirectory,
                                            bool writeReviewToml) {
+  using Clock = std::chrono::steady_clock;
+  const auto serializationStarted = Clock::now();
+  auto elapsedMicroseconds = [](Clock::time_point started) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
+  };
+  uint64_t jsonMicroseconds = 0;
+  uint64_t csvMicroseconds = 0;
+  uint64_t markdownMicroseconds = 0;
+  uint64_t reviewTomlMicroseconds = 0;
+
   std::error_code error;
   std::filesystem::create_directories(outputDirectory, error);
   if (error) {
@@ -1766,6 +1775,7 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
                                               outputDirectory.string(), error.message()));
   }
 
+  auto formatStarted = Clock::now();
   std::ofstream jsonOutput(outputDirectory / "entrypoint-closure.json",
                            std::ios::binary | std::ios::trunc);
   if (!jsonOutput) {
@@ -1775,7 +1785,9 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
   jsonOutput.close();
   if (!jsonOutput)
     return Err(ErrorCategory::IO, "Unable to write entrypoint-closure.json");
+  jsonMicroseconds += elapsedMicroseconds(formatStarted);
 
+  formatStarted = Clock::now();
   std::ostringstream csv;
   csv << "address,end,size,classification,confidence,known_range_relationship,"
          "complete_traversal,evidence_kinds,storage_addresses,source_addresses,"
@@ -1801,7 +1813,9 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
   if (!WriteReportFile(outputDirectory / "entrypoint-closure.csv", csv.str())) {
     return Err(ErrorCategory::IO, "Unable to write entrypoint-closure.csv");
   }
+  csvMicroseconds += elapsedMicroseconds(formatStarted);
 
+  formatStarted = Clock::now();
   std::ostringstream markdown;
   markdown << "# Static entrypoint-closure report\n\n"
            << "Authoritative data: `entrypoint-closure.json` (schema " << report.schemaVersion
@@ -1853,12 +1867,16 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
   if (!WriteReportFile(outputDirectory / "entrypoint-closure.md", markdown.str())) {
     return Err(ErrorCategory::IO, "Unable to write entrypoint-closure.md");
   }
+  markdownMicroseconds += elapsedMicroseconds(formatStarted);
 
+  formatStarted = Clock::now();
   const auto jumpJson = JumpTableRecoveryJson(report.jumpTableRecovery, report.image);
   if (!WriteReportFile(outputDirectory / "jump-table-recovery.json", jumpJson.dump(2) + '\n')) {
     return Err(ErrorCategory::IO, "Unable to write jump-table-recovery.json");
   }
+  jsonMicroseconds += elapsedMicroseconds(formatStarted);
 
+  formatStarted = Clock::now();
   std::ostringstream jumpCsv;
   jumpCsv << "site,owner,classification,link,conditional,uses_ctr,recovered,origin,kind,"
              "table_start,table_end,case_count,targets,failures,manual_comparison\n";
@@ -1880,20 +1898,20 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
     }
     jumpCsv << Hex(site.site) << ',' << Hex(site.ownerAddress) << ','
             << IndirectSiteClassificationName(site.classification) << ','
-            << (site.link ? "true" : "false") << ','
-            << (site.conditional ? "true" : "false") << ','
+            << (site.link ? "true" : "false") << ',' << (site.conditional ? "true" : "false") << ','
             << (site.usesCtr ? "true" : "false") << ',' << (table ? "true" : "false") << ','
             << (table ? JumpTableOriginName(table->origin) : "") << ','
             << (table ? JumpTableKindName(table->kind) : "") << ','
             << (table ? Hex(table->tableAddress) : "") << ','
             << (table ? Hex(table->storageEnd) : "") << ','
-            << (table ? std::to_string(table->caseCount) : "") << ','
-            << CsvEscape(targets.str()) << ',' << CsvEscape(failures.str()) << ','
+            << (table ? std::to_string(table->caseCount) : "") << ',' << CsvEscape(targets.str())
+            << ',' << CsvEscape(failures.str()) << ','
             << (table ? JumpTableManualComparisonName(table->manualComparison) : "") << '\n';
   }
   if (!WriteReportFile(outputDirectory / "jump-table-recovery.csv", jumpCsv.str())) {
     return Err(ErrorCategory::IO, "Unable to write jump-table-recovery.csv");
   }
+  csvMicroseconds += elapsedMicroseconds(formatStarted);
 
   std::map<std::string, uint32_t> classifications;
   std::map<std::string, uint32_t> failures;
@@ -1902,6 +1920,7 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
     for (auto failure : site.failures)
       failures[JumpTableFailureName(failure)]++;
   }
+  formatStarted = Clock::now();
   std::ostringstream jumpMarkdown;
   jumpMarkdown << "# PPC jump-table recovery report\n\n"
                << "Authoritative data: `jump-table-recovery.json` (schema "
@@ -1920,8 +1939,7 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
                << report.jumpTableRecovery.stats.fixpointIterations << "\n"
                << "- Decoded instructions visited by recovery: "
                << report.jumpTableRecovery.stats.decodedInstructions << "\n"
-               << "- Boundary effects: " << report.jumpTableRecovery.boundaryEffects.size()
-               << " ("
+               << "- Boundary effects: " << report.jumpTableRecovery.boundaryEffects.size() << " ("
                << std::count_if(report.jumpTableRecovery.boundaryEffects.begin(),
                                 report.jumpTableRecovery.boundaryEffects.end(),
                                 [](const auto& effect) { return effect.changed; })
@@ -1953,35 +1971,16 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
     for (auto failure : site.failures)
       reasons << JumpTableFailureName(failure) << ' ';
     jumpMarkdown << "| `" << Hex(site.site) << "` | `" << Hex(site.ownerAddress) << "` | `"
-                 << IndirectSiteClassificationName(site.classification) << "` | `"
-                 << reasons.str() << "` |\n";
+                 << IndirectSiteClassificationName(site.classification) << "` | `" << reasons.str()
+                 << "` |\n";
   }
   if (!WriteReportFile(outputDirectory / "jump-table-recovery.md", jumpMarkdown.str())) {
     return Err(ErrorCategory::IO, "Unable to write jump-table-recovery.md");
   }
-
-  Json volatileJson{{"schema_version", 1},
-                    {"authoritative_report", "entrypoint-closure.json"},
-                    {"elapsed_milliseconds", runMetadata.elapsedMilliseconds},
-                    {"peak_working_set_bytes", runMetadata.peakWorkingSetBytes},
-                    {"command_line", runMetadata.commandLine}};
-  if (!WriteReportFile(outputDirectory / "entrypoint-closure-run.json",
-                       volatileJson.dump(2) + '\n')) {
-    return Err(ErrorCategory::IO, "Unable to write entrypoint-closure-run.json");
-  }
-  Json jumpVolatileJson{{"schema_version", 1},
-                        {"authoritative_report", "jump-table-recovery.json"},
-                        {"pipeline_elapsed_milliseconds", runMetadata.elapsedMilliseconds},
-                        {"recovery_pass_elapsed_microseconds",
-                         report.jumpTableRecovery.stats.elapsedMicroseconds},
-                        {"peak_working_set_bytes", runMetadata.peakWorkingSetBytes},
-                        {"command_line", runMetadata.commandLine}};
-  if (!WriteReportFile(outputDirectory / "jump-table-recovery-run.json",
-                       jumpVolatileJson.dump(2) + '\n')) {
-    return Err(ErrorCategory::IO, "Unable to write jump-table-recovery-run.json");
-  }
+  markdownMicroseconds += elapsedMicroseconds(formatStarted);
 
   if (writeReviewToml) {
+    formatStarted = Clock::now();
     std::ostringstream toml;
     toml << "# REVIEW ONLY: not loaded or applied by ReXGlue.\n"
             "# Verify every boundary against the patched image before editing a manifest.\n\n"
@@ -1998,6 +1997,62 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
     if (!WriteReportFile(outputDirectory / "entrypoint-closure-review.toml", toml.str())) {
       return Err(ErrorCategory::IO, "Unable to write entrypoint-closure-review.toml");
     }
+    reviewTomlMicroseconds += elapsedMicroseconds(formatStarted);
+  }
+
+  const uint64_t totalSerializationMicroseconds = elapsedMicroseconds(serializationStarted);
+  const auto& stages = runMetadata.stageTimings;
+  Json stageJson{
+      {"image_xex_loading", stages.imageLoadMicroseconds},
+      {"identity_verification", stages.identityVerificationMicroseconds},
+      {"instruction_decode_cache_population", stages.instructionDecodeMicroseconds},
+      {"register_phase", stages.registerMicroseconds},
+      {"scan_phase", stages.scanMicroseconds},
+      {"discover_phase", stages.discoverMicroseconds},
+      {"gap_fill_phase", stages.gapFillMicroseconds},
+      {"final_ownership_boundary_calculation", stages.finalOwnershipMicroseconds},
+      {"validate_phase", stages.validateMicroseconds},
+      {"preliminary_cfg_discovery", stages.preliminaryCfgMicroseconds},
+      {"indirect_site_classification", stages.indirectSiteClassificationMicroseconds},
+      {"jump_table_dataflow_recovery", stages.jumpTableDataflowRecoveryMicroseconds},
+      {"case_target_cfg_expansion", stages.caseTargetCfgExpansionMicroseconds},
+      {"per_function_fixpoint_work", stages.perFunctionFixpointMicroseconds},
+      {"fixpoint_bookkeeping", stages.fixpointOverheadMicroseconds},
+      {"function_seed_construction", stages.functionSeedConstructionMicroseconds},
+      {"jump_table_report_construction", stages.jumpTableReportConstructionMicroseconds},
+      {"entrypoint_closure_integration", stages.closureAnalysisMicroseconds},
+      {"section_hashing", stages.sectionHashingMicroseconds},
+      {"ghidra_evidence_diff_integration", stages.ghidraIntegrationMicroseconds},
+  };
+  Json serializationJson{{"json", jsonMicroseconds},
+                         {"csv", csvMicroseconds},
+                         {"markdown", markdownMicroseconds},
+                         {"review_toml", reviewTomlMicroseconds},
+                         {"total", totalSerializationMicroseconds}};
+
+  Json volatileJson{{"schema_version", 2},
+                    {"authoritative_report", "entrypoint-closure.json"},
+                    {"elapsed_milliseconds", runMetadata.elapsedMilliseconds},
+                    {"peak_working_set_bytes", runMetadata.peakWorkingSetBytes},
+                    {"stage_elapsed_microseconds", stageJson},
+                    {"serialization_elapsed_microseconds", serializationJson},
+                    {"command_line", runMetadata.commandLine}};
+  if (!WriteReportFile(outputDirectory / "entrypoint-closure-run.json",
+                       volatileJson.dump(2) + '\n')) {
+    return Err(ErrorCategory::IO, "Unable to write entrypoint-closure-run.json");
+  }
+  Json jumpVolatileJson{
+      {"schema_version", 2},
+      {"authoritative_report", "jump-table-recovery.json"},
+      {"pipeline_elapsed_milliseconds", runMetadata.elapsedMilliseconds},
+      {"recovery_pass_elapsed_microseconds", report.jumpTableRecovery.stats.elapsedMicroseconds},
+      {"peak_working_set_bytes", runMetadata.peakWorkingSetBytes},
+      {"stage_elapsed_microseconds", stageJson},
+      {"serialization_elapsed_microseconds", serializationJson},
+      {"command_line", runMetadata.commandLine}};
+  if (!WriteReportFile(outputDirectory / "jump-table-recovery-run.json",
+                       jumpVolatileJson.dump(2) + '\n')) {
+    return Err(ErrorCategory::IO, "Unable to write jump-table-recovery-run.json");
   }
 
   return Ok();

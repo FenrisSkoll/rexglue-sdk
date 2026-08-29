@@ -199,6 +199,8 @@ class FunctionNode {
 
   // Populated at discover()
   std::vector<Block> blocks_;
+  uint32_t blockExtentStart_ = 0;
+  uint32_t blockExtentEnd_ = 0;
   std::vector<rex::codegen::ppc::Instruction*> instructions_;  // Pointers into DecodedBinary
   std::set<uint32_t> labels_;  // Branch targets within this function
 

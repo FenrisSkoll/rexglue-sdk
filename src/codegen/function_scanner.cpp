@@ -14,6 +14,7 @@
 #include "ppc/opcode.h"
 
 #include <algorithm>
+#include <chrono>
 #include <queue>
 #include <set>
 #include <stack>
@@ -1855,9 +1856,8 @@ static BlockDiscoveryResult discoverBlocksPass(
     block.base = blockStart;
     block.size = 0;
 
-    while (isWithinFunction(addr) ||
-           (outOfLineBlock && containingRegion.contains(addr) &&
-            (addr == blockStart || !knownFunctions.contains(addr)))) {
+    while (isWithinFunction(addr) || (outOfLineBlock && containingRegion.contains(addr) &&
+                                      (addr == blockStart || !knownFunctions.contains(addr)))) {
       auto* insn = decoded.get(addr);
       if (!insn) {
         REXCODEGEN_TRACE("discoverBlocks: 0x{:08X} no instruction at addr, breaking", entryPoint);
@@ -2073,6 +2073,13 @@ BlockDiscoveryResult discoverBlocks(
     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize,
     const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables) {
+  using Clock = std::chrono::steady_clock;
+  const auto functionStarted = Clock::now();
+  auto elapsedMicroseconds = [](Clock::time_point started) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
+  };
+
   std::unordered_map<uint32_t, JumpTable> selectedTables;
   if (manualSwitchTables) {
     for (const auto& [site, configured] : *manualSwitchTables) {
@@ -2096,11 +2103,18 @@ BlockDiscoveryResult discoverBlocks(
   limits.maxFixpointIterations = REXCVAR_GET(jump_table_fixpoint_iterations);
 
   for (uint32_t iteration = 1; iteration <= limits.maxFixpointIterations; ++iteration) {
+    const auto cfgStarted = Clock::now();
     result = discoverBlocksPass(decoded, entryPoint, containingRegion, knownFunctions, pdataSize,
                                 selectedTables.empty() ? nullptr : &selectedTables);
+    const uint64_t cfgMicroseconds = elapsedMicroseconds(cfgStarted);
+    if (iteration == 1)
+      aggregate.preliminaryCfgMicroseconds += cfgMicroseconds;
+    else
+      aggregate.caseExpansionCfgMicroseconds += cfgMicroseconds;
     if (iteration == 1)
       preliminaryBlocks = result.blocks;
 
+    const auto classificationStarted = Clock::now();
     std::vector<uint32_t> sites;
     for (const auto* instruction : result.instructions) {
       if (instruction && instruction->is_indirect_branch())
@@ -2108,6 +2122,7 @@ BlockDiscoveryResult discoverBlocks(
     }
     std::sort(sites.begin(), sites.end());
     sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
+    aggregate.indirectSiteClassificationMicroseconds += elapsedMicroseconds(classificationStarted);
 
     std::vector<IndirectSiteAnalysis> analyses;
     std::unordered_map<uint32_t, JumpTable> nextTables;
@@ -2160,6 +2175,7 @@ BlockDiscoveryResult discoverBlocks(
       analyses.push_back(std::move(analysis));
     }
 
+    const auto fixpointOverheadStarted = Clock::now();
     aggregate.elapsedMicroseconds += iterationStats.elapsedMicroseconds;
     aggregate.decodedInstructions += iterationStats.decodedInstructions;
     aggregate.analysisLimitHit = aggregate.analysisLimitHit || iterationStats.analysisLimitHit;
@@ -2178,24 +2194,23 @@ BlockDiscoveryResult discoverBlocks(
       }
     }
     selectedTables = std::move(nextTables);
+    aggregate.fixpointOverheadMicroseconds += elapsedMicroseconds(fixpointOverheadStarted);
 
     if (!changed) {
       aggregate.indirectSites = static_cast<uint32_t>(result.indirectSites.size());
       aggregate.recoveredTables = static_cast<uint32_t>(std::count_if(
-          result.indirectSites.begin(), result.indirectSites.end(),
-          [](const auto& site) {
-            return site.selectedTable &&
-                   site.selectedTable->origin == JumpTableOrigin::Automatic;
+          result.indirectSites.begin(), result.indirectSites.end(), [](const auto& site) {
+            return site.selectedTable && site.selectedTable->origin == JumpTableOrigin::Automatic;
           }));
       aggregate.manualTables = static_cast<uint32_t>(std::count_if(
           result.indirectSites.begin(), result.indirectSites.end(), [](const auto& site) {
             return site.selectedTable && site.selectedTable->origin == JumpTableOrigin::Manual;
           }));
       aggregate.unresolvedSites = static_cast<uint32_t>(std::count_if(
-          result.indirectSites.begin(), result.indirectSites.end(),
-          [](const auto& site) {
+          result.indirectSites.begin(), result.indirectSites.end(), [](const auto& site) {
             return site.usesCtr && !site.link && !site.selectedTable.has_value();
           }));
+      aggregate.functionFixpointMicroseconds = elapsedMicroseconds(functionStarted);
       result.jumpTableRecovery = aggregate;
       result.jumpTableLimits = limits;
       result.preliminaryBlocks = std::move(preliminaryBlocks);
@@ -2204,6 +2219,7 @@ BlockDiscoveryResult discoverBlocks(
   }
 
   aggregate.analysisLimitHit = true;
+  aggregate.functionFixpointMicroseconds = elapsedMicroseconds(functionStarted);
   result.jumpTableRecovery = aggregate;
   result.jumpTableLimits = limits;
   result.preliminaryBlocks = std::move(preliminaryBlocks);

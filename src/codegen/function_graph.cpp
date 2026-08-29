@@ -95,7 +95,15 @@ void FunctionNode::discover(std::vector<Block> blocks,
   labels_ = std::move(labels);
 
   // Update size based on blocks
+  blockExtentStart_ = 0;
+  blockExtentEnd_ = 0;
+  if (!blocks_.empty()) {
+    blockExtentStart_ = blocks_.front().base;
+    blockExtentEnd_ = blocks_.front().end();
+  }
   for (const auto& block : blocks_) {
+    blockExtentStart_ = std::min(blockExtentStart_, block.base);
+    blockExtentEnd_ = std::max(blockExtentEnd_, block.end());
     uint32_t blockEnd = block.base + block.size;
     if (blockEnd > base_ + size_) {
       size_ = blockEnd - base_;
@@ -136,6 +144,13 @@ const FunctionAnalysis& FunctionNode::analysis() const {
 }
 
 void FunctionNode::addBlock(Block block) {
+  if (blocks_.empty()) {
+    blockExtentStart_ = block.base;
+    blockExtentEnd_ = block.end();
+  } else {
+    blockExtentStart_ = std::min(blockExtentStart_, block.base);
+    blockExtentEnd_ = std::max(blockExtentEnd_, block.end());
+  }
   blocks_.push_back(block);
 
   // Extend size if block extends past current end
@@ -146,27 +161,27 @@ void FunctionNode::addBlock(Block block) {
 }
 
 bool FunctionNode::containsAddress(uint32_t addr) const {
-  // Exact owned fragments take precedence over the min/max extent. A switch
-  // case can be emitted before the callable entry point.
-  for (const auto& block : blocks_) {
-    if (block.contains(addr)) {
-      return true;
-    }
-  }
-
-  if (addr < base_ || addr >= base_ + size_)
-    return false;
-
   // If no blocks are available yet, use the registered linear range.
   if (blocks_.empty())
-    return true;
+    return addr >= base_ && addr < base_ + size_;
 
   // For CONFIG and PDATA functions, trust the declared size even if blocks don't cover it
   // This handles out-of-line switch cases where compiler places code after epilogue
-  if (authority_ == FunctionAuthority::CONFIG || authority_ == FunctionAuthority::PDATA) {
-    return true;  // Already passed bounds check above
+  const bool inDeclaredRange = addr >= base_ && addr < base_ + size_;
+  if (inDeclaredRange &&
+      (authority_ == FunctionAuthority::CONFIG || authority_ == FunctionAuthority::PDATA)) {
+    return true;
   }
 
+  // Reject addresses outside both the declared range and the cached envelope
+  // before scanning exact fragments. This preserves cases emitted before the
+  // callable entry while keeping ubiquitous containment checks constant-time.
+  if (addr < blockExtentStart_ || addr >= blockExtentEnd_)
+    return false;
+  for (const auto& block : blocks_) {
+    if (block.contains(addr))
+      return true;
+  }
   return false;
 }
 
@@ -894,9 +909,9 @@ void FunctionGraph::addJumpTableToFunction(uint32_t entry, JumpTable jt) {
   }
 }
 
-void FunctionGraph::setJumpTableRecoveryForFunction(
-    uint32_t entry, std::vector<IndirectSiteAnalysis> sites,
-    std::vector<Block> preliminaryBlocks) {
+void FunctionGraph::setJumpTableRecoveryForFunction(uint32_t entry,
+                                                    std::vector<IndirectSiteAnalysis> sites,
+                                                    std::vector<Block> preliminaryBlocks) {
   if (auto* node = getFunction(entry)) {
     node->setJumpTableRecovery(std::move(sites), std::move(preliminaryBlocks));
   }

@@ -508,24 +508,19 @@ EntrypointJumpTableRecovery BuildJumpTableRecovery(const CodegenContext& context
               return lhs.ownerAddress < rhs.ownerAddress;
             });
   std::sort(report.boundaryEffects.begin(), report.boundaryEffects.end(),
-            [](const auto& lhs, const auto& rhs) {
-              return lhs.ownerAddress < rhs.ownerAddress;
-            });
+            [](const auto& lhs, const auto& rhs) { return lhs.ownerAddress < rhs.ownerAddress; });
   report.stats.indirectSites = static_cast<uint32_t>(report.indirectSites.size());
-  report.stats.recoveredTables = static_cast<uint32_t>(std::count_if(
-      report.indirectSites.begin(), report.indirectSites.end(),
-      [](const auto& site) {
-        return site.selectedTable &&
-               site.selectedTable->origin == JumpTableOrigin::Automatic;
+  report.stats.recoveredTables = static_cast<uint32_t>(
+      std::count_if(report.indirectSites.begin(), report.indirectSites.end(), [](const auto& site) {
+        return site.selectedTable && site.selectedTable->origin == JumpTableOrigin::Automatic;
       }));
-  report.stats.manualTables = static_cast<uint32_t>(std::count_if(
-      report.indirectSites.begin(), report.indirectSites.end(), [](const auto& site) {
+  report.stats.manualTables = static_cast<uint32_t>(
+      std::count_if(report.indirectSites.begin(), report.indirectSites.end(), [](const auto& site) {
         return site.selectedTable && site.selectedTable->origin == JumpTableOrigin::Manual;
       }));
   report.stats.unresolvedSites = static_cast<uint32_t>(std::count_if(
-      report.indirectSites.begin(), report.indirectSites.end(), [](const auto& site) {
-        return site.usesCtr && !site.link && !site.selectedTable;
-      }));
+      report.indirectSites.begin(), report.indirectSites.end(),
+      [](const auto& site) { return site.usesCtr && !site.link && !site.selectedTable; }));
   return report;
 }
 
@@ -598,7 +593,13 @@ Result<void> VerifyIdentity(const EntrypointImageIdentity& actual,
 }
 
 Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
+  using Clock = std::chrono::steady_clock;
   const auto start = std::chrono::steady_clock::now();
+  auto elapsedMicroseconds = [](Clock::time_point started) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
+  };
+  EntrypointClosureRunMetadata runMetadata;
   fs::path manifestPath = args.manifestPath;
   if (manifestPath.empty()) {
     auto discovered = DiscoverManifestInCwd();
@@ -622,7 +623,9 @@ Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
   if (!provenance)
     return Err<void>(provenance.error());
 
+  auto stageStarted = Clock::now();
   auto pipeline = CodegenPipeline::CreateEntrypoint(*loadedManifest);
+  runMetadata.stageTimings.imageLoadMicroseconds = elapsedMicroseconds(stageStarted);
   if (!pipeline)
     return Err<void>(pipeline.error());
 
@@ -631,6 +634,7 @@ Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
     return Err<void>(rex::ErrorCategory::Format, "Loaded XEX module is unavailable");
   auto* module = executable->xex_module();
 
+  stageStarted = Clock::now();
   fs::path xexPath = loadedManifest->manifestDir / loadedManifest->entrypoint.recompiler.filePath;
   xexPath = fs::canonical(xexPath);
   fs::path titleUpdatePath = xexPath;
@@ -675,19 +679,43 @@ Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
   }
   if (auto verified = VerifyIdentity(identity, *provenance); !verified)
     return verified;
+  runMetadata.stageTimings.identityVerificationMicroseconds = elapsedMicroseconds(stageStarted);
 
   // Reject a wrong executable/update pair before the expensive graph pass.
   if (auto analysis = pipeline->RunAnalyze(); !analysis)
     return analysis;
+  const auto& analysisTimings = pipeline->context().analysisState().stageTimings;
+  const auto& jumpTimings = pipeline->context().analysisState().jumpTableRecovery;
+  runMetadata.stageTimings.instructionDecodeMicroseconds = analysisTimings.decodeMicroseconds;
+  runMetadata.stageTimings.registerMicroseconds = analysisTimings.registerMicroseconds;
+  runMetadata.stageTimings.scanMicroseconds = analysisTimings.scanMicroseconds;
+  runMetadata.stageTimings.discoverMicroseconds = analysisTimings.discoverMicroseconds;
+  runMetadata.stageTimings.gapFillMicroseconds = analysisTimings.gapFillMicroseconds;
+  runMetadata.stageTimings.finalOwnershipMicroseconds = analysisTimings.mergeMicroseconds;
+  runMetadata.stageTimings.validateMicroseconds = analysisTimings.validateMicroseconds;
+  runMetadata.stageTimings.preliminaryCfgMicroseconds = jumpTimings.preliminaryCfgMicroseconds;
+  runMetadata.stageTimings.indirectSiteClassificationMicroseconds =
+      jumpTimings.indirectSiteClassificationMicroseconds;
+  runMetadata.stageTimings.jumpTableDataflowRecoveryMicroseconds = jumpTimings.elapsedMicroseconds;
+  runMetadata.stageTimings.caseTargetCfgExpansionMicroseconds =
+      jumpTimings.caseExpansionCfgMicroseconds;
+  runMetadata.stageTimings.perFunctionFixpointMicroseconds =
+      jumpTimings.functionFixpointMicroseconds;
+  runMetadata.stageTimings.fixpointOverheadMicroseconds = jumpTimings.fixpointOverheadMicroseconds;
 
+  stageStarted = Clock::now();
   EntrypointClosureInput input{
       .image = identity,
       .limits = args.limits,
-      .functionSeeds = BuildFunctionSeeds(pipeline->context()),
       .manualEvidence = provenance->manualEvidence,
       .fixtures = provenance->fixtures,
-      .jumpTableRecovery = BuildJumpTableRecovery(pipeline->context()),
   };
+  input.functionSeeds = BuildFunctionSeeds(pipeline->context());
+  runMetadata.stageTimings.functionSeedConstructionMicroseconds = elapsedMicroseconds(stageStarted);
+  stageStarted = Clock::now();
+  input.jumpTableRecovery = BuildJumpTableRecovery(pipeline->context());
+  runMetadata.stageTimings.jumpTableReportConstructionMicroseconds =
+      elapsedMicroseconds(stageStarted);
   input.relocationStorageAddresses.insert(module->relocation_storage_addresses().begin(),
                                           module->relocation_storage_addresses().end());
   for (const auto& item : module->binary_exports())
@@ -704,7 +732,10 @@ Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
                    "relocation-backed pointer evidence is unavailable"});
   }
 
+  stageStarted = Clock::now();
   auto report = AnalyzeEntrypointClosure(pipeline->context(), std::move(input));
+  runMetadata.stageTimings.closureAnalysisMicroseconds = elapsedMicroseconds(stageStarted);
+  stageStarted = Clock::now();
   for (auto& section : report.sections) {
     const auto* binarySection = pipeline->context().binary().findSection(section.range.start);
     if (!binarySection || binarySection->baseAddress != section.range.start ||
@@ -715,6 +746,7 @@ Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
     }
     section.sha256 = HashSection(*binarySection);
   }
+  runMetadata.stageTimings.sectionHashingMicroseconds = elapsedMicroseconds(stageStarted);
   fs::path outputDirectory = args.outputDirectory;
   if (outputDirectory.empty()) {
     outputDirectory =
@@ -731,12 +763,11 @@ Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
     commandLine << " --provenance \"" << args.provenancePath << "\"";
   if (!args.outputDirectory.empty())
     commandLine << " --output \"" << args.outputDirectory << "\"";
+  runMetadata.elapsedMilliseconds = static_cast<uint64_t>(elapsed.count());
+  runMetadata.peakWorkingSetBytes = PeakWorkingSetBytes();
+  runMetadata.commandLine = commandLine.str();
   auto written =
-      WriteEntrypointClosureReports(report,
-                                    {.elapsedMilliseconds = static_cast<uint64_t>(elapsed.count()),
-                                     .peakWorkingSetBytes = PeakWorkingSetBytes(),
-                                     .commandLine = commandLine.str()},
-                                    outputDirectory, !args.noReviewToml);
+      WriteEntrypointClosureReports(report, runMetadata, outputDirectory, !args.noReviewToml);
   if (!written)
     return written;
 

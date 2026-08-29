@@ -311,9 +311,9 @@ struct JumpTableInstructionEvidence {
 };
 
 struct JumpTable {
-  uint32_t bctrAddress = 0;        // Address of bctr instruction
-  uint32_t tableAddress = 0;       // Address of jump table data
-  uint8_t indexRegister = 0xFF;    // Register holding unscaled switch index
+  uint32_t bctrAddress = 0;       // Address of bctr instruction
+  uint32_t tableAddress = 0;      // Address of jump table data
+  uint8_t indexRegister = 0xFF;   // Register holding unscaled switch index
   std::vector<uint32_t> targets;  // Resolved case targets (internal labels)
 
   // Recovery evidence. Manual tables need only the compatibility fields above;
@@ -346,8 +346,7 @@ struct IndirectSiteAnalysis {
   bool link = false;
   bool conditional = false;
   bool usesCtr = false;
-  IndirectSiteClassification classification =
-      IndirectSiteClassification::OpaqueIndirectTransfer;
+  IndirectSiteClassification classification = IndirectSiteClassification::OpaqueIndirectTransfer;
   std::vector<JumpTableFailure> failures;
   std::vector<JumpTableInstructionEvidence> evidence;
   std::optional<JumpTable> automaticTable;
@@ -364,6 +363,11 @@ struct JumpTableRecoveryLimits {
 
 struct JumpTableRecoveryStats {
   uint64_t elapsedMicroseconds = 0;
+  uint64_t preliminaryCfgMicroseconds = 0;
+  uint64_t caseExpansionCfgMicroseconds = 0;
+  uint64_t indirectSiteClassificationMicroseconds = 0;
+  uint64_t fixpointOverheadMicroseconds = 0;
+  uint64_t functionFixpointMicroseconds = 0;
   uint64_t decodedInstructions = 0;
   uint32_t fixpointIterations = 0;
   uint32_t indirectSites = 0;
