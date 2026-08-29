@@ -243,11 +243,133 @@ struct Block {
 // Jump Table
 //=============================================================================
 
+enum class IndirectSiteClassification : uint8_t {
+  SwitchBctr,
+  ComputedTailBctr,
+  VirtualOrCallbackBctrl,
+  IndirectTailBctrlOrBctr,
+  OrdinaryBlrReturn,
+  NonstandardBclr,
+  OpaqueIndirectTransfer,
+};
+
+enum class JumpTableFailure : uint8_t {
+  None,
+  MissingBound,
+  AmbiguousBound,
+  UnknownTableBase,
+  UnknownIndex,
+  AmbiguousReachingDefinition,
+  UnsupportedRelativeForm,
+  InvalidElementWidth,
+  TargetOutOfRange,
+  TargetUnaligned,
+  MixedValidityTargets,
+  AnalysisLimit,
+  NonSwitchIndirect,
+};
+
+enum class JumpTableKind : uint8_t {
+  Unknown,
+  AbsolutePointer,
+  RelativeOffset,
+};
+
+enum class JumpTableOrigin : uint8_t {
+  Automatic,
+  Manual,
+};
+
+enum class JumpTableManualComparison : uint8_t {
+  None,
+  ExactEquivalent,
+  AutomaticSuperset,
+  AutomaticSubset,
+  ConflictingTargets,
+  ConflictingBounds,
+  UnsupportedManualForm,
+  NewAutomaticTable,
+};
+
+const char* IndirectSiteClassificationName(IndirectSiteClassification classification);
+const char* JumpTableFailureName(JumpTableFailure failure);
+const char* JumpTableKindName(JumpTableKind kind);
+const char* JumpTableOriginName(JumpTableOrigin origin);
+const char* JumpTableManualComparisonName(JumpTableManualComparison comparison);
+
+struct JumpTableRawEntry {
+  uint32_t storageAddress = 0;
+  uint32_t rawValue = 0;
+  uint32_t target = 0;
+};
+
+struct JumpTableInstructionEvidence {
+  uint32_t address = 0;
+  std::string role;
+  std::string instruction;
+};
+
 struct JumpTable {
-  uint32_t bctrAddress;           // Address of bctr instruction
-  uint32_t tableAddress;          // Address of jump table data
-  uint8_t indexRegister;          // Register holding switch index
+  uint32_t bctrAddress = 0;        // Address of bctr instruction
+  uint32_t tableAddress = 0;       // Address of jump table data
+  uint8_t indexRegister = 0xFF;    // Register holding unscaled switch index
   std::vector<uint32_t> targets;  // Resolved case targets (internal labels)
+
+  // Recovery evidence. Manual tables need only the compatibility fields above;
+  // automatic tables fill the complete model before they can affect ownership.
+  JumpTableKind kind = JumpTableKind::Unknown;
+  JumpTableOrigin origin = JumpTableOrigin::Automatic;
+  JumpTableManualComparison manualComparison = JumpTableManualComparison::None;
+  uint32_t ownerAddress = 0;
+  uint32_t storageEnd = 0;
+  uint32_t boundValue = 0;
+  uint32_t caseCount = 0;
+  uint32_t defaultTarget = 0;
+  uint32_t anchorAddress = 0;
+  uint32_t targetScale = 1;
+  uint8_t elementWidth = 0;
+  bool elementSigned = false;
+  bool boundInclusive = false;
+  bool defaultIsReturn = false;
+  bool tableInExecutableSection = false;
+  std::string boundSemantics;
+  std::string confidence;
+  std::vector<JumpTableRawEntry> rawEntries;
+  std::vector<JumpTableInstructionEvidence> evidence;
+  std::vector<std::string> conflicts;
+};
+
+struct IndirectSiteAnalysis {
+  uint32_t site = 0;
+  uint32_t ownerAddress = 0;
+  bool link = false;
+  bool conditional = false;
+  bool usesCtr = false;
+  IndirectSiteClassification classification =
+      IndirectSiteClassification::OpaqueIndirectTransfer;
+  std::vector<JumpTableFailure> failures;
+  std::vector<JumpTableInstructionEvidence> evidence;
+  std::optional<JumpTable> automaticTable;
+  std::optional<JumpTable> selectedTable;
+};
+
+struct JumpTableRecoveryLimits {
+  uint32_t maxBackwardInstructions = 96;
+  uint32_t maxPredecessors = 64;
+  uint32_t maxStates = 128;
+  uint32_t maxEntries = 4096;
+  uint32_t maxFixpointIterations = 8;
+};
+
+struct JumpTableRecoveryStats {
+  uint64_t elapsedMicroseconds = 0;
+  uint64_t decodedInstructions = 0;
+  uint32_t fixpointIterations = 0;
+  uint32_t indirectSites = 0;
+  uint32_t recoveredTables = 0;
+  uint32_t manualTables = 0;
+  uint32_t unresolvedSites = 0;
+  bool analysisLimitHit = false;
 };
 
 //=============================================================================
