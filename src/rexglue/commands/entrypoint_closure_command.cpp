@@ -10,6 +10,7 @@
 #include "codegen_command.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <filesystem>
@@ -64,6 +65,8 @@ struct ProvenanceConfig {
   std::string expectedBaseXexSha256;
   std::string expectedTitleUpdateSha256;
   std::string expectedPatchedImageSha256;
+  std::string expectedExecutableMemoryFingerprintAlgorithm;
+  std::string expectedExecutableMemoryFingerprint;
   std::optional<uint32_t> expectedImageBase;
   std::optional<uint32_t> expectedImageSize;
   std::optional<uint32_t> expectedTitleId;
@@ -104,6 +107,84 @@ std::string HashPatchedImage(const rex::runtime::XexModule& module) {
   sha256::SHA256 hash;
   hash.add(image, module.image_size());
   return Upper(hash.getHash());
+}
+
+std::string HashSection(const SectionView& section) {
+  sha256::SHA256 hash;
+  if (section.size != 0)
+    hash.add(section.data, section.size);
+  return Upper(hash.getHash());
+}
+
+Result<std::string> ComputeExecutableMemoryFingerprint(const BinaryView& binary) {
+  struct CanonicalSpan {
+    uint64_t start = 0;
+    uint64_t end = 0;
+    uint8_t permissions = 0;
+    std::vector<const SectionView*> sections;
+  };
+
+  std::vector<const SectionView*> executableSections;
+  for (const auto& section : binary.sections()) {
+    if (section.executable && section.size != 0)
+      executableSections.push_back(&section);
+  }
+  std::sort(executableSections.begin(), executableSections.end(), [](const auto* a, const auto* b) {
+    if (a->baseAddress != b->baseAddress)
+      return a->baseAddress < b->baseAddress;
+    return a->size < b->size;
+  });
+
+  std::vector<CanonicalSpan> spans;
+  for (const auto* section : executableSections) {
+    const uint64_t start = section->baseAddress;
+    const uint64_t end = start + section->size;
+    const uint8_t permissions = static_cast<uint8_t>(
+        (section->readable ? 1 : 0) | (section->writable ? 2 : 0) | (section->executable ? 4 : 0));
+    if (!spans.empty() && start < spans.back().end) {
+      return Err<std::string>(
+          rex::ErrorCategory::Validation,
+          fmt::format("Executable sections overlap at 0x{:08X}", section->baseAddress));
+    }
+    if (!spans.empty() && start == spans.back().end && permissions == spans.back().permissions) {
+      spans.back().end = end;
+      spans.back().sections.push_back(section);
+    } else {
+      spans.push_back(
+          {.start = start, .end = end, .permissions = permissions, .sections = {section}});
+    }
+  }
+
+  sha256::SHA256 hash;
+  constexpr std::string_view magic = "FABLE2_EXECUTABLE_MEMORY_V1";
+  hash.add(magic.data(), magic.size());
+  const uint8_t terminator = 0;
+  hash.add(&terminator, sizeof(terminator));
+
+  auto addBe32 = [&](uint32_t value) {
+    const std::array<uint8_t, 4> bytes{
+        static_cast<uint8_t>(value >> 24), static_cast<uint8_t>(value >> 16),
+        static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value)};
+    hash.add(bytes.data(), bytes.size());
+  };
+  auto addBe64 = [&](uint64_t value) {
+    const std::array<uint8_t, 8> bytes{
+        static_cast<uint8_t>(value >> 56), static_cast<uint8_t>(value >> 48),
+        static_cast<uint8_t>(value >> 40), static_cast<uint8_t>(value >> 32),
+        static_cast<uint8_t>(value >> 24), static_cast<uint8_t>(value >> 16),
+        static_cast<uint8_t>(value >> 8),  static_cast<uint8_t>(value)};
+    hash.add(bytes.data(), bytes.size());
+  };
+
+  addBe32(static_cast<uint32_t>(spans.size()));
+  for (const auto& span : spans) {
+    addBe64(span.start);
+    addBe64(span.end - span.start);
+    hash.add(&span.permissions, sizeof(span.permissions));
+    for (const auto* section : span.sections)
+      hash.add(section->data, section->size);
+  }
+  return rex::Ok(Upper(hash.getHash()));
 }
 
 uint64_t PeakWorkingSetBytes() {
@@ -177,15 +258,20 @@ Result<ProvenanceConfig> LoadProvenance(const fs::path& path) {
         rex::ErrorCategory::Config,
         fmt::format("Unable to parse provenance '{}': {}", path.string(), error.what()));
   }
-  if (root.value("schema_version", 0) != 1) {
+  const uint32_t schemaVersion = root.value("schema_version", 0);
+  if (schemaVersion != 1 && schemaVersion != 2) {
     return Err<ProvenanceConfig>(rex::ErrorCategory::Config,
-                                 "Unsupported provenance schema_version (expected 1)");
+                                 "Unsupported provenance schema_version (expected 1 or 2)");
   }
 
   const auto& identity = root.value("expected_image_identity", Json::object());
   result.expectedBaseXexSha256 = Upper(identity.value("base_xex_sha256", ""));
   result.expectedTitleUpdateSha256 = Upper(identity.value("title_update_sha256", ""));
   result.expectedPatchedImageSha256 = Upper(identity.value("patched_image_sha256", ""));
+  result.expectedExecutableMemoryFingerprintAlgorithm =
+      identity.value("executable_memory_fingerprint_algorithm", "");
+  result.expectedExecutableMemoryFingerprint =
+      Upper(identity.value("executable_memory_fingerprint", ""));
   auto optionalAddress = [&](const char* name,
                              std::optional<uint32_t>& destination) -> Result<void> {
     if (!identity.contains(name))
@@ -391,6 +477,25 @@ Result<void> VerifyIdentity(const EntrypointImageIdentity& actual,
                                   actual.patchedImageSha256);
       !result)
     return result;
+  if (!expected.expectedExecutableMemoryFingerprint.empty()) {
+    if (expected.expectedExecutableMemoryFingerprintAlgorithm.empty()) {
+      return Err<void>(rex::ErrorCategory::Config,
+                       "Expected executable-memory fingerprint requires its algorithm");
+    }
+    if (expected.expectedExecutableMemoryFingerprintAlgorithm !=
+        actual.executableMemoryFingerprintAlgorithm) {
+      return Err<void>(
+          rex::ErrorCategory::Validation,
+          fmt::format("Wrong image: executable_memory_fingerprint_algorithm expected {}, found {}",
+                      expected.expectedExecutableMemoryFingerprintAlgorithm,
+                      actual.executableMemoryFingerprintAlgorithm));
+    }
+    if (auto result = compareString("executable_memory_fingerprint",
+                                    expected.expectedExecutableMemoryFingerprint,
+                                    actual.executableMemoryFingerprint);
+        !result)
+      return result;
+  }
   if (auto result = compareAddress("image_base", expected.expectedImageBase, actual.imageBase);
       !result)
     return result;
@@ -458,12 +563,20 @@ Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
     titleUpdateHash = *hash;
   }
 
+  auto executableMemoryFingerprint =
+      ComputeExecutableMemoryFingerprint(pipeline->context().binary());
+  if (!executableMemoryFingerprint)
+    return Err<void>(executableMemoryFingerprint.error());
+
   EntrypointImageIdentity identity{
       .identityMethod =
-          "SHA-256 of source XEX, sibling XEXP and contiguous loaded post-patch guest image",
+          "SHA-256 of source XEX, sibling XEXP, contiguous loaded post-patch guest image and "
+          "versioned executable-memory spans",
       .baseXexSha256 = *baseHash,
       .titleUpdateSha256 = titleUpdateHash,
       .patchedImageSha256 = HashPatchedImage(*module),
+      .executableMemoryFingerprintAlgorithm = std::string(kExecutableMemoryFingerprintAlgorithm),
+      .executableMemoryFingerprint = *executableMemoryFingerprint,
       .imageBase = module->base_address(),
       .imageSize = module->image_size(),
       .entryPoint = module->entry_point(),
@@ -508,6 +621,16 @@ Result<void> RunEntrypointClosure(const EntrypointClosureArgs& args) {
   }
 
   auto report = AnalyzeEntrypointClosure(pipeline->context(), std::move(input));
+  for (auto& section : report.sections) {
+    const auto* binarySection = pipeline->context().binary().findSection(section.range.start);
+    if (!binarySection || binarySection->baseAddress != section.range.start ||
+        binarySection->end() != section.range.end) {
+      return Err<void>(rex::ErrorCategory::Validation,
+                       fmt::format("Unable to hash report section {} [0x{:08X},0x{:08X})",
+                                   section.name, section.range.start, section.range.end));
+    }
+    section.sha256 = HashSection(*binarySection);
+  }
   fs::path outputDirectory = args.outputDirectory;
   if (outputDirectory.empty()) {
     outputDirectory =

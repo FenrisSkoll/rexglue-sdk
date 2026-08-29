@@ -28,8 +28,10 @@ namespace rex::codegen {
 
 class CodegenContext;
 
-inline constexpr uint32_t kEntrypointClosureSchemaVersion = 1;
-inline constexpr std::string_view kEntrypointClosureAnalyzerVersion = "1.0.0";
+inline constexpr uint32_t kEntrypointClosureSchemaVersion = 2;
+inline constexpr std::string_view kEntrypointClosureAnalyzerVersion = "1.1.0";
+inline constexpr std::string_view kExecutableMemoryFingerprintAlgorithm =
+    "fable2-executable-memory-sha256-v1";
 
 enum class EntrypointEvidenceKind : uint8_t {
   XexEntrypoint,
@@ -165,6 +167,8 @@ struct EntrypointImageIdentity {
   std::string baseXexSha256;
   std::string titleUpdateSha256;
   std::string patchedImageSha256;
+  std::string executableMemoryFingerprintAlgorithm;
+  std::string executableMemoryFingerprint;
   uint32_t imageBase = 0;
   uint32_t imageSize = 0;
   uint32_t entryPoint = 0;
@@ -177,6 +181,7 @@ struct EntrypointImageIdentity {
 struct EntrypointSectionRecord {
   std::string name;
   EntrypointAddressRange range;
+  std::string sha256;
   bool executable = false;
   bool readable = false;
   bool writable = false;

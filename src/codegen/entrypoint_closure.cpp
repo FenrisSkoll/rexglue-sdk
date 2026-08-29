@@ -14,7 +14,6 @@
 
 #include "decoded_binary.h"
 #include "file_io.h"
-
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -1116,6 +1115,7 @@ static EntrypointClosureReport AnalyzeEntrypointClosureDecoded(const BinaryView&
   for (const auto& section : binary.sections()) {
     report.sections.push_back({.name = std::string(section.name),
                                .range = {section.baseAddress, section.end()},
+                               .sha256 = {},
                                .executable = section.executable,
                                .readable = section.readable,
                                .writable = section.writable});
@@ -1499,6 +1499,9 @@ void StreamEntrypointClosureJson(std::ostream& output, const EntrypointClosureRe
                  {"base_xex_sha256", image.baseXexSha256},
                  {"title_update_sha256", image.titleUpdateSha256},
                  {"patched_image_sha256", image.patchedImageSha256},
+                 {"executable_memory_fingerprint_algorithm",
+                  image.executableMemoryFingerprintAlgorithm},
+                 {"executable_memory_fingerprint", image.executableMemoryFingerprint},
                  {"image_base", Hex(image.imageBase)},
                  {"image_size", Hex(image.imageSize)},
                  {"entry_point", Hex(image.entryPoint)},
@@ -1509,11 +1512,9 @@ void StreamEntrypointClosureJson(std::ostream& output, const EntrypointClosureRe
                 .dump()
          << ",\"sections\":";
   StreamJsonArray(output, report.sections, [](const auto& section) {
-    return Json{{"name", section.name},
-                {"range", RangeJson(section.range)},
-                {"executable", section.executable},
-                {"readable", section.readable},
-                {"writable", section.writable}};
+    return Json{{"name", section.name},         {"range", RangeJson(section.range)},
+                {"sha256", section.sha256},     {"executable", section.executable},
+                {"readable", section.readable}, {"writable", section.writable}};
   });
   output << ",\"executable_ranges\":[";
   bool firstExecutable = true;
@@ -1660,6 +1661,9 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
            << ", analyser " << report.analyzerVersion
            << "). Volatile measurements are in `entrypoint-closure-run.json`.\n\n"
            << "- Patched image SHA-256: `" << report.image.patchedImageSha256 << "`\n"
+           << "- Executable-memory fingerprint (`"
+           << report.image.executableMemoryFingerprintAlgorithm << "`): `"
+           << report.image.executableMemoryFingerprint << "`\n"
            << "- Image: `" << Hex(report.image.imageBase) << "` + `" << Hex(report.image.imageSize)
            << "`\n"
            << "- Fixpoint reached: " << (report.fixpointReached ? "yes" : "no") << " after "
