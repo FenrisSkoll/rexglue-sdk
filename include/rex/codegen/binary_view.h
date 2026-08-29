@@ -30,6 +30,8 @@ struct SectionView {
   uint32_t size;
   const uint8_t* data;
   bool executable;
+  bool readable;
+  bool writable;
 
   bool contains(uint32_t addr) const { return addr >= baseAddress && addr < baseAddress + size; }
 
@@ -40,6 +42,16 @@ struct SectionView {
   }
 
   uint32_t end() const { return baseAddress + size; }
+};
+
+/// Owned-section input used by analysis tools and synthetic tests.
+struct BinarySectionInput {
+  std::string name;
+  uint32_t baseAddress = 0;
+  std::span<const uint8_t> data;
+  bool executable = false;
+  bool readable = true;
+  bool writable = false;
 };
 
 /// Import symbol from binary (thunk address + name in "libname@ordinal" format)
@@ -53,6 +65,10 @@ class BinaryView {
  public:
   /// Factory - copies all data from Module
   static BinaryView fromModule(const runtime::Module& module);
+
+  /// Factory for deterministic analysis fixtures and non-runtime importers.
+  static BinaryView fromSections(uint32_t baseAddress, uint32_t imageSize, uint32_t entryPoint,
+                                 std::span<const BinarySectionInput> sections);
 
   // Move-only (owns large buffers)
   BinaryView(BinaryView&&) noexcept = default;

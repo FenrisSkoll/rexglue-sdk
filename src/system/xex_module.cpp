@@ -829,6 +829,12 @@ int XexModule::ReadPEHeaders() {
   // NOTE: PE headers are little-endian (PE spec), no byte-swap needed.
   exception_dir_rva_ = opthdr->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
   exception_dir_size_ = opthdr->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+  export_dir_rva_ = opthdr->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+  export_dir_size_ = opthdr->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+  tls_dir_rva_ = opthdr->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+  tls_dir_size_ = opthdr->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size;
+  relocation_dir_rva_ = opthdr->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+  relocation_dir_size_ = opthdr->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
 
   // DumpTLSDirectory(pImageBase, pNTHeader, (PIMAGE_TLS_DIRECTORY32)0);
   // DumpExportsSection(pImageBase, pNTHeader);
@@ -1147,6 +1153,9 @@ bool XexModule::ContainsAddress(uint32_t address) {
 void XexModule::PopulateBinaryData() {
   binary_sections_.clear();
   binary_symbols_.clear();
+  binary_exports_.clear();
+  tls_callbacks_.clear();
+  relocation_storage_addresses_.clear();
 
   // Populate sections from existing PE sections
   for (const auto& pe_sec : pe_sections_) {
@@ -1156,6 +1165,7 @@ void XexModule::PopulateBinaryData() {
     sec.virtual_size = pe_sec.size;
     sec.host_data = memory()->TranslateVirtual<uint8_t*>(pe_sec.address);
     sec.executable = (pe_sec.flags & kXEPESectionMemoryExecute) != 0;
+    sec.readable = (pe_sec.flags & kXEPESectionMemoryRead) != 0;
     sec.writable = (pe_sec.flags & kXEPESectionMemoryWrite) != 0;
     binary_sections_.push_back(std::move(sec));
   }
@@ -1171,6 +1181,157 @@ void XexModule::PopulateBinaryData() {
       binary_symbols_.push_back(std::move(sym));
     }
   }
+
+  auto address_in_image = [&](uint32_t address, uint32_t size = 1) {
+    const uint64_t end = static_cast<uint64_t>(address) + size;
+    return address >= base_address_ && end <= static_cast<uint64_t>(base_address_) + image_size();
+  };
+
+  // XEX ordinal exports are separate from the PE export directory.
+  if (xex_security_info()->export_table &&
+      address_in_image(xex_security_info()->export_table, sizeof(xex2_export_table))) {
+    auto* table =
+        memory()->TranslateVirtual<const xex2_export_table*>(xex_security_info()->export_table);
+    const uint32_t count = std::min<uint32_t>(table->count, 65536);
+    for (uint32_t index = 0; index < count; ++index) {
+      uint32_t address = static_cast<uint32_t>(table->ordOffset[index]) +
+                         (static_cast<uint32_t>(table->imagebaseaddr) << 16);
+      if (!address_in_image(address))
+        continue;
+      binary_exports_.push_back(
+          {.name = fmt::format("ordinal_{}", static_cast<uint32_t>(table->base) + index),
+           .address = address,
+           .ordinal = static_cast<uint32_t>(table->base) + index});
+    }
+  }
+
+  // PE exports by name use offsets relative to the export directory in Xbox
+  // images (the convention already used by GetProcAddress above).
+  xex2_opt_data_directory* namedExports = nullptr;
+  if (GetOptHeader(XEX_HEADER_EXPORTS_BY_NAME, &namedExports) && namedExports &&
+      address_in_image(base_address_ + namedExports->offset, sizeof(X_IMAGE_EXPORT_DIRECTORY))) {
+    uint32_t directoryAddress = base_address_ + namedExports->offset;
+    auto* directory = memory()->TranslateVirtual<const X_IMAGE_EXPORT_DIRECTORY*>(directoryAddress);
+    const uint32_t functionCount = std::min<uint32_t>(directory->NumberOfFunctions, 65536);
+    const uint32_t nameCount = std::min<uint32_t>(directory->NumberOfNames, 65536);
+    auto* functions = reinterpret_cast<const uint32_t*>(reinterpret_cast<uintptr_t>(directory) +
+                                                        directory->AddressOfFunctions);
+    auto* names = reinterpret_cast<const uint32_t*>(reinterpret_cast<uintptr_t>(directory) +
+                                                    directory->AddressOfNames);
+    auto* ordinals = reinterpret_cast<const uint16_t*>(reinterpret_cast<uintptr_t>(directory) +
+                                                       directory->AddressOfNameOrdinals);
+
+    std::unordered_map<uint32_t, std::string> namesByOrdinal;
+    for (uint32_t index = 0; index < nameCount; ++index) {
+      uint32_t ordinal = ordinals[index];
+      if (ordinal >= functionCount || names[index] >= namedExports->size)
+        continue;
+      auto* name =
+          reinterpret_cast<const char*>(reinterpret_cast<uintptr_t>(directory) + names[index]);
+      namesByOrdinal.emplace(ordinal, name);
+    }
+    for (uint32_t index = 0; index < functionCount; ++index) {
+      uint32_t address = base_address_ + functions[index];
+      if (!address_in_image(address))
+        continue;
+      auto foundName = namesByOrdinal.find(index);
+      binary_exports_.push_back({.name = foundName == namesByOrdinal.end()
+                                             ? fmt::format("pe_ordinal_{}", directory->Base + index)
+                                             : foundName->second,
+                                 .address = address,
+                                 .ordinal = directory->Base + index});
+    }
+  }
+
+  // IMAGE_TLS_DIRECTORY fields and callback pointers are guest big-endian.
+  constexpr uint32_t kImageTlsDirectory32Size = 6 * sizeof(uint32_t);
+  if (tls_dir_rva_ && tls_dir_size_ >= kImageTlsDirectory32Size &&
+      address_in_image(base_address_ + tls_dir_rva_, kImageTlsDirectory32Size)) {
+    auto* tls = memory()->TranslateVirtual<const rex::be<uint32_t>*>(base_address_ + tls_dir_rva_);
+    uint32_t callbacksAddress = tls[3];
+    for (uint32_t index = 0; index < 1024 && address_in_image(callbacksAddress + index * 4, 4);
+         ++index) {
+      auto* callbackSlot =
+          memory()->TranslateVirtual<const rex::be<uint32_t>*>(callbacksAddress + index * 4);
+      uint32_t callback = *callbackSlot;
+      if (!callback)
+        break;
+      if (address_in_image(callback))
+        tls_callbacks_.push_back(callback);
+    }
+  }
+
+  // Base relocation blocks are PE metadata and therefore little-endian. The
+  // relocated storage itself remains guest big-endian. Retain storage sites,
+  // not relocated values, so static evidence stays auditable.
+  if (relocation_dir_rva_ && relocation_dir_size_ >= sizeof(IMAGE_BASE_RELOCATION) &&
+      address_in_image(base_address_ + relocation_dir_rva_, relocation_dir_size_)) {
+    const uint8_t* data =
+        memory()->TranslateVirtual<const uint8_t*>(base_address_ + relocation_dir_rva_);
+    auto read16 = [](const uint8_t* source, bool bigEndian) {
+      uint16_t value = 0;
+      std::memcpy(&value, source, sizeof(value));
+      return bigEndian ? rex::byte_swap(value) : value;
+    };
+    auto read32 = [](const uint8_t* source, bool bigEndian) {
+      uint32_t value = 0;
+      std::memcpy(&value, source, sizeof(value));
+      return bigEndian ? rex::byte_swap(value) : value;
+    };
+    auto plausibleFirstBlock = [&](bool bigEndian) {
+      uint32_t pageRva = read32(data, bigEndian);
+      uint32_t blockSize = read32(data + 4, bigEndian);
+      return pageRva < image_size() && blockSize >= sizeof(IMAGE_BASE_RELOCATION) &&
+             blockSize <= relocation_dir_size_;
+    };
+    const bool bigEndian = !plausibleFirstBlock(false) && plausibleFirstBlock(true);
+    REXLOG_DEBUG(
+        "PE base relocations: RVA=0x{:08X} size=0x{:X}, first LE "
+        "page=0x{:08X}/size=0x{:X}, first BE page=0x{:08X}/size=0x{:X}, "
+        "selected {}-endian",
+        relocation_dir_rva_, relocation_dir_size_, read32(data, false), read32(data + 4, false),
+        read32(data, true), read32(data + 4, true), bigEndian ? "big" : "little");
+    uint32_t offset = 0;
+    while (offset + sizeof(IMAGE_BASE_RELOCATION) <= relocation_dir_size_) {
+      uint32_t pageRva = read32(data + offset, bigEndian);
+      uint32_t blockSize = read32(data + offset + 4, bigEndian);
+      if (blockSize < sizeof(IMAGE_BASE_RELOCATION) || offset + blockSize > relocation_dir_size_)
+        break;
+      const uint32_t entryCount = (blockSize - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(uint16_t);
+      for (uint32_t index = 0; index < entryCount; ++index) {
+        uint16_t entry =
+            read16(data + offset + sizeof(IMAGE_BASE_RELOCATION) + index * 2, bigEndian);
+        uint32_t type = entry >> 12;
+        if (type == IMAGE_REL_BASED_ABSOLUTE)
+          continue;
+        uint32_t address = base_address_ + pageRva + (entry & 0x0FFF);
+        if (address_in_image(address, 4))
+          relocation_storage_addresses_.push_back(address);
+      }
+      offset += blockSize;
+    }
+  }
+
+  std::sort(binary_exports_.begin(), binary_exports_.end(), [](const auto& a, const auto& b) {
+    if (a.address != b.address)
+      return a.address < b.address;
+    if (a.ordinal != b.ordinal)
+      return a.ordinal < b.ordinal;
+    return a.name < b.name;
+  });
+  binary_exports_.erase(std::unique(binary_exports_.begin(), binary_exports_.end(),
+                                    [](const auto& a, const auto& b) {
+                                      return a.address == b.address && a.ordinal == b.ordinal &&
+                                             a.name == b.name;
+                                    }),
+                        binary_exports_.end());
+  std::sort(tls_callbacks_.begin(), tls_callbacks_.end());
+  tls_callbacks_.erase(std::unique(tls_callbacks_.begin(), tls_callbacks_.end()),
+                       tls_callbacks_.end());
+  std::sort(relocation_storage_addresses_.begin(), relocation_storage_addresses_.end());
+  relocation_storage_addresses_.erase(
+      std::unique(relocation_storage_addresses_.begin(), relocation_storage_addresses_.end()),
+      relocation_storage_addresses_.end());
 }
 
 std::span<const BinarySection> XexModule::binary_sections() const {

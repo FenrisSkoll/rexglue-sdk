@@ -92,7 +92,9 @@ BinaryView BinaryView::fromModule(const runtime::Module& module) {
                                          .baseAddress = section.virtual_address,
                                          .size = section.virtual_size,
                                          .data = view.sectionData_.back().data(),
-                                         .executable = section.executable});
+                                         .executable = section.executable,
+                                         .readable = section.readable,
+                                         .writable = section.writable});
 
     REXCODEGEN_DEBUG("BinaryView: section '{}' at 0x{:08X} size 0x{:X} exec={}", section.name,
                      section.virtual_address, section.virtual_size, section.executable);
@@ -101,6 +103,34 @@ BinaryView BinaryView::fromModule(const runtime::Module& module) {
   REXCODEGEN_DEBUG("BinaryView: loaded {} sections, base=0x{:08X}, size=0x{:X}",
                    view.sections_.size(), view.baseAddress_, view.imageSize_);
 
+  return view;
+}
+
+BinaryView BinaryView::fromSections(uint32_t baseAddress, uint32_t imageSize, uint32_t entryPoint,
+                                    std::span<const BinarySectionInput> sections) {
+  BinaryView view;
+  view.baseAddress_ = baseAddress;
+  view.imageSize_ = imageSize;
+  view.entryPoint_ = entryPoint;
+  view.sectionNames_.reserve(sections.size());
+  view.sectionData_.reserve(sections.size());
+  view.sections_.reserve(sections.size());
+
+  for (const auto& section : sections) {
+    view.sectionNames_.push_back(section.name);
+    view.sectionData_.emplace_back(section.data.begin(), section.data.end());
+    view.sections_.push_back(SectionView{.name = view.sectionNames_.back(),
+                                         .baseAddress = section.baseAddress,
+                                         .size = static_cast<uint32_t>(section.data.size()),
+                                         .data = view.sectionData_.back().data(),
+                                         .executable = section.executable,
+                                         .readable = section.readable,
+                                         .writable = section.writable});
+  }
+
+  std::sort(
+      view.sections_.begin(), view.sections_.end(),
+      [](const SectionView& a, const SectionView& b) { return a.baseAddress < b.baseAddress; });
   return view;
 }
 

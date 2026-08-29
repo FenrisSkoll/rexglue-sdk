@@ -23,6 +23,8 @@ class Runtime;
 
 namespace rex::codegen {
 
+struct ManifestConfig;
+
 /**
  * Pipeline orchestrator for code generation.
  *
@@ -50,12 +52,19 @@ class CodegenPipeline {
    */
   static Result<CodegenPipeline> Create(const std::filesystem::path& configPath);
 
+  /// Create an analysis-only pipeline for the entrypoint embedded in a
+  /// project manifest. This loads the same game root, XEX and sibling title
+  /// update as project codegen, but never constructs a writer.
+  static Result<CodegenPipeline> CreateEntrypoint(const ManifestConfig& manifest);
+
   Result<void> Run(bool force = false);
   Result<void> RunAnalyze();
   Result<void> RunWrite(bool force = false);
 
   CodegenContext& context() { return *ctx_; }
   const CodegenContext& context() const { return *ctx_; }
+  Runtime& runtime() { return *runtime_; }
+  const Runtime& runtime() const { return *runtime_; }
 
  private:
   CodegenPipeline() = default;

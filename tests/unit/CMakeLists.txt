@@ -17,6 +17,7 @@ add_executable(unit_tests
     system/function_dispatcher_test.cpp
     input/input_assignment_test.cpp
     codegen/codegen_writer_test.cpp
+    codegen/entrypoint_closure_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
 )

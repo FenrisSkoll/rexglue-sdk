@@ -153,6 +153,11 @@ class XexModule : public Module {
   std::span<const BinarySection> binary_sections() const override;
   const BinarySection* FindSectionByName(std::string_view name) const override;
   std::span<const BinarySymbol> binary_symbols() const override;
+  std::span<const BinaryExport> binary_exports() const { return binary_exports_; }
+  std::span<const uint32_t> tls_callbacks() const { return tls_callbacks_; }
+  std::span<const uint32_t> relocation_storage_addresses() const {
+    return relocation_storage_addresses_;
+  }
 
   uint32_t GetProcAddress(uint16_t ordinal) const;
   uint32_t GetProcAddress(const std::string_view name) const;
@@ -227,9 +232,19 @@ class XexModule : public Module {
   // Exception DataDirectory from PE Optional Header
   uint32_t exception_dir_rva_ = 0;
   uint32_t exception_dir_size_ = 0;
+  uint32_t export_dir_rva_ = 0;
+  uint32_t export_dir_size_ = 0;
+  uint32_t tls_dir_rva_ = 0;
+  uint32_t tls_dir_size_ = 0;
+  uint32_t relocation_dir_rva_ = 0;
+  uint32_t relocation_dir_size_ = 0;
 
   // PE FileHeader TimeDateStamp from the contained PE image.
   uint32_t pe_time_date_stamp_ = 0;
+
+  std::vector<BinaryExport> binary_exports_;
+  std::vector<uint32_t> tls_callbacks_;
+  std::vector<uint32_t> relocation_storage_addresses_;
 
   XexFormat xex_format_ = kFormatUnknown;
   SecurityInfoContext security_info_ = {};

@@ -26,12 +26,19 @@ struct BinarySymbol {
   BinarySymbolType type = BinarySymbolType::Unknown;
 };
 
+struct BinaryExport {
+  std::string name;
+  uint32_t address = 0;
+  uint32_t ordinal = 0;
+};
+
 struct BinarySection {
   std::string name;
   uint32_t virtual_address = 0;
   uint32_t virtual_size = 0;
   const uint8_t* host_data = nullptr;  // Pointer to data in host memory
   bool executable = false;
+  bool readable = true;
   bool writable = false;
 };
 
