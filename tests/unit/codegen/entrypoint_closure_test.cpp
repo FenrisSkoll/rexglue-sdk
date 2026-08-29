@@ -133,6 +133,41 @@ TEST_CASE("entrypoint closure records relocations, pointer runs and writable poi
   CHECK(report.counts.pointerRuns == 1);
 }
 
+TEST_CASE("entrypoint closure requires a code xref before calling a pointer run a callback table",
+          "[codegen][entrypoint-closure]") {
+  SyntheticImage image;
+  for (uint32_t offset : {0x40u, 0x48u}) {
+    StoreBe32(image.text, offset, 0x38600000);
+    StoreBe32(image.text, offset + 4, 0x4E800020);
+  }
+  StoreBe32(image.readOnly, 0x00, kTextBase + 0x40);
+  StoreBe32(image.readOnly, 0x04, kTextBase + 0x48);
+
+  auto report = AnalyzeEntrypointClosure(image.view(), DefaultInput());
+  const auto& candidate = Candidate(report, kTextBase + 0x40);
+  CHECK(candidate.classification == EntrypointClassification::ProbableNewFunction);
+  CHECK(HasEvidence(candidate, EntrypointEvidenceKind::PointerTableRun));
+  CHECK_FALSE(HasEvidence(candidate, EntrypointEvidenceKind::CallbackTable));
+}
+
+TEST_CASE("entrypoint closure records conflicts between proposed candidate ranges",
+          "[codegen][entrypoint-closure]") {
+  SyntheticImage image;
+  StoreBe32(image.text, 0x40, 0x60000000);
+  StoreBe32(image.text, 0x44, 0x60000000);
+  StoreBe32(image.text, 0x48, 0x60000000);
+  StoreBe32(image.text, 0x4C, 0x4E800020);
+  StoreBe32(image.readOnly, 0x00, kTextBase + 0x40);
+  StoreBe32(image.readOnly, 0x04, kTextBase + 0x48);
+
+  auto report = AnalyzeEntrypointClosure(image.view(), DefaultInput());
+  const auto& outer = Candidate(report, kTextBase + 0x40);
+  const auto& inner = Candidate(report, kTextBase + 0x48);
+  CHECK(report.counts.candidateOverlapPairs == 1);
+  CHECK(outer.conflicts.size() == 1);
+  CHECK(inner.conflicts.size() == 1);
+}
+
 TEST_CASE("entrypoint closure recognizes PPC high-low address materialization",
           "[codegen][entrypoint-closure]") {
   SyntheticImage image;

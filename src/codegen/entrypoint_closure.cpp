@@ -236,7 +236,13 @@ void ScanStoragePointers(const BinaryView& binary, const EntrypointClosureInput&
                          WorkingSet& work) {
   work.pointerRuns = FindPointerRuns(binary, input.limits);
   std::unordered_map<uint32_t, const PointerRun*> runByStorage;
-  for (const auto& run : work.pointerRuns) {
+  for (auto& run : work.pointerRuns) {
+    for (size_t index = 0; index < run.targets.size(); ++index) {
+      if (work.rttiStorage.contains(run.start + static_cast<uint32_t>(index * 4))) {
+        run.rtti = true;
+        break;
+      }
+    }
     for (size_t index = 0; index < run.targets.size(); ++index) {
       runByStorage.emplace(run.start + static_cast<uint32_t>(index * 4), &run);
     }
@@ -316,18 +322,6 @@ void ScanStoragePointers(const BinaryView& binary, const EntrypointClosureInput&
                         {"slot", std::to_string(slot)},
                     },
             });
-        if (!work.rttiStorage.contains(storage) && !section.executable) {
-          AddEvidence(work, EntrypointEvidence{
-                                .kind = EntrypointEvidenceKind::CallbackTable,
-                                .targetAddress = target,
-                                .sourceAddress = run.start,
-                                .storageAddress = storage,
-                                .sourceSection = std::string(section.name),
-                                .provenance = "non-RTTI contiguous callback/function-pointer array",
-                                .attributes = {{"entries", std::to_string(run.targets.size())},
-                                               {"slot", std::to_string(slot)}},
-                            });
-        }
       }
     }
   }
@@ -388,6 +382,7 @@ void ScanMaterializations(const BinaryView& binary, const DecodedBinary& decoded
 
         if (value) {
           std::vector<std::pair<uint32_t, uint32_t>> referencedPointers;
+          const PointerRun* referencedRun = nullptr;
           if (auto pointer = work.pointerTargetByStorage.find(*value);
               pointer != work.pointerTargetByStorage.end()) {
             referencedPointers.emplace_back(pointer->first, pointer->second);
@@ -395,6 +390,7 @@ void ScanMaterializations(const BinaryView& binary, const DecodedBinary& decoded
           for (const auto& run : work.pointerRuns) {
             if (run.start != *value)
               continue;
+            referencedRun = &run;
             for (size_t slot = 0; slot < run.targets.size(); ++slot) {
               referencedPointers.emplace_back(run.start + static_cast<uint32_t>(slot * 4),
                                               run.targets[slot]);
@@ -416,6 +412,23 @@ void ScanMaterializations(const BinaryView& binary, const DecodedBinary& decoded
                                               {"high_site", Hex(highAddress)},
                                               {"low_site", Hex(lowAddress)},
                                               {"table_or_storage", Hex(*value)}}});
+            if (referencedRun && !referencedRun->rtti && !referencedRun->section->executable) {
+              const size_t slot = (storage - referencedRun->start) / 4;
+              AddEvidence(
+                  work,
+                  {.kind = EntrypointEvidenceKind::CallbackTable,
+                   .targetAddress = target,
+                   .sourceAddress = highAddress,
+                   .storageAddress = storage,
+                   .sourceSection = std::string(referencedRun->section->name),
+                   .provenance = "non-RTTI pointer array referenced by PPC address materialization",
+                   .attributes = {{"entries", std::to_string(referencedRun->targets.size())},
+                                  {"form", form},
+                                  {"high_site", Hex(highAddress)},
+                                  {"low_site", Hex(lowAddress)},
+                                  {"run_start", Hex(referencedRun->start)},
+                                  {"slot", std::to_string(slot)}}});
+            }
           }
         }
 
@@ -916,6 +929,45 @@ void FinalizeFixtures(const EntrypointClosureInput& input, EntrypointClosureRepo
             [](const auto& a, const auto& b) { return a.expected.address < b.expected.address; });
 }
 
+uint32_t RecordCandidateOverlapConflicts(std::vector<EntrypointCandidate>& candidates) {
+  auto isReviewRange = [](const EntrypointCandidate& candidate) {
+    return candidate.proposedRange &&
+           (candidate.classification == EntrypointClassification::StrongNewFunction ||
+            candidate.classification == EntrypointClassification::ProbableNewFunction ||
+            candidate.classification == EntrypointClassification::AmbiguousCodePointer);
+  };
+
+  uint32_t pairs = 0;
+  for (size_t leftIndex = 0; leftIndex < candidates.size(); ++leftIndex) {
+    auto& left = candidates[leftIndex];
+    if (!isReviewRange(left))
+      continue;
+    for (size_t rightIndex = leftIndex + 1; rightIndex < candidates.size(); ++rightIndex) {
+      auto& right = candidates[rightIndex];
+      if (right.address >= left.proposedRange->end)
+        break;
+      if (!isReviewRange(right) || !left.proposedRange->overlaps(*right.proposedRange))
+        continue;
+
+      left.conflicts.push_back(
+          fmt::format("proposed range {}-{} overlaps candidate {}-{}",
+                      Hex(left.proposedRange->start), Hex(left.proposedRange->end),
+                      Hex(right.proposedRange->start), Hex(right.proposedRange->end)));
+      right.conflicts.push_back(
+          fmt::format("proposed range {}-{} overlaps candidate {}-{}",
+                      Hex(right.proposedRange->start), Hex(right.proposedRange->end),
+                      Hex(left.proposedRange->start), Hex(left.proposedRange->end)));
+      ++pairs;
+    }
+  }
+  for (auto& candidate : candidates) {
+    std::sort(candidate.conflicts.begin(), candidate.conflicts.end());
+    candidate.conflicts.erase(std::unique(candidate.conflicts.begin(), candidate.conflicts.end()),
+                              candidate.conflicts.end());
+  }
+  return pairs;
+}
+
 void ComputeCounts(const WorkingSet& work, EntrypointClosureReport& report) {
   for (const auto& seed : report.functionRanges) {
     report.counts.trustedRanges += seed.trusted ? 1u : 0u;
@@ -1169,6 +1221,7 @@ static EntrypointClosureReport AnalyzeEntrypointClosureDecoded(const BinaryView&
   }
   std::sort(report.candidates.begin(), report.candidates.end(),
             [](const auto& a, const auto& b) { return a.address < b.address; });
+  report.counts.candidateOverlapPairs = RecordCandidateOverlapConflicts(report.candidates);
 
   report.functionRanges = std::move(input.functionSeeds);
   for (const auto& seed : report.functionRanges) {
@@ -1493,7 +1546,8 @@ void StreamEntrypointClosureJson(std::ostream& output, const EntrypointClosureRe
                  {"relocation_storage_sites", counts.relocationStorageSites},
                  {"pe_exports", counts.peExports},
                  {"tls_callbacks", counts.tlsCallbacks},
-                 {"indirect_sites", counts.indirectSites}}
+                 {"indirect_sites", counts.indirectSites},
+                 {"candidate_overlap_pairs", counts.candidateOverlapPairs}}
                 .dump()
          << ",\"function_ranges\":";
   StreamJsonArray(output, report.functionRanges,
@@ -1617,6 +1671,8 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
            << report.counts.probableNewFunctions << "\n"
            << "- Ambiguous/rejected candidates: " << report.counts.ambiguousCandidates << "/"
            << report.counts.rejectedCandidates << "\n"
+           << "- Proposed candidate-range overlap pairs: " << report.counts.candidateOverlapPairs
+           << "\n"
            << "- Safety-limit diagnostics: " << report.limitDiagnostics.size()
            << "\n\n## Acceptance fixtures\n\n"
            << "| Address | Expected range | Independent | Storage / xref sites | Result |\n"

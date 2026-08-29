@@ -244,6 +244,7 @@ struct EntrypointClosureCounts {
   uint32_t peExports = 0;
   uint32_t tlsCallbacks = 0;
   uint32_t indirectSites = 0;
+  uint32_t candidateOverlapPairs = 0;
 };
 
 struct EntrypointClosureReport {
