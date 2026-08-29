@@ -1460,8 +1460,7 @@ Json JumpTableRecoveryJson(const EntrypointJumpTableRecovery& recovery,
             {"max_entries", recovery.limits.maxEntries},
             {"max_fixpoint_iterations", recovery.limits.maxFixpointIterations}}},
       {"stats",
-       Json{{"pass_elapsed_microseconds", recovery.stats.elapsedMicroseconds},
-            {"decoded_instructions", recovery.stats.decodedInstructions},
+       Json{{"decoded_instructions", recovery.stats.decodedInstructions},
             {"max_function_fixpoint_iterations", recovery.stats.fixpointIterations},
             {"indirect_sites", recovery.stats.indirectSites},
             {"recovered_tables", recovery.stats.recoveredTables},
@@ -1919,8 +1918,6 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
                << report.jumpTableRecovery.stats.unresolvedSites << "\n"
                << "- Max per-function fixpoint iterations: "
                << report.jumpTableRecovery.stats.fixpointIterations << "\n"
-               << "- Recovery pass time: "
-               << report.jumpTableRecovery.stats.elapsedMicroseconds << " us\n"
                << "- Decoded instructions visited by recovery: "
                << report.jumpTableRecovery.stats.decodedInstructions << "\n"
                << "- Boundary effects: " << report.jumpTableRecovery.boundaryEffects.size()
