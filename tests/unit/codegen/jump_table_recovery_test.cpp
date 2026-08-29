@@ -458,6 +458,27 @@ TEST_CASE("jump-table recovery decodes signed byte relative offsets and scaling"
         std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
 }
 
+TEST_CASE("jump-table recovery folds a nested lis/addi relative anchor",
+          "[codegen][jump-table]") {
+  RelativeSwitch image;
+  StoreBe32(image.text, 0x04, Bc(kTextBase + 4, kTextBase + 0x38, 12, 1));
+  StoreBe32(image.text, 0x1C, 0x3CC01000);  // lis r6, anchor@ha
+  StoreBe32(image.text, 0x20, 0x38C60040);  // addi r6, r6, anchor@l
+  StoreBe32(image.text, 0x24, Add(5, 6, 5));
+  StoreBe32(image.text, 0x28, Mtctr(5));
+  StoreBe32(image.text, 0x2C, 0x4E800420);
+  StoreBe32(image.text, 0x38, 0x4E800020);
+  image.site = kTextBase + 0x2C;
+  image.table[0x20] = 0;
+  image.table[0x21] = 4;
+  image.table[0x22] = 8;
+  auto analysis = Analyze(image);
+  REQUIRE(analysis.selectedTable);
+  CHECK(analysis.selectedTable->anchorAddress == kTextBase + 0x40);
+  CHECK(analysis.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
+}
+
 TEST_CASE("jump-table recovery decodes signed halfword relative offsets",
           "[codegen][jump-table]") {
   RelativeSwitch image(true);

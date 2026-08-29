@@ -758,17 +758,32 @@ bool LoadIsSignExtended(const ExprPtr& expression, uint32_t loadOrigin, bool und
          LoadIsSignExtended(expression->rhs, loadOrigin, nowSigned);
 }
 
-std::optional<uint32_t> ConstantAnchor(const ExprPtr& expression) {
+std::optional<uint32_t> EvaluateConstant(const ExprPtr& expression) {
   if (!expression)
     return std::nullopt;
+  if (expression->kind == ExprKind::Constant)
+    return expression->value;
   if (expression->kind == ExprKind::Add) {
-    if (expression->lhs && expression->lhs->kind == ExprKind::Constant &&
-        ContainsLoad(expression->rhs))
-      return expression->lhs->value;
-    if (expression->rhs && expression->rhs->kind == ExprKind::Constant &&
-        ContainsLoad(expression->lhs))
-      return expression->rhs->value;
+    auto lhs = EvaluateConstant(expression->lhs);
+    auto rhs = EvaluateConstant(expression->rhs);
+    if (lhs && rhs)
+      return *lhs + *rhs;
   }
+  if (expression->kind == ExprKind::ShiftLeft) {
+    auto operand = EvaluateConstant(expression->lhs);
+    if (operand)
+      return *operand << expression->value;
+  }
+  return std::nullopt;
+}
+
+std::optional<uint32_t> ConstantAnchor(const ExprPtr& expression) {
+  if (!expression || expression->kind != ExprKind::Add)
+    return std::nullopt;
+  if (auto lhs = EvaluateConstant(expression->lhs); lhs && ContainsLoad(expression->rhs))
+    return lhs;
+  if (auto rhs = EvaluateConstant(expression->rhs); rhs && ContainsLoad(expression->lhs))
+    return rhs;
   return std::nullopt;
 }
 
