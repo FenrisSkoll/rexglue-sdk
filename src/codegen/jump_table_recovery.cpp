@@ -406,8 +406,8 @@ class Resolver {
     }
 
     if (alternatives.size() != 1) {
-      bool preciseMerge = true;
-      std::vector<ExprPtr> mergedExpressions;
+      bool preciseCompleteAlternatives = true;
+      std::vector<ExprPtr> completeExpressions;
       size_t completeAlternatives = 0;
       bool hasIncompleteAlternative = false;
       for (auto& [unused, result] : alternatives) {
@@ -415,20 +415,31 @@ class Resolver {
           hasIncompleteAlternative = true;
         } else {
           ++completeAlternatives;
+          preciseCompleteAlternatives = preciseCompleteAlternatives && !result.ambiguous &&
+                                        !result.limitHit && !IsUnknown(result.expression);
+          completeExpressions.push_back(result.expression);
         }
         merged.limitHit = merged.limitHit || result.limitHit;
-        preciseMerge = preciseMerge && !result.ambiguous && !result.limitHit &&
-                       !result.incompleteCaseEntryPath && !IsUnknown(result.expression);
-        mergedExpressions.push_back(result.expression);
         merged.evidence.insert(merged.evidence.end(), result.evidence.begin(),
                                result.evidence.end());
       }
-      if (preciseMerge) {
+      if (!hasIncompleteAlternative && preciseCompleteAlternatives) {
         // A path merge is not inherently ambiguous: a dominating bound can
         // constrain the merged register value before the table consumes it.
         // Keep the exact, deterministically ordered reaching alternatives so
         // only the same merge can satisfy that bound.
-        merged.expression = MakeMergedValue(std::move(mergedExpressions));
+        merged.expression = MakeMergedValue(std::move(completeExpressions));
+      } else if (hasIncompleteAlternative && completeAlternatives != 0 &&
+                 preciseCompleteAlternatives) {
+        // Preserve a precise summary of the complete paths, but do not accept
+        // it as a new proof while a prior case entry remains incomplete. The
+        // fixpoint owner may retain its previously validated table without
+        // confusing multiple complete incoming values with a conflict.
+        merged.expression = completeExpressions.size() == 1
+                                ? completeExpressions.front()
+                                : MakeMergedValue(std::move(completeExpressions));
+        merged.ambiguous = true;
+        merged.incompleteCaseEntryPath = true;
       } else {
         merged.expression = MakeUnknown();
         merged.ambiguous = true;
