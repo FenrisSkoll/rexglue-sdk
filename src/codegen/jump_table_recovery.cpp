@@ -4521,6 +4521,33 @@ JumpTableEntryCallsiteDomainEvidence AnalyzeDirectCallArgumentDomain(
     return output;
   }
 
+  // An exact immediate reaching the call is already a stronger finite-domain
+  // proof than any surrounding upper-bound guard. Validate it before the
+  // caller-wide bound census so a large unrelated prefix cannot hide a local
+  // dominating constant behind maxBackwardInstructions exhaustion.
+  if (value.expression->kind == ExprKind::Constant && value.expression->origin != 0) {
+    bool dominanceLimit = false;
+    if (!cfg.Dominates(value.expression->origin, callAddress, limits, &dominanceLimit)) {
+      output.limitHit = dominanceLimit;
+      reject(dominanceLimit ? "callsite_constant_dominance_limit"
+                            : "callsite_constant_does_not_dominate");
+      return output;
+    }
+    bool stabilityLimit = false;
+    if (!cfg.RegisterValueAvailableOnEveryPath(value.expression->origin + 4, callAddress,
+                                               registerIndex, limits, &stabilityLimit)) {
+      output.limitHit = stabilityLimit;
+      reject(stabilityLimit ? "callsite_constant_stability_limit"
+                            : "callsite_register_modified_after_constant");
+      return output;
+    }
+    output.definitionAddresses.push_back(value.expression->origin);
+    output.finiteValues.push_back(value.expression->value);
+    output.proofKind = "dominating_immediate_constant";
+    output.complete = true;
+    return output;
+  }
+
   bool boundLimit = false;
   auto bounds = FindBounds(decoded, cfg, resolver, callAddress, limits, &boundLimit);
   if (boundLimit) {
@@ -4567,29 +4594,7 @@ JumpTableEntryCallsiteDomainEvidence AnalyzeDirectCallArgumentDomain(
     return output;
   }
 
-  if (value.expression->kind != ExprKind::Constant || value.expression->origin == 0) {
-    reject("no_exact_constant_or_unsigned_dominating_guard");
-    return output;
-  }
-  bool dominanceLimit = false;
-  if (!cfg.Dominates(value.expression->origin, callAddress, limits, &dominanceLimit)) {
-    output.limitHit = dominanceLimit;
-    reject(dominanceLimit ? "callsite_constant_dominance_limit"
-                          : "callsite_constant_does_not_dominate");
-    return output;
-  }
-  bool stabilityLimit = false;
-  if (!cfg.RegisterValueAvailableOnEveryPath(value.expression->origin + 4, callAddress,
-                                             registerIndex, limits, &stabilityLimit)) {
-    output.limitHit = stabilityLimit;
-    reject(stabilityLimit ? "callsite_constant_stability_limit"
-                          : "callsite_register_modified_after_constant");
-    return output;
-  }
-  output.definitionAddresses.push_back(value.expression->origin);
-  output.finiteValues.push_back(value.expression->value);
-  output.proofKind = "dominating_immediate_constant";
-  output.complete = true;
+  reject("no_exact_constant_or_unsigned_dominating_guard");
   return output;
 }
 

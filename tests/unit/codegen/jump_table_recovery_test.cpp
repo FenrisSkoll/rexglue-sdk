@@ -948,6 +948,50 @@ TEST_CASE("whole-image direct-call domains recover an otherwise unbounded entry 
   CHECK_FALSE(functions.contains(kTextBase + 0x80));
 }
 
+TEST_CASE("exact local call arguments survive unrelated caller-wide bound exhaustion",
+          "[codegen][jump-table][entry-domain]") {
+  auto image = EntryDomainSwitch();
+  image.text.resize(0x400);
+  for (uint32_t offset = 0x200; offset < image.text.size(); offset += 4)
+    StoreBe32(image.text, offset, 0x60000000);  // nop
+
+  constexpr uint32_t kCaller = kTextBase + 0x200;
+  constexpr uint32_t kDefinition = kTextBase + 0x3F4;
+  constexpr uint32_t kCall = kTextBase + 0x3F8;
+  StoreBe32(image.text, kDefinition - kTextBase, Addi(7, 0, 4));
+  StoreBe32(image.text, kCall - kTextBase, Bl(kCall, kTextBase));
+  StoreBe32(image.text, kCall + 4 - kTextBase, 0x4E800020);  // blr
+
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const Block caller{kCaller, 0x200};
+
+  SECTION("the exact adjacent immediate is accepted before the unrelated scan limit") {
+    auto callsite = AnalyzeDirectCallArgumentDomain(decoded, std::span<const Block>(&caller, 1),
+                                                    kCaller, kCall, kTextBase, 7);
+    CHECK_FALSE(callsite.limitHit);
+    CHECK(callsite.rejections.empty());
+    REQUIRE(callsite.complete);
+    CHECK(callsite.proofKind == "dominating_immediate_constant");
+    CHECK(callsite.definitionAddresses == std::vector<uint32_t>{kDefinition});
+    CHECK(callsite.finiteValues == std::vector<uint32_t>{4});
+  }
+
+  SECTION("a later incompatible write cannot borrow the earlier immediate") {
+    StoreBe32(image.text, kDefinition - 4 - kTextBase, Addi(7, 0, 4));
+    StoreBe32(image.text, kDefinition - kTextBase, Mr(7, 3));
+    auto alteredView = image.view();
+    DecodedBinary alteredDecoded(alteredView);
+    alteredDecoded.decode();
+    auto callsite = AnalyzeDirectCallArgumentDomain(
+        alteredDecoded, std::span<const Block>(&caller, 1), kCaller, kCall, kTextBase, 7);
+    CHECK_FALSE(callsite.complete);
+    CHECK(callsite.finiteValues.empty());
+    CHECK(callsite.proofKind.empty());
+  }
+}
+
 TEST_CASE("discover phase requires a complete static inbound-reference census for entry domains",
           "[codegen][jump-table][entry-domain][discover]") {
   SECTION("four independently finite callsites recover the exact eight-case table") {
