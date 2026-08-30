@@ -44,4 +44,16 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
                                          const JumpTableRecoveryInput& input,
                                          JumpTableRecoveryStats* stats = nullptr);
 
+/**
+ * Re-analyze a previously validated automatic table with bounded larger
+ * budgets when case-expanded CFG growth alone exhausts the normal limits.
+ *
+ * The retry is accepted only when normal recovery fully validates a table
+ * that is semantically identical to priorAutomaticTable. Ambiguous, changed,
+ * or partially valid tables remain unresolved.
+ */
+IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
+    DecodedBinary& decoded, const JumpTableRecoveryInput& input,
+    JumpTableRecoveryStats* stats = nullptr);
+
 }  // namespace rex::codegen

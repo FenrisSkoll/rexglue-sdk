@@ -1373,4 +1373,83 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
   return finish();
 }
 
+IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
+    DecodedBinary& decoded, const JumpTableRecoveryInput& input,
+    JumpTableRecoveryStats* stats) {
+  auto analysis = AnalyzeIndirectSite(decoded, input, stats);
+  if (analysis.selectedTable || !input.priorAutomaticTable ||
+      std::find(analysis.failures.begin(), analysis.failures.end(),
+                JumpTableFailure::AnalysisLimit) == analysis.failures.end()) {
+    return analysis;
+  }
+
+  auto growLimit = [](uint32_t value, uint32_t factor, uint32_t ceiling) {
+    const uint64_t grown = std::max<uint64_t>(static_cast<uint64_t>(value) + 1,
+                                              static_cast<uint64_t>(value) * factor);
+    return static_cast<uint32_t>(std::min<uint64_t>(grown, ceiling));
+  };
+
+  JumpTableRecoveryInput retryInput = input;
+  retryInput.limits.maxBackwardInstructions =
+      growLimit(input.limits.maxBackwardInstructions, 4, 10000);
+  retryInput.limits.maxPredecessors = growLimit(input.limits.maxPredecessors, 2, 100000);
+  retryInput.limits.maxStates = growLimit(input.limits.maxStates, 8, 1000000);
+
+  auto retry = AnalyzeIndirectSite(decoded, retryInput, stats);
+  auto sameRawEntries = [](const std::vector<JumpTableRawEntry>& lhs,
+                           const std::vector<JumpTableRawEntry>& rhs) {
+    if (lhs.size() != rhs.size())
+      return false;
+    for (size_t index = 0; index < lhs.size(); ++index) {
+      if (lhs[index].storageAddress != rhs[index].storageAddress ||
+          lhs[index].rawValue != rhs[index].rawValue || lhs[index].target != rhs[index].target) {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto sameSemanticTable = [&](const JumpTable& lhs, const JumpTable& rhs) {
+    return lhs.bctrAddress == rhs.bctrAddress && lhs.tableAddress == rhs.tableAddress &&
+           lhs.indexRegister == rhs.indexRegister && lhs.targets == rhs.targets &&
+           lhs.kind == rhs.kind && lhs.origin == rhs.origin &&
+           lhs.ownerAddress == rhs.ownerAddress && lhs.storageEnd == rhs.storageEnd &&
+           lhs.boundValue == rhs.boundValue && lhs.caseCount == rhs.caseCount &&
+           lhs.defaultTarget == rhs.defaultTarget && lhs.anchorAddress == rhs.anchorAddress &&
+           lhs.targetScale == rhs.targetScale && lhs.elementWidth == rhs.elementWidth &&
+           lhs.elementSigned == rhs.elementSigned && lhs.boundInclusive == rhs.boundInclusive &&
+           lhs.defaultIsReturn == rhs.defaultIsReturn &&
+           lhs.tableInExecutableSection == rhs.tableInExecutableSection &&
+           lhs.boundSemantics == rhs.boundSemantics &&
+           sameRawEntries(lhs.rawEntries, rhs.rawEntries);
+  };
+
+  const bool accepted = retry.selectedTable &&
+                        retry.selectedTable->origin == JumpTableOrigin::Automatic &&
+                        retry.automaticTable &&
+                        sameSemanticTable(*retry.selectedTable, *input.priorAutomaticTable);
+  if (stats) {
+    // Both analyses contribute real elapsed and decoded-instruction work, but
+    // together they still classify one site and have one final resolution.
+    if (stats->indirectSites > 0)
+      --stats->indirectSites;
+    if (accepted) {
+      if (stats->unresolvedSites > 0)
+        --stats->unresolvedSites;
+    } else if (retry.selectedTable) {
+      if (stats->recoveredTables > 0)
+        --stats->recoveredTables;
+    } else if (stats->unresolvedSites > 0) {
+      --stats->unresolvedSites;
+    }
+  }
+
+  if (!accepted) {
+    return analysis;
+  }
+
+  retry.automaticTable->confidence = "validated_after_expanded_cfg_limit_retry";
+  retry.selectedTable->confidence = "validated_after_expanded_cfg_limit_retry";
+  return retry;
+}
+
 }  // namespace rex::codegen

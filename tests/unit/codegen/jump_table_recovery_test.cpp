@@ -546,6 +546,71 @@ TEST_CASE("jump-table recovery accepts a delayed guard with preserved condition 
         std::vector<uint32_t>{kTextBase + 0x180, kTextBase + 0x190, kTextBase + 0x1A0});
 }
 
+TEST_CASE("case-expanded CFG limit retry requires an exact previously validated table",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  image.text.resize(0x200);
+  for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
+    StoreBe32(image.text, offset, 0x60000000);  // nop
+  StoreBe32(image.text, 0x00, 0x28030002);      // cmplwi r3, 2
+  StoreBe32(image.text, 0x04, Bc(kTextBase + 0x04, kTextBase + 0x1F0, 12, 1));
+  StoreBe32(image.text, 0x150, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x154, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x158, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x15C, Mtctr(5));
+  StoreBe32(image.text, 0x160, 0x4E800420);  // bctr
+  StoreBe32(image.text, 0x180, 0x4E800020);
+  StoreBe32(image.text, 0x190, 0x4E800020);
+  StoreBe32(image.text, 0x1A0, 0x4E800020);
+  StoreBe32(image.text, 0x1F0, 0x4E800020);  // default: blr
+  StoreBe32(image.table, 0x00, kTextBase + 0x180);
+  StoreBe32(image.table, 0x04, kTextBase + 0x190);
+  StoreBe32(image.table, 0x08, kTextBase + 0x1A0);
+
+  auto prior = Analyze(image, kTextBase + 0x160, nullptr, {}, 0x200);
+  REQUIRE(prior.selectedTable);
+
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const Block expandedBlock{kTextBase, 0x200};
+  JumpTableRecoveryLimits truncatedLimits;
+  truncatedLimits.maxBackwardInstructions = 64;
+  JumpTableRecoveryInput input{
+      .site = kTextBase + 0x160,
+      .ownerAddress = kTextBase,
+      .preliminaryBlocks = std::span<const Block>(&expandedBlock, 1),
+      .containingRegion = decoded.regionContaining(kTextBase),
+      .priorAutomaticTable = &*prior.selectedTable,
+      .limits = truncatedLimits,
+  };
+
+  auto truncated = AnalyzeIndirectSite(decoded, input);
+  REQUIRE_FALSE(truncated.selectedTable);
+  REQUIRE(HasFailure(truncated, JumpTableFailure::AnalysisLimit));
+
+  JumpTableRecoveryStats acceptedStats;
+  auto accepted = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input, &acceptedStats);
+  REQUIRE(accepted.selectedTable);
+  CHECK(accepted.selectedTable->targets == prior.selectedTable->targets);
+  CHECK(accepted.selectedTable->rawEntries.size() == prior.selectedTable->rawEntries.size());
+  CHECK(accepted.selectedTable->confidence == "validated_after_expanded_cfg_limit_retry");
+  CHECK(acceptedStats.indirectSites == 1);
+  CHECK(acceptedStats.recoveredTables == 1);
+  CHECK(acceptedStats.unresolvedSites == 0);
+
+  JumpTable mismatchedPrior = *prior.selectedTable;
+  mismatchedPrior.rawEntries[0].target += 4;
+  input.priorAutomaticTable = &mismatchedPrior;
+  JumpTableRecoveryStats rejectedStats;
+  auto rejected = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input, &rejectedStats);
+  CHECK_FALSE(rejected.selectedTable);
+  CHECK(HasFailure(rejected, JumpTableFailure::AnalysisLimit));
+  CHECK(rejectedStats.indirectSites == 1);
+  CHECK(rejectedStats.recoveredTables == 0);
+  CHECK(rejectedStats.unresolvedSites == 1);
+}
+
 TEST_CASE("jump-table recovery uses an exact transformed index despite ambiguous live-ins",
           "[codegen][jump-table]") {
   AbsoluteSwitch image;

@@ -2156,7 +2156,7 @@ BlockDiscoveryResult discoverBlocks(
       }
       input.manualTable = manual;
       input.limits = limits;
-      auto analysis = AnalyzeIndirectSite(decoded, input, &iterationStats);
+      auto analysis = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input, &iterationStats);
       if (!analysis.selectedTable && previous != selectedTables.end() &&
           previous->second.origin == JumpTableOrigin::Automatic) {
         if (analysis.incompleteCaseEntryPaths) {
