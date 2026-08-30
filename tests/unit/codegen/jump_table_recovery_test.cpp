@@ -2,12 +2,17 @@
 
 #include <array>
 #include <cstdint>
+#include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include <rex/codegen/binary_view.h>
+#include <rex/codegen/codegen_context.h>
+#include <rex/codegen/config.h>
 #include <rex/codegen/jump_table_recovery.h>
 #include <rex/codegen/function_scanner.h>
+#include <rex/codegen/phases.h>
 
 #include "codegen/decoded_binary.h"
 
@@ -41,6 +46,10 @@ uint32_t Bc(uint32_t site, uint32_t target, uint8_t bo, uint8_t bi) {
 uint32_t B(uint32_t site, uint32_t target) {
   const int32_t displacement = static_cast<int32_t>(target - site);
   return 0x48000000u | (static_cast<uint32_t>(displacement) & 0x03FFFFFCu);
+}
+
+uint32_t Bl(uint32_t site, uint32_t target) {
+  return B(site, target) | 1u;
 }
 
 uint32_t Addi(uint8_t rt, uint8_t ra, int16_t immediate) {
@@ -577,6 +586,104 @@ AbsoluteSwitch FiniteCfgDomainSwitch() {
   return image;
 }
 
+constexpr uint32_t kEntryDomainSite = kTextBase + 0x10;
+
+AbsoluteSwitch EntryDomainSwitch() {
+  AbsoluteSwitch image;
+  image.text.resize(0x200);
+  for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
+    StoreBe32(image.text, offset, 0x60000000);  // nop
+
+  // The owner deliberately has no local compare. Its absolute table index is
+  // the incoming r7 value, mirroring the missing-bound compiler form without
+  // using any private executable bytes.
+  StoreBe32(image.text, 0x00, 0x3D802000);              // lis r12, table@h
+  StoreBe32(image.text, 0x04, Rlwinm(0, 7, 2, 0, 29));  // slwi r0, r7, 2
+  StoreBe32(image.text, 0x08, Lwzx(0, 12, 0));
+  StoreBe32(image.text, 0x0C, Mtctr(0));
+  StoreBe32(image.text, 0x10, 0x4E800420);  // bctr
+  for (uint32_t index = 0; index < 8; ++index) {
+    const uint32_t target = kTextBase + 0x20 + index * 0x10;
+    StoreBe32(image.text, target - kTextBase, 0x4E800020);
+    StoreBe32(image.table, index * 4, target);
+  }
+
+  StoreBe32(image.text, 0xC0, Addi(7, 0, 6));
+  StoreBe32(image.text, 0xC4, Bl(kTextBase + 0xC4, kTextBase));
+  StoreBe32(image.text, 0xC8, 0x4E800020);
+  StoreBe32(image.text, 0xD0, Addi(7, 0, 3));
+  StoreBe32(image.text, 0xD4, Bl(kTextBase + 0xD4, kTextBase));
+  StoreBe32(image.text, 0xD8, 0x4E800020);
+  StoreBe32(image.text, 0xE0, Addi(7, 0, 4));
+  StoreBe32(image.text, 0xE4, Bl(kTextBase + 0xE4, kTextBase));
+  StoreBe32(image.text, 0xE8, 0x4E800020);
+  StoreBe32(image.text, 0xF0, Lwzx(7, 3, 4));
+  StoreBe32(image.text, 0xF4, 0x28070007);  // cmplwi r7, 7
+  StoreBe32(image.text, 0xF8, Bc(kTextBase + 0xF8, kTextBase + 0x108, 12, 1));
+  StoreBe32(image.text, 0xFC, Bl(kTextBase + 0xFC, kTextBase));
+  StoreBe32(image.text, 0x100, 0x4E800020);
+  StoreBe32(image.text, 0x108, 0x4E800020);
+  return image;
+}
+
+JumpTableEntryRegisterDomainEvidence ProveEntryDomain(DecodedBinary& decoded) {
+  JumpTableEntryRegisterDomainEvidence domain;
+  domain.entryAddress = kTextBase;
+  domain.registerIndex = 7;
+  const std::array callsites{
+      std::pair{Block{kTextBase + 0xC0, 0x0C}, kTextBase + 0xC4},
+      std::pair{Block{kTextBase + 0xD0, 0x0C}, kTextBase + 0xD4},
+      std::pair{Block{kTextBase + 0xE0, 0x0C}, kTextBase + 0xE4},
+      std::pair{Block{kTextBase + 0xF0, 0x1C}, kTextBase + 0xFC},
+  };
+  std::set<uint32_t> values;
+  for (const auto& [block, callAddress] : callsites) {
+    auto callsite = AnalyzeDirectCallArgumentDomain(decoded, std::span<const Block>(&block, 1),
+                                                    block.base, callAddress, kTextBase, 7);
+    domain.directCallSites.push_back(callAddress);
+    values.insert(callsite.finiteValues.begin(), callsite.finiteValues.end());
+    domain.callsites.push_back(std::move(callsite));
+  }
+  domain.finiteValues.assign(values.begin(), values.end());
+  domain.allReferencesDirectCalls = true;
+  domain.finiteDenseDomain = std::all_of(domain.callsites.begin(), domain.callsites.end(),
+                                         [](const auto& callsite) { return callsite.complete; }) &&
+                             domain.finiteValues.size() == 8;
+  return domain;
+}
+
+CodegenContext MakeEntryDomainContext(const AbsoluteSwitch& image) {
+  const std::array sections{
+      BinarySectionInput{.name = ".text",
+                         .baseAddress = kTextBase,
+                         .data = image.text,
+                         .executable = true,
+                         .readable = true},
+      BinarySectionInput{
+          .name = ".rdata", .baseAddress = kTableBase, .data = image.table, .readable = true},
+  };
+  RecompilerConfig config;
+  auto ctx = CodegenContext::Create(
+      BinaryView::fromSections(kTextBase, 0x10000200, kTextBase + 0x1F0, sections),
+      std::move(config));
+  ctx.initDecoded();
+  ctx.scan.codeRegions.assign(ctx.decoded().codeRegions().begin(),
+                              ctx.decoded().codeRegions().end());
+
+  ctx.graph.addFunction(kTextBase, 4, FunctionAuthority::DISCOVERED, true);
+  const std::array callers{
+      std::pair{kTextBase + 0xC0, 0x0Cu},
+      std::pair{kTextBase + 0xD0, 0x0Cu},
+      std::pair{kTextBase + 0xE0, 0x0Cu},
+      std::pair{kTextBase + 0xF0, 0x1Cu},
+  };
+  for (const auto& [address, size] : callers) {
+    ctx.graph.addFunction(address, size, FunctionAuthority::PDATA, true);
+    ctx.scan.pdataSizes.emplace(address, size);
+  }
+  return ctx;
+}
+
 }  // namespace
 
 TEST_CASE("jump-table recovery validates a bounded absolute Xenon switch",
@@ -760,6 +867,354 @@ TEST_CASE("jump-table recovery reports a missing dominating bound", "[codegen][j
   auto analysis = Analyze(image);
   CHECK_FALSE(analysis.selectedTable);
   CHECK(HasFailure(analysis, JumpTableFailure::MissingBound));
+}
+
+TEST_CASE("whole-image direct-call domains recover an otherwise unbounded entry switch",
+          "[codegen][jump-table][entry-domain]") {
+  auto image = EntryDomainSwitch();
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+  const Block ownerBlock{kTextBase, 0x14};
+
+  JumpTableRecoveryInput input;
+  input.site = kEntryDomainSite;
+  input.ownerAddress = kTextBase;
+  input.trustedOwnerEnd = kTextBase + 0xA0;
+  input.preliminaryBlocks = std::span<const Block>(&ownerBlock, 1);
+  input.containingRegion = region;
+  auto initial = AnalyzeIndirectSite(decoded, input);
+  REQUIRE_FALSE(initial.selectedTable);
+  CHECK(initial.failures == std::vector{JumpTableFailure::MissingBound});
+  REQUIRE(initial.dataflow);
+  CHECK(initial.dataflow->indexRegister == 0);
+  CHECK(initial.dataflow->tableLoadInputRegisters == std::vector<uint8_t>{7});
+
+  auto domain = ProveEntryDomain(decoded);
+  REQUIRE(domain.callsites.size() == 4);
+  CHECK(domain.callsites[0].proofKind == "dominating_immediate_constant");
+  CHECK(domain.callsites[0].finiteValues == std::vector<uint32_t>{6});
+  CHECK(domain.callsites[1].finiteValues == std::vector<uint32_t>{3});
+  CHECK(domain.callsites[2].finiteValues == std::vector<uint32_t>{4});
+  CHECK(domain.callsites[3].proofKind == "unsigned_dominating_callsite_guard");
+  CHECK(domain.callsites[3].compareAddress == kTextBase + 0xF4);
+  CHECK(domain.callsites[3].guardAddress == kTextBase + 0xF8);
+  CHECK(domain.callsites[3].finiteValues == std::vector<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7});
+  REQUIRE(domain.allReferencesDirectCalls);
+  REQUIRE(domain.finiteDenseDomain);
+  CHECK(domain.finiteValues == std::vector<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7});
+
+  JumpTableEntryRegisterDomainMap domains;
+  domains.emplace(7, domain);
+  input.entryRegisterDomains = &domains;
+  auto recovered = AnalyzeIndirectSite(decoded, input);
+  REQUIRE(recovered.selectedTable);
+  CHECK(recovered.failures.empty());
+  CHECK(recovered.selectedTable->caseCount == 8);
+  CHECK(recovered.selectedTable->tableAddress == kTableBase);
+  CHECK(recovered.selectedTable->storageEnd == kTableBase + 0x20);
+  CHECK(recovered.selectedTable->boundSemantics == "interprocedural_entry_domain_zero_based_dense");
+  CHECK(recovered.selectedTable->confidence ==
+        "validated_interprocedural_entry_domain_all_targets");
+  CHECK(std::find(recovered.selectedTable->targets.begin(), recovered.selectedTable->targets.end(),
+                  kTextBase + 0x80) != recovered.selectedTable->targets.end());
+  REQUIRE(recovered.dataflow);
+  CHECK(recovered.dataflow->indexRegister == 7);
+  CHECK(recovered.dataflow->tableLoadInputRegisters == std::vector<uint8_t>{7});
+  REQUIRE(recovered.dataflow->entryRegisterDomains.size() == 1);
+  CHECK(recovered.dataflow->entryRegisterDomains.front().directCallSites == domain.directCallSites);
+  const auto bound = std::find_if(
+      recovered.dataflow->boundCandidates.begin(), recovered.dataflow->boundCandidates.end(),
+      [](const auto& candidate) { return candidate.interproceduralEntryDomain; });
+  REQUIRE(bound != recovered.dataflow->boundCandidates.end());
+  CHECK(bound->finiteDenseDomain);
+  CHECK(bound->finiteValues == domain.finiteValues);
+  CHECK(recovered.dataflow->mergeShape == "interprocedural_entry_domain");
+  CHECK(recovered.dataflow->switchLikelihood == JumpTableSwitchLikelihood::ResolvedSwitch);
+
+  const std::unordered_set<uint32_t> functions{kTextBase};
+  JumpTableEntryRegisterDomainsBySite domainsBySite;
+  domainsBySite.emplace(kEntryDomainSite, domains);
+  auto integrated =
+      discoverBlocks(decoded, kTextBase, *region, functions, 0xA0, nullptr, &domainsBySite);
+  REQUIRE(integrated.jumpTables.size() == 1);
+  CHECK(integrated.jumpTables.front().caseCount == 8);
+  CHECK(integrated.labels.contains(kTextBase + 0x80));
+  CHECK(std::any_of(integrated.blocks.begin(), integrated.blocks.end(),
+                    [](const Block& block) { return block.contains(kTextBase + 0x80); }));
+  CHECK(functions.size() == 1);
+  CHECK_FALSE(functions.contains(kTextBase + 0x80));
+}
+
+TEST_CASE("discover phase requires a complete static inbound-reference census for entry domains",
+          "[codegen][jump-table][entry-domain][discover]") {
+  SECTION("four independently finite callsites recover the exact eight-case table") {
+    auto image = EntryDomainSwitch();
+    auto ctx = MakeEntryDomainContext(image);
+    REQUIRE(phases::Discover(ctx));
+
+    const auto* owner = ctx.graph.getFunction(kTextBase);
+    REQUIRE(owner != nullptr);
+    REQUIRE(owner->jumpTables().size() == 1);
+    const auto& table = owner->jumpTables().front();
+    CHECK(table.bctrAddress == kEntryDomainSite);
+    CHECK(table.caseCount == 8);
+    CHECK(table.storageEnd == kTableBase + 0x20);
+    CHECK(table.indexRegister == 7);
+    CHECK(table.boundSemantics == "interprocedural_entry_domain_zero_based_dense");
+    CHECK(table.confidence == "validated_interprocedural_entry_domain_all_targets");
+    CHECK(std::find(table.targets.begin(), table.targets.end(), kTextBase + 0x80) !=
+          table.targets.end());
+    CHECK(owner->containsAddress(kTextBase + 0x80));
+    CHECK_FALSE(ctx.graph.isEntryPoint(kTextBase + 0x80));
+
+    const auto site =
+        std::find_if(owner->indirectSites().begin(), owner->indirectSites().end(),
+                     [](const auto& analysis) { return analysis.site == kEntryDomainSite; });
+    REQUIRE(site != owner->indirectSites().end());
+    REQUIRE(site->selectedTable);
+    REQUIRE(site->dataflow);
+    REQUIRE(site->dataflow->entryRegisterDomains.size() == 1);
+    const auto& domain = site->dataflow->entryRegisterDomains.front();
+    CHECK(domain.allReferencesDirectCalls);
+    CHECK(domain.finiteDenseDomain);
+    CHECK(domain.directCallSites == std::vector<uint32_t>{kTextBase + 0xC4, kTextBase + 0xD4,
+                                                          kTextBase + 0xE4, kTextBase + 0xFC});
+    CHECK(domain.finiteValues == std::vector<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7});
+  }
+
+  SECTION("one static address escape rejects recovery despite the same finite callsites") {
+    auto image = EntryDomainSwitch();
+    StoreBe32(image.table, 0x30, kTextBase);
+    auto ctx = MakeEntryDomainContext(image);
+    REQUIRE(phases::Discover(ctx));
+
+    const auto* owner = ctx.graph.getFunction(kTextBase);
+    REQUIRE(owner != nullptr);
+    CHECK(owner->jumpTables().empty());
+    const auto site =
+        std::find_if(owner->indirectSites().begin(), owner->indirectSites().end(),
+                     [](const auto& analysis) { return analysis.site == kEntryDomainSite; });
+    REQUIRE(site != owner->indirectSites().end());
+    CHECK_FALSE(site->selectedTable);
+    REQUIRE(site->dataflow);
+    REQUIRE(site->dataflow->entryRegisterDomains.size() == 1);
+    const auto& domain = site->dataflow->entryRegisterDomains.front();
+    CHECK_FALSE(domain.allReferencesDirectCalls);
+    CHECK_FALSE(domain.finiteDenseDomain);
+    CHECK(domain.rejection == "entry_has_non_call_or_address_escape_reference");
+    CHECK(domain.rejectedReferenceSites == std::vector<uint32_t>{kTableBase + 0x30});
+    CHECK(domain.referenceRejections ==
+          std::vector<std::string>{"aligned_static_code_pointer_reference"});
+    CHECK(site->dataflow->switchLikelihood ==
+          JumpTableSwitchLikelihood::InsufficientStaticEvidence);
+  }
+
+  SECTION("non-call references remain visible when there are no direct callers") {
+    auto image = EntryDomainSwitch();
+    StoreBe32(image.text, 0xC4, 0x4E800020);
+    StoreBe32(image.text, 0xD4, 0x4E800020);
+    StoreBe32(image.text, 0xE4, 0x4E800020);
+    StoreBe32(image.text, 0xFC, 0x4E800020);
+    StoreBe32(image.table, 0x30, kTextBase);
+    auto ctx = MakeEntryDomainContext(image);
+    REQUIRE(phases::Discover(ctx));
+
+    const auto* owner = ctx.graph.getFunction(kTextBase);
+    REQUIRE(owner != nullptr);
+    CHECK(owner->jumpTables().empty());
+    const auto site =
+        std::find_if(owner->indirectSites().begin(), owner->indirectSites().end(),
+                     [](const auto& analysis) { return analysis.site == kEntryDomainSite; });
+    REQUIRE(site != owner->indirectSites().end());
+    REQUIRE(site->dataflow);
+    REQUIRE(site->dataflow->entryRegisterDomains.size() == 1);
+    const auto& domain = site->dataflow->entryRegisterDomains.front();
+    CHECK(domain.directCallSites.empty());
+    CHECK(domain.rejection == "entry_has_only_non_call_or_address_escape_references");
+    CHECK(domain.rejectedReferenceSites == std::vector<uint32_t>{kTableBase + 0x30});
+    CHECK(domain.referenceRejections ==
+          std::vector<std::string>{"aligned_static_code_pointer_reference"});
+  }
+}
+
+TEST_CASE("entry-domain recovery rejects incomplete or altered evidence",
+          "[codegen][jump-table][entry-domain]") {
+  auto analyzeWithDomain = [](AbsoluteSwitch& image, JumpTableEntryRegisterDomainEvidence domain,
+                              uint32_t site = kEntryDomainSite, uint32_t blockSize = 0x14) {
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const Block ownerBlock{kTextBase, blockSize};
+    JumpTableEntryRegisterDomainMap domains;
+    domains.emplace(7, std::move(domain));
+    JumpTableRecoveryInput input;
+    input.site = site;
+    input.ownerAddress = kTextBase;
+    input.trustedOwnerEnd = kTextBase + 0xA0;
+    input.preliminaryBlocks = std::span<const Block>(&ownerBlock, 1);
+    input.containingRegion = decoded.regionContaining(kTextBase);
+    input.entryRegisterDomains = &domains;
+    return AnalyzeIndirectSite(decoded, input);
+  };
+
+  SECTION("a runtime edge cannot replace complete inbound-reference evidence") {
+    auto image = EntryDomainSwitch();
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    auto domain = ProveEntryDomain(decoded);
+    domain.allReferencesDirectCalls = false;
+    domain.finiteDenseDomain = false;
+    domain.rejectedReferenceSites.push_back(kTextBase + 0x180);
+    domain.referenceRejections.push_back("aligned_static_code_pointer_reference");
+    domain.rejection = "entry_has_non_call_or_address_escape_reference";
+    auto rejected = analyzeWithDomain(image, std::move(domain));
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::MissingBound));
+    REQUIRE(rejected.dataflow);
+    CHECK(rejected.dataflow->switchLikelihood ==
+          JumpTableSwitchLikelihood::InsufficientStaticEvidence);
+  }
+
+  SECTION("a sparse entry domain is not expanded into an inferred table length") {
+    auto image = EntryDomainSwitch();
+    JumpTableEntryRegisterDomainEvidence domain;
+    domain.entryAddress = kTextBase;
+    domain.registerIndex = 7;
+    domain.allReferencesDirectCalls = true;
+    domain.finiteDenseDomain = false;
+    domain.finiteValues = {0, 2};
+    domain.rejection = "entry_domain_not_dense_zero_based";
+    auto rejected = analyzeWithDomain(image, std::move(domain));
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::MissingBound));
+  }
+
+  SECTION("direct references remain distinct from incomplete callsite domains") {
+    auto image = EntryDomainSwitch();
+    JumpTableEntryRegisterDomainEvidence domain;
+    domain.entryAddress = kTextBase;
+    domain.registerIndex = 7;
+    domain.allReferencesDirectCalls = true;
+    domain.finiteDenseDomain = false;
+    domain.rejection = "one_or_more_callsite_domains_incomplete";
+    JumpTableEntryCallsiteDomainEvidence callsite;
+    callsite.callAddress = kTextBase + 0xC4;
+    callsite.targetAddress = kTextBase;
+    callsite.registerIndex = 7;
+    callsite.rejections = {"no_exact_constant_or_unsigned_dominating_guard"};
+    domain.callsites.push_back(std::move(callsite));
+    auto rejected = analyzeWithDomain(image, std::move(domain));
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::MissingBound));
+    REQUIRE(rejected.dataflow);
+    CHECK(rejected.dataflow->switchLikelihood ==
+          JumpTableSwitchLikelihood::InsufficientStaticEvidence);
+  }
+
+  SECTION("the owner must preserve the proven entry register") {
+    auto image = EntryDomainSwitch();
+    StoreBe32(image.text, 0x00, 0x3D802000);  // lis r12, table@h
+    StoreBe32(image.text, 0x04, Mr(7, 3));    // incompatible owner write
+    StoreBe32(image.text, 0x08, Rlwinm(0, 7, 2, 0, 29));
+    StoreBe32(image.text, 0x0C, Lwzx(0, 12, 0));
+    StoreBe32(image.text, 0x10, Mtctr(0));
+    StoreBe32(image.text, 0x14, 0x4E800420);
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    auto domain = ProveEntryDomain(decoded);
+    auto rejected = analyzeWithDomain(image, std::move(domain), kTextBase + 0x14, 0x18);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::MissingBound));
+    REQUIRE(rejected.dataflow);
+    const auto evidence = std::find_if(
+        rejected.dataflow->boundCandidates.begin(), rejected.dataflow->boundCandidates.end(),
+        [](const auto& candidate) { return candidate.interproceduralEntryDomain; });
+    REQUIRE(evidence != rejected.dataflow->boundCandidates.end());
+    CHECK(evidence->rejection == "entry_domain_register_modified_before_dispatch");
+  }
+
+  SECTION("the entry register must be the exact element-scaled table index") {
+    auto image = EntryDomainSwitch();
+    StoreBe32(image.text, 0x04, Rlwinm(0, 7, 1, 0, 30));  // scale by two, not word width
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    auto domain = ProveEntryDomain(decoded);
+    auto rejected = analyzeWithDomain(image, std::move(domain));
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::MissingBound));
+    REQUIRE(rejected.dataflow);
+    const auto evidence = std::find_if(
+        rejected.dataflow->boundCandidates.begin(), rejected.dataflow->boundCandidates.end(),
+        [](const auto& candidate) { return candidate.interproceduralEntryDomain; });
+    REQUIRE(evidence != rejected.dataflow->boundCandidates.end());
+    CHECK(evidence->rejection == "entry_domain_register_not_exact_scaled_table_index");
+  }
+
+  SECTION("an altered raw entry invalidates the whole table") {
+    auto image = EntryDomainSwitch();
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    auto domain = ProveEntryDomain(decoded);
+    StoreBe32(image.table, 7 * 4, kTextBase + 0x23);  // unaligned final target
+    auto rejected = analyzeWithDomain(image, std::move(domain));
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::MixedValidityTargets));
+  }
+
+  SECTION("one observed direct call without a finite argument proof remains incomplete") {
+    auto image = EntryDomainSwitch();
+    StoreBe32(image.text, 0xF4, Bl(kTextBase + 0xF4, kTextBase));
+    StoreBe32(image.text, 0xF8, 0x4E800020);
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const Block block{kTextBase + 0xF0, 0x0C};
+    auto callsite = AnalyzeDirectCallArgumentDomain(decoded, std::span<const Block>(&block, 1),
+                                                    block.base, kTextBase + 0xF4, kTextBase, 7);
+    CHECK_FALSE(callsite.complete);
+    CHECK(callsite.finiteValues.empty());
+    CHECK(std::find(callsite.rejections.begin(), callsite.rejections.end(),
+                    "no_exact_constant_or_unsigned_dominating_guard") != callsite.rejections.end());
+  }
+
+  SECTION("a signed callsite guard does not prove a zero-based unsigned domain") {
+    auto image = EntryDomainSwitch();
+    StoreBe32(image.text, 0xF4, 0x2C070007);  // cmpwi r7, 7
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const Block block{kTextBase + 0xF0, 0x1C};
+    auto callsite = AnalyzeDirectCallArgumentDomain(decoded, std::span<const Block>(&block, 1),
+                                                    block.base, kTextBase + 0xFC, kTextBase, 7);
+    CHECK_FALSE(callsite.complete);
+    CHECK(callsite.finiteValues.empty());
+  }
+
+  SECTION("the exhausted callsite budget is reported without widening another limit") {
+    auto image = EntryDomainSwitch();
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const Block block{kTextBase + 0xF0, 0x1C};
+    JumpTableRecoveryLimits limits;
+    limits.maxStates = 1;
+    auto callsite =
+        AnalyzeDirectCallArgumentDomain(decoded, std::span<const Block>(&block, 1), block.base,
+                                        kTextBase + 0xFC, kTextBase, 7, limits);
+    CHECK_FALSE(callsite.complete);
+    REQUIRE(callsite.limitHit);
+    CHECK(callsite.exhaustedBudget == "max_states");
+    CHECK(callsite.budgetLimit == 1);
+    CHECK(callsite.budgetObserved > callsite.budgetLimit);
+    CHECK(callsite.rejections == std::vector<std::string>{"callsite_reaching_definition_limit"});
+  }
 }
 
 TEST_CASE("jump-table recovery reports unknown index and ambiguous bounds",

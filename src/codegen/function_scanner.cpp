@@ -2069,10 +2069,19 @@ static BlockDiscoveryResult discoverBlocksPass(
   return result;
 }
 
+BlockDiscoveryResult discoverPreliminaryBlocks(DecodedBinary& decoded, uint32_t entryPoint,
+                                               const CodeRegion& containingRegion,
+                                               const std::unordered_set<uint32_t>& knownFunctions,
+                                               uint32_t pdataSize) {
+  return discoverBlocksPass(decoded, entryPoint, containingRegion, knownFunctions, pdataSize,
+                            nullptr);
+}
+
 BlockDiscoveryResult discoverBlocks(
     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize,
-    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables) {
+    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables,
+    const JumpTableEntryRegisterDomainsBySite* entryRegisterDomainsBySite) {
   using Clock = std::chrono::steady_clock;
   const auto functionStarted = Clock::now();
   auto elapsedMicroseconds = [](Clock::time_point started) {
@@ -2156,6 +2165,11 @@ BlockDiscoveryResult discoverBlocks(
       input.containingRegion = &containingRegion;
       input.independentlyCallableEntries = &knownFunctions;
       input.validatedOwnerTables = &selectedTables;
+      if (entryRegisterDomainsBySite) {
+        const auto domains = entryRegisterDomainsBySite->find(site);
+        if (domains != entryRegisterDomainsBySite->end())
+          input.entryRegisterDomains = &domains->second;
+      }
       auto previous = selectedTables.find(site);
       if (previous != selectedTables.end() &&
           previous->second.origin == JumpTableOrigin::Automatic) {

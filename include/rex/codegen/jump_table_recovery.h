@@ -38,11 +38,28 @@ struct JumpTableRecoveryInput {
   // the current site is excluded and still follows priorAutomaticTable's
   // stricter exact-retention lifecycle.
   const std::unordered_map<uint32_t, JumpTable>* validatedOwnerTables = nullptr;
+  // Independently proven finite domains for registers at this existing owner
+  // entry. These constrain table recovery only; they never register a function
+  // or make a case target independently callable.
+  const JumpTableEntryRegisterDomainMap* entryRegisterDomains = nullptr;
   const JumpTable* priorAutomaticTable = nullptr;
   const JumpTable* manualTable = nullptr;
   bool allowPriorLocalSliceRecovery = false;
   JumpTableRecoveryLimits limits;
 };
+
+/**
+ * Prove the finite value domain of one GPR at a direct callsite.
+ *
+ * The proof accepts only an exact immediate constant or an unsigned,
+ * dominating dense upper-bound guard whose case path reaches the call with the
+ * register unmodified. It is a building block for the whole-image inbound
+ * reference audit and does not inspect or infer jump-table storage.
+ */
+JumpTableEntryCallsiteDomainEvidence AnalyzeDirectCallArgumentDomain(
+    DecodedBinary& decoded, std::span<const Block> callerBlocks, uint32_t callerAddress,
+    uint32_t callAddress, uint32_t expectedTarget, uint8_t registerIndex,
+    const JumpTableRecoveryLimits& limits = {});
 
 /**
  * Classify one indirect branch and conservatively recover its switch table.

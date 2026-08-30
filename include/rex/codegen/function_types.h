@@ -385,6 +385,49 @@ struct JumpTableCfgEdgeEvidence {
   bool operator==(const JumpTableCfgEdgeEvidence&) const = default;
 };
 
+// A finite argument-domain proof at one direct callsite. This is deliberately
+// separate from callable-entry discovery: it constrains a register value at an
+// already trusted function entry and never makes an address callable.
+struct JumpTableEntryCallsiteDomainEvidence {
+  uint32_t callerAddress = 0;
+  uint32_t callAddress = 0;
+  uint32_t targetAddress = 0;
+  uint32_t compareAddress = 0;
+  uint32_t guardAddress = 0;
+  uint8_t registerIndex = 0xFF;
+  std::vector<uint32_t> definitionAddresses;
+  std::vector<uint32_t> finiteValues;
+  std::string proofKind;
+  std::vector<std::string> rejections;
+  std::string exhaustedBudget;
+  uint32_t budgetLimit = 0;
+  uint32_t budgetObserved = 0;
+  bool complete = false;
+  bool limitHit = false;
+};
+
+// Whole-image evidence that every supported static inbound reference to an
+// existing trusted entry is accounted for and supplies a finite register
+// domain. A production switch may consume this only after the union is proven
+// dense and the register is preserved from entry to dispatch.
+struct JumpTableEntryRegisterDomainEvidence {
+  uint32_t entryAddress = 0;
+  uint8_t registerIndex = 0xFF;
+  std::vector<uint32_t> finiteValues;
+  std::vector<uint32_t> directCallSites;
+  std::vector<uint32_t> rejectedReferenceSites;
+  std::vector<std::string> referenceRejections;
+  std::vector<JumpTableEntryCallsiteDomainEvidence> callsites;
+  bool allReferencesDirectCalls = false;
+  bool finiteDenseDomain = false;
+  std::string rejection;
+};
+
+using JumpTableEntryRegisterDomainMap =
+    std::unordered_map<uint8_t, JumpTableEntryRegisterDomainEvidence>;
+using JumpTableEntryRegisterDomainsBySite =
+    std::unordered_map<uint32_t, JumpTableEntryRegisterDomainMap>;
+
 struct JumpTableBoundCandidateEvidence {
   uint32_t compareAddress = 0;
   uint32_t guardAddress = 0;
@@ -402,6 +445,7 @@ struct JumpTableBoundCandidateEvidence {
   bool priorDirectBoundedIndexRevalidation = false;
   bool inheritedCaseEdgeProof = false;
   bool finiteCfgDomain = false;
+  bool interproceduralEntryDomain = false;
   std::vector<uint32_t> finiteValues;
   std::string rejection;
 };
@@ -457,11 +501,16 @@ struct JumpTableSiteDataflowEvidence {
   std::vector<uint32_t> tableBaseCandidates;
   std::vector<uint32_t> anchorCandidates;
   uint8_t indexRegister = 0xFF;
+  // ABI input registers that occur in the primary table load's address
+  // expression. This is distinct from indexRegister, which may be the PPC
+  // load's already-scaled RB scratch register.
+  std::vector<uint8_t> tableLoadInputRegisters;
   std::vector<std::string> indexTransformChain;
   uint8_t elementWidth = 0;
   std::string elementSignedness = "unknown";
   uint32_t targetScale = 0;
   std::vector<JumpTableBoundCandidateEvidence> boundCandidates;
+  std::vector<JumpTableEntryRegisterDomainEvidence> entryRegisterDomains;
   std::string tableKindHypothesis = "unknown";
   std::string tableBaseConstruction = "unknown";
   std::string mergeShape = "unknown";

@@ -241,6 +241,50 @@ uint32_t CountUnknownLeaves(const ExprPtr& expression) {
          CountUnknownLeaves(expression->rhs);
 }
 
+void CollectInputRegisters(const ExprPtr& expression, std::set<uint8_t>& registers) {
+  if (!expression)
+    return;
+  if (expression->kind == ExprKind::InputRegister) {
+    registers.insert(expression->reg);
+    return;
+  }
+  CollectInputRegisters(expression->lhs, registers);
+  CollectInputRegisters(expression->rhs, registers);
+}
+
+// Return the coefficient of one input register in a constant-plus-scaled-index
+// address. Any other symbolic value makes the form ineligible: an entry-domain
+// proof may bound an index, but it may never stand in for a runtime table base.
+std::optional<uint32_t> LinearInputCoefficient(const ExprPtr& expression, uint8_t reg) {
+  if (!expression)
+    return std::nullopt;
+  switch (expression->kind) {
+    case ExprKind::Constant:
+      return 0;
+    case ExprKind::InputRegister:
+      return expression->reg == reg ? std::optional<uint32_t>(1) : std::nullopt;
+    case ExprKind::Add: {
+      const auto lhs = LinearInputCoefficient(expression->lhs, reg);
+      const auto rhs = LinearInputCoefficient(expression->rhs, reg);
+      if (!lhs || !rhs || *lhs > std::numeric_limits<uint32_t>::max() - *rhs)
+        return std::nullopt;
+      return *lhs + *rhs;
+    }
+    case ExprKind::ShiftLeft: {
+      const auto value = LinearInputCoefficient(expression->lhs, reg);
+      if (!value || expression->value >= 32 ||
+          *value > (std::numeric_limits<uint32_t>::max() >> expression->value)) {
+        return std::nullopt;
+      }
+      return *value << expression->value;
+    }
+    default:
+      return std::nullopt;
+  }
+}
+
+const Expr* FindFirstLoad(const ExprPtr& expression);
+
 std::optional<uint32_t> ConstantComponent(const ExprPtr& expression) {
   if (!expression)
     return std::nullopt;
@@ -481,6 +525,11 @@ class LocalCfg {
       pending.pop_front();
       if (!visited.insert({state.address, state.modified}).second)
         continue;
+      if (visited.size() > limits.maxStates) {
+        if (limitHit)
+          *limitHit = true;
+        return false;
+      }
       if (state.address == target) {
         if (state.modified)
           return false;
@@ -1501,6 +1550,7 @@ struct BoundCandidate {
   bool inclusive = false;
   bool defaultIsReturn = false;
   bool finiteCfgDomain = false;
+  bool interproceduralEntryDomain = false;
   std::vector<uint32_t> finiteValues;
   ExprPtr indexExpression;
   std::vector<JumpTableInstructionEvidence> evidence;
@@ -2028,6 +2078,100 @@ std::vector<BoundCandidate> FindFiniteCfgDomainBounds(
     }
     for (uint32_t address : expression->backedgeDefinitions)
       addDefinitionEvidence(address, "finite_cfg_domain_backedge_definition");
+    bounds.push_back(std::move(bound));
+  }
+  return bounds;
+}
+
+std::vector<BoundCandidate> FindEntryRegisterDomainBounds(
+    DecodedBinary& decoded, const LocalCfg& cfg, const JumpTableRecoveryInput& input,
+    const ExprPtr& targetExpression, std::vector<JumpTableBoundCandidateEvidence>* reportEvidence,
+    bool* limitHit) {
+  std::vector<BoundCandidate> bounds;
+  if (!input.entryRegisterDomains)
+    return bounds;
+
+  std::vector<uint8_t> registers;
+  registers.reserve(input.entryRegisterDomains->size());
+  for (const auto& [reg, unused] : *input.entryRegisterDomains)
+    registers.push_back(reg);
+  std::sort(registers.begin(), registers.end());
+
+  for (uint8_t reg : registers) {
+    const auto& domain = input.entryRegisterDomains->at(reg);
+    JumpTableBoundCandidateEvidence report;
+    report.domainOriginAddress = input.ownerAddress;
+    report.indexRegister = reg;
+    report.interproceduralEntryDomain = true;
+    report.finiteValues = domain.finiteValues;
+    report.caseCount = static_cast<uint32_t>(domain.finiteValues.size());
+    report.value = domain.finiteValues.empty() ? 0 : domain.finiteValues.back();
+    report.inclusive = true;
+
+    const auto reject = [&](std::string reason) {
+      if (report.rejection.empty())
+        report.rejection = std::move(reason);
+    };
+    if (domain.entryAddress != input.ownerAddress || domain.registerIndex != reg) {
+      reject("entry_domain_identity_mismatch");
+    } else if (!domain.allReferencesDirectCalls) {
+      reject("entry_domain_has_unaccounted_reference");
+    } else if (!domain.finiteDenseDomain) {
+      reject(domain.rejection.empty() ? "entry_domain_not_finite_dense" : domain.rejection);
+    } else if (domain.finiteValues.empty()) {
+      reject("entry_domain_empty");
+    } else if (domain.finiteValues.size() > input.limits.maxEntries) {
+      reject("entry_domain_exceeds_entry_limit");
+    } else if (!IsDenseZeroBasedDomain(domain.finiteValues)) {
+      reject("entry_domain_not_dense_zero_based");
+    }
+
+    bool stabilityLimit = false;
+    if (report.rejection.empty()) {
+      report.dominatesDispatch = cfg.RegisterUnmodifiedOnEveryPath(
+          input.ownerAddress, input.site, reg, input.limits, &stabilityLimit);
+      if (stabilityLimit) {
+        if (limitHit)
+          *limitHit = true;
+        reject("entry_domain_owner_stability_limit");
+      } else if (!report.dominatesDispatch) {
+        reject("entry_domain_register_modified_before_dispatch");
+      }
+    }
+    if (report.rejection.empty()) {
+      const Expr* tableLoad = FindFirstLoad(targetExpression);
+      const auto coefficient =
+          tableLoad ? LinearInputCoefficient(tableLoad->lhs, reg) : std::nullopt;
+      if (!tableLoad || !coefficient || *coefficient != tableLoad->width)
+        reject("entry_domain_register_not_exact_scaled_table_index");
+    }
+
+    report.finiteDenseDomain = report.rejection.empty();
+    if (reportEvidence)
+      reportEvidence->push_back(report);
+    if (!report.finiteDenseDomain)
+      continue;
+
+    BoundCandidate bound;
+    bound.domainOriginAddress = input.ownerAddress;
+    bound.value = report.value;
+    bound.caseCount = report.caseCount;
+    bound.indexRegister = reg;
+    bound.inclusive = true;
+    bound.interproceduralEntryDomain = true;
+    bound.finiteValues = domain.finiteValues;
+    bound.indexExpression = MakeInputRegister(reg);
+    for (const auto& callsite : domain.callsites) {
+      const auto addEvidence = [&](uint32_t address, std::string role) {
+        if (const auto* instruction = decoded.get(address))
+          bound.evidence.push_back(Evidence(*instruction, std::move(role)));
+      };
+      for (uint32_t address : callsite.definitionAddresses)
+        addEvidence(address, "entry_domain_callsite_definition");
+      addEvidence(callsite.compareAddress, "entry_domain_callsite_bound");
+      addEvidence(callsite.guardAddress, "entry_domain_callsite_guard");
+      addEvidence(callsite.callAddress, "entry_domain_direct_call");
+    }
     bounds.push_back(std::move(bound));
   }
   return bounds;
@@ -3970,6 +4114,11 @@ void FinalizeSiteDataflow(DecodedBinary& decoded, const LocalCfg& cfg,
       dataflow.diagnosticProbe.candidateTable ? &*dataflow.diagnosticProbe.candidateTable : nullptr;
   const JumpTable* metadataTable = selected ? selected : probed;
   const Expr* primaryLoad = target ? FindFirstLoad(target->expression) : nullptr;
+  if (primaryLoad) {
+    std::set<uint8_t> inputRegisters;
+    CollectInputRegisters(primaryLoad->lhs, inputRegisters);
+    dataflow.tableLoadInputRegisters.assign(inputRegisters.begin(), inputRegisters.end());
+  }
   if (metadataTable) {
     dataflow.indexRegister = metadataTable->indexRegister;
     dataflow.elementWidth = metadataTable->elementWidth;
@@ -4036,19 +4185,22 @@ void FinalizeSiteDataflow(DecodedBinary& decoded, const LocalCfg& cfg,
                    selected->confidence == "validated_exact_prior_inherited_bound_case_edges");
   const bool finiteCfgDomain =
       selected && selected->confidence == "validated_finite_cfg_domain_all_targets";
+  const bool interproceduralEntryDomain =
+      selected && selected->confidence == "validated_interprocedural_entry_domain_all_targets";
   dataflow.mergeShape =
       boundedDirectIndex        ? "bounded_direct_index"
       : boundedTransformedIndex ? "bounded_transformed_index"
       : equivalentBoundIndexRecomputation
           ? "equivalent_bound_index_recomputation"
-          : (finiteCfgDomain ? "finite_cfg_domain"
-                             : (inheritedBoundFromUpstreamSwitch ? "inherited_bound_case_edges"
-                                : boundedIndexAfterStateLimit
-                                    ? "bounded_index_after_state_limit"
-                                    : (!analysis.loopEvidence.empty()
-                                           ? "finite_loop_phi"
-                                           : (target && target->ambiguous ? "incompatible_phi"
-                                                                          : "equivalent"))));
+          : (interproceduralEntryDomain ? "interprocedural_entry_domain"
+             : finiteCfgDomain ? "finite_cfg_domain"
+                               : (inheritedBoundFromUpstreamSwitch ? "inherited_bound_case_edges"
+                                  : boundedIndexAfterStateLimit
+                                      ? "bounded_index_after_state_limit"
+                                      : (!analysis.loopEvidence.empty()
+                                             ? "finite_loop_phi"
+                                             : (target && target->ambiguous ? "incompatible_phi"
+                                                                            : "equivalent"))));
 
   bool cycleLimit = false;
   dataflow.sourceInScc = cfg.IsInCycle(input.site, input.limits, &cycleLimit);
@@ -4223,6 +4375,11 @@ void FinalizeJumpTableSiteDisposition(IndirectSiteAnalysis& analysis) {
     dataflow.switchLikelihood = JumpTableSwitchLikelihood::RejectedFalsePositive;
   } else if (hasFailure(JumpTableFailure::AnalysisLimit)) {
     dataflow.switchLikelihood = JumpTableSwitchLikelihood::InsufficientStaticEvidence;
+  } else if (!dataflow.entryRegisterDomains.empty()) {
+    // An attempted whole-image entry-domain proof that did not produce a
+    // selected table is explicitly incomplete evidence, not license to infer
+    // a table length from runtime observations or executable pointer runs.
+    dataflow.switchLikelihood = JumpTableSwitchLikelihood::InsufficientStaticEvidence;
   } else if (dataflow.elementWidth != 0 && finiteBound) {
     dataflow.switchLikelihood = JumpTableSwitchLikelihood::PlausibleSwitchCandidate;
   } else if (analysis.classification == IndirectSiteClassification::ComputedTailBctr) {
@@ -4257,6 +4414,8 @@ void FinalizeJumpTableSiteDisposition(IndirectSiteAnalysis& analysis) {
     if (dataflow.indexRegister != 0xFF && bound.indexRegister == dataflow.indexRegister) {
       if (bound.finiteCfgDomain) {
         boundShape = "finite_cfg_dense";
+      } else if (bound.interproceduralEntryDomain) {
+        boundShape = "interprocedural_entry_dense";
       } else {
         boundShape = bound.signedCompare ? "signed_" : "unsigned_";
         boundShape += bound.inclusive ? "le" : "lt";
@@ -4303,6 +4462,135 @@ void FinalizeJumpTableSiteDisposition(IndirectSiteAnalysis& analysis) {
                        "|merge=" + dataflow.mergeShape + "|base=" + dataflow.tableBaseConstruction +
                        "|slice=" + dataflow.normalizedTargetExpression +
                        "|stage=" + dataflow.failureStage + "|reason=" + failureShape;
+}
+
+JumpTableEntryCallsiteDomainEvidence AnalyzeDirectCallArgumentDomain(
+    DecodedBinary& decoded, std::span<const Block> callerBlocks, uint32_t callerAddress,
+    uint32_t callAddress, uint32_t expectedTarget, uint8_t registerIndex,
+    const JumpTableRecoveryLimits& limits) {
+  JumpTableEntryCallsiteDomainEvidence output;
+  output.callerAddress = callerAddress;
+  output.callAddress = callAddress;
+  output.targetAddress = expectedTarget;
+  output.registerIndex = registerIndex;
+
+  const auto reject = [&](std::string reason) {
+    if (std::find(output.rejections.begin(), output.rejections.end(), reason) ==
+        output.rejections.end()) {
+      output.rejections.push_back(std::move(reason));
+    }
+  };
+  if (registerIndex >= 32) {
+    reject("invalid_register");
+    return output;
+  }
+  const auto* call = decoded.get(callAddress);
+  if (!call || call->opcode != Opcode::bl || !call->branch_target ||
+      *call->branch_target != expectedTarget) {
+    reject("not_exact_relative_unconditional_direct_call");
+    return output;
+  }
+
+  LocalCfg cfg(decoded, callerBlocks, callerAddress, callAddress);
+  if (!cfg.contains(callerAddress) || !cfg.contains(callAddress)) {
+    reject("callsite_not_reachable_in_preliminary_cfg");
+    return output;
+  }
+
+  std::vector<JumpTableReachingDefinitionPathEvidence> paths;
+  Resolver resolver(decoded, cfg, limits, nullptr, nullptr, &paths);
+  auto value = resolver.Resolve(registerIndex, callAddress);
+  if (resolver.maxStatesLimitHit()) {
+    output.limitHit = true;
+    output.exhaustedBudget = "max_states";
+    output.budgetLimit = limits.maxStates;
+    output.budgetObserved = resolver.visitedStates();
+    reject("callsite_reaching_definition_limit");
+    return output;
+  }
+  if (value.limitHit) {
+    // Resolver sub-analyses can report a conservative limit without exposing
+    // which internal traversal exhausted. Keep the failure structured, but do
+    // not falsely attribute it to max_states or invent an observed count.
+    output.limitHit = true;
+    reject("callsite_reaching_definition_limit");
+    return output;
+  }
+  if (value.ambiguous || !value.expression || IsUnknown(value.expression)) {
+    reject("callsite_reaching_definition_ambiguous");
+    return output;
+  }
+
+  bool boundLimit = false;
+  auto bounds = FindBounds(decoded, cfg, resolver, callAddress, limits, &boundLimit);
+  if (boundLimit) {
+    output.limitHit = true;
+    reject("callsite_bound_analysis_limit");
+    return output;
+  }
+  std::vector<BoundCandidate> matchingBounds;
+  for (auto& bound : bounds) {
+    if (bound.indexRegister == registerIndex &&
+        ContainsExpression(value.expression, ExprKey(bound.indexExpression))) {
+      matchingBounds.push_back(std::move(bound));
+    }
+  }
+  if (!matchingBounds.empty()) {
+    const auto equivalent = [&](const BoundCandidate& bound) {
+      return bound.caseCount == matchingBounds.front().caseCount &&
+             bound.value == matchingBounds.front().value &&
+             bound.inclusive == matchingBounds.front().inclusive &&
+             ExprKey(bound.indexExpression) == ExprKey(matchingBounds.front().indexExpression);
+    };
+    if (!std::all_of(matchingBounds.begin(), matchingBounds.end(), equivalent)) {
+      reject("multiple_incompatible_callsite_bounds");
+      return output;
+    }
+    const auto selected = std::max_element(
+        matchingBounds.begin(), matchingBounds.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.compareAddress < rhs.compareAddress; });
+    bool stabilityLimit = false;
+    if (!cfg.RegisterValueAvailableOnEveryPath(selected->compareAddress + 4, callAddress,
+                                               registerIndex, limits, &stabilityLimit)) {
+      output.limitHit = stabilityLimit;
+      reject(stabilityLimit ? "callsite_guard_stability_limit"
+                            : "callsite_register_modified_after_guard");
+      return output;
+    }
+    output.compareAddress = selected->compareAddress;
+    output.guardAddress = selected->guardAddress;
+    output.proofKind = "unsigned_dominating_callsite_guard";
+    output.finiteValues.resize(selected->caseCount);
+    for (uint32_t index = 0; index < selected->caseCount; ++index)
+      output.finiteValues[index] = index;
+    output.complete = true;
+    return output;
+  }
+
+  if (value.expression->kind != ExprKind::Constant || value.expression->origin == 0) {
+    reject("no_exact_constant_or_unsigned_dominating_guard");
+    return output;
+  }
+  bool dominanceLimit = false;
+  if (!cfg.Dominates(value.expression->origin, callAddress, limits, &dominanceLimit)) {
+    output.limitHit = dominanceLimit;
+    reject(dominanceLimit ? "callsite_constant_dominance_limit"
+                          : "callsite_constant_does_not_dominate");
+    return output;
+  }
+  bool stabilityLimit = false;
+  if (!cfg.RegisterValueAvailableOnEveryPath(value.expression->origin + 4, callAddress,
+                                             registerIndex, limits, &stabilityLimit)) {
+    output.limitHit = stabilityLimit;
+    reject(stabilityLimit ? "callsite_constant_stability_limit"
+                          : "callsite_register_modified_after_constant");
+    return output;
+  }
+  output.definitionAddresses.push_back(value.expression->origin);
+  output.finiteValues.push_back(value.expression->value);
+  output.proofKind = "dominating_immediate_constant";
+  output.complete = true;
+  return output;
 }
 
 IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
@@ -4368,6 +4656,15 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
   LocalCfg cfg(decoded, input.preliminaryBlocks, input.ownerAddress, input.site,
                input.priorAutomaticTable, input.validatedOwnerTables);
   auto& dataflow = *analysis.dataflow;
+  if (input.entryRegisterDomains) {
+    std::vector<uint8_t> registers;
+    registers.reserve(input.entryRegisterDomains->size());
+    for (const auto& [reg, unused] : *input.entryRegisterDomains)
+      registers.push_back(reg);
+    std::sort(registers.begin(), registers.end());
+    for (uint8_t reg : registers)
+      dataflow.entryRegisterDomains.push_back(input.entryRegisterDomains->at(reg));
+  }
   Resolver resolver(decoded, cfg, input.limits, input.priorAutomaticTable, stats,
                     &dataflow.reachingDefinitionPaths);
   for (const auto& block : input.preliminaryBlocks) {
@@ -4495,6 +4792,14 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
                                                 &dataflow.boundCandidates, &finiteCfgLimitHit);
     if (finiteCfgLimitHit) {
       dataflow.rejectionEvidence.push_back("finite_cfg_domain_limit");
+      if (stats)
+        stats->analysisLimitHit = true;
+    }
+    bool entryDomainLimitHit = false;
+    auto entryDomainBounds = FindEntryRegisterDomainBounds(
+        decoded, cfg, input, target.expression, &dataflow.boundCandidates, &entryDomainLimitHit);
+    if (entryDomainLimitHit) {
+      dataflow.rejectionEvidence.push_back("interprocedural_entry_domain_limit");
       if (stats)
         stats->analysisLimitHit = true;
     }
@@ -4635,6 +4940,12 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
             matchingBounds.push_back(std::move(bound));
         }
       }
+      if (matchingBounds.empty()) {
+        for (auto& bound : entryDomainBounds) {
+          if (ContainsExpression(target.expression, ExprKey(bound.indexExpression)))
+            matchingBounds.push_back(std::move(bound));
+        }
+      }
       if (matchingBounds.size() > 1) {
         // Repeated loop guards can provide the same proof. Coalesce only
         // bounds whose index expression, range, and default edge are exact;
@@ -4710,7 +5021,8 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
           table.caseCount = bound.caseCount;
           table.boundInclusive = bound.inclusive;
           table.boundSemantics =
-              bound.finiteCfgDomain
+              bound.interproceduralEntryDomain ? "interprocedural_entry_domain_zero_based_dense"
+              : bound.finiteCfgDomain
                   ? "finite_cfg_domain_zero_based_dense"
                   : (bound.inclusive ? "unsigned_index <= bound" : "unsigned_index < bound");
           table.defaultTarget = bound.defaultTarget;
@@ -4724,8 +5036,10 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
           table.kind = primaryLoad->width == 4 && table.anchorAddress == 0 && table.targetScale == 1
                            ? JumpTableKind::AbsolutePointer
                            : JumpTableKind::RelativeOffset;
-          table.confidence = bound.finiteCfgDomain ? "validated_finite_cfg_domain_all_targets"
-                                                   : "validated_bound_and_all_targets";
+          table.confidence = bound.interproceduralEntryDomain
+                                 ? "validated_interprocedural_entry_domain_all_targets"
+                             : bound.finiteCfgDomain ? "validated_finite_cfg_domain_all_targets"
+                                                     : "validated_bound_and_all_targets";
           table.evidence = analysis.evidence;
           table.evidence.insert(table.evidence.end(), bound.evidence.begin(), bound.evidence.end());
 

@@ -260,7 +260,16 @@ struct BlockDiscoveryResult {
 BlockDiscoveryResult discoverBlocks(
     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize = 0,
-    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables = nullptr);
+    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables = nullptr,
+    const JumpTableEntryRegisterDomainsBySite* entryRegisterDomainsBySite = nullptr);
+
+/// Run only the bounded CFG/block pass. This is used by conservative
+/// interprocedural evidence collection and never performs jump-table recovery
+/// or case expansion.
+BlockDiscoveryResult discoverPreliminaryBlocks(DecodedBinary& decoded, uint32_t entryPoint,
+                                               const CodeRegion& containingRegion,
+                                               const std::unordered_set<uint32_t>& knownFunctions,
+                                               uint32_t pdataSize = 0);
 
 //=============================================================================
 // Jump Table Detection

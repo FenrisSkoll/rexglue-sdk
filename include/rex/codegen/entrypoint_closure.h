@@ -283,8 +283,8 @@ struct JumpTableClusterSummary {
 };
 
 struct EntrypointJumpTableRecovery {
-  uint32_t schemaVersion = 2;
-  std::string analyzerVersion = "2.0.0";
+  uint32_t schemaVersion = 3;
+  std::string analyzerVersion = "3.0.0";
   JumpTableRecoveryLimits limits;
   JumpTableRecoveryStats stats;
   std::vector<IndirectSiteAnalysis> indirectSites;

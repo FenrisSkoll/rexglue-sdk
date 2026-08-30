@@ -1175,7 +1175,8 @@ static EntrypointClosureReport AnalyzeEntrypointClosureDecoded(const BinaryView&
     if (site.selectedTable)
       addEvidence("production_table_recovered");
     if (dataflow.mergeShape == "finite_loop_phi" || dataflow.mergeShape == "finite_cfg_domain" ||
-        dataflow.mergeShape == "bounded_direct_index")
+        dataflow.mergeShape == "bounded_direct_index" ||
+        dataflow.mergeShape == "interprocedural_entry_domain")
       cluster.syntheticFixtureExists = true;
   }
   for (auto& [unused, cluster] : clusterMap) {
@@ -1540,8 +1541,47 @@ Json JumpBoundCandidateJson(const JumpTableBoundCandidateEvidence& bound) {
       {"prior_direct_bounded_index_revalidation", bound.priorDirectBoundedIndexRevalidation},
       {"inherited_case_edge_proof", bound.inheritedCaseEdgeProof},
       {"finite_cfg_domain", bound.finiteCfgDomain},
+      {"interprocedural_entry_domain", bound.interproceduralEntryDomain},
       {"finite_values", std::move(finiteValues)},
       {"rejection", bound.rejection.empty() ? Json(nullptr) : Json(bound.rejection)}};
+}
+
+Json JumpEntryCallsiteDomainJson(const JumpTableEntryCallsiteDomainEvidence& callsite) {
+  return Json{
+      {"caller_address", Hex(callsite.callerAddress)},
+      {"call_address", Hex(callsite.callAddress)},
+      {"target_address", Hex(callsite.targetAddress)},
+      {"compare_address",
+       callsite.compareAddress ? Json(Hex(callsite.compareAddress)) : Json(nullptr)},
+      {"guard_address", callsite.guardAddress ? Json(Hex(callsite.guardAddress)) : Json(nullptr)},
+      {"register", callsite.registerIndex == 0xFF ? Json(nullptr) : Json(callsite.registerIndex)},
+      {"definition_addresses", HexAddressArray(callsite.definitionAddresses)},
+      {"finite_values", callsite.finiteValues},
+      {"proof_kind", callsite.proofKind.empty() ? Json(nullptr) : Json(callsite.proofKind)},
+      {"rejections", StringArray(callsite.rejections)},
+      {"exhausted_budget",
+       callsite.exhaustedBudget.empty() ? Json(nullptr) : Json(callsite.exhaustedBudget)},
+      {"budget_limit", callsite.budgetLimit},
+      {"budget_observed", callsite.budgetObserved},
+      {"complete", callsite.complete},
+      {"limit_hit", callsite.limitHit}};
+}
+
+Json JumpEntryRegisterDomainJson(const JumpTableEntryRegisterDomainEvidence& domain) {
+  Json callsites = Json::array();
+  for (const auto& callsite : domain.callsites)
+    callsites.push_back(JumpEntryCallsiteDomainJson(callsite));
+  return Json{
+      {"entry_address", Hex(domain.entryAddress)},
+      {"register", domain.registerIndex == 0xFF ? Json(nullptr) : Json(domain.registerIndex)},
+      {"finite_values", domain.finiteValues},
+      {"direct_call_sites", HexAddressArray(domain.directCallSites)},
+      {"rejected_reference_sites", HexAddressArray(domain.rejectedReferenceSites)},
+      {"reference_rejections", StringArray(domain.referenceRejections)},
+      {"callsites", std::move(callsites)},
+      {"all_references_direct_calls", domain.allReferencesDirectCalls},
+      {"finite_dense_domain", domain.finiteDenseDomain},
+      {"rejection", domain.rejection.empty() ? Json(nullptr) : Json(domain.rejection)}};
 }
 
 Json JumpBudgetExhaustionJson(const JumpTableBudgetExhaustionEvidence& exhaustion) {
@@ -1586,6 +1626,9 @@ Json JumpSiteDataflowJson(const JumpTableSiteDataflowEvidence& dataflow) {
   Json bounds = Json::array();
   for (const auto& bound : dataflow.boundCandidates)
     bounds.push_back(JumpBoundCandidateJson(bound));
+  Json entryDomains = Json::array();
+  for (const auto& domain : dataflow.entryRegisterDomains)
+    entryDomains.push_back(JumpEntryRegisterDomainJson(domain));
   Json exhaustedBudgets = Json::array();
   for (const auto& exhaustion : dataflow.exhaustedBudgets)
     exhaustedBudgets.push_back(JumpBudgetExhaustionJson(exhaustion));
@@ -1616,11 +1659,13 @@ Json JumpSiteDataflowJson(const JumpTableSiteDataflowEvidence& dataflow) {
       {"anchor_candidates", HexAddressArray(dataflow.anchorCandidates)},
       {"index_register",
        dataflow.indexRegister == 0xFF ? Json(nullptr) : Json(dataflow.indexRegister)},
+      {"table_load_input_registers", RegisterArray(dataflow.tableLoadInputRegisters)},
       {"index_transform_chain", StringArray(dataflow.indexTransformChain)},
       {"element_width", dataflow.elementWidth},
       {"element_signedness", dataflow.elementSignedness},
       {"target_scale", dataflow.targetScale},
       {"bound_candidates", std::move(bounds)},
+      {"entry_register_domains", std::move(entryDomains)},
       {"table_kind_hypothesis", dataflow.tableKindHypothesis},
       {"table_base_construction", dataflow.tableBaseConstruction},
       {"merge_shape", dataflow.mergeShape},
@@ -2191,9 +2236,11 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
   jumpCsv << "site,owner,classification,link,conditional,uses_ctr,recovered,origin,kind,"
              "table_start,table_end,case_count,targets,failures,manual_comparison,cluster_id,"
              "switch_likelihood,preliminary_block,predecessors,case_expanded_cfg,source_in_scc,"
-             "loop_headers,ctr_source_register,normalized_target_expression,index_transforms,"
-             "element_width,element_signedness,target_scale,bound_candidates,diagnostic_probe,"
-             "reaching_definition_paths,exhausted_budgets,limit_retry,rejection_evidence\n";
+             "loop_headers,ctr_source_register,normalized_target_expression,"
+             "table_load_input_registers,index_transforms,"
+             "element_width,element_signedness,target_scale,bound_candidates,"
+             "entry_register_domains,diagnostic_probe,reaching_definition_paths,"
+             "exhausted_budgets,limit_retry,rejection_evidence\n";
   for (const auto& site : report.jumpTableRecovery.indirectSites) {
     const JumpTable* table = site.selectedTable ? &*site.selectedTable : nullptr;
     const auto& dataflow = JumpSiteDataflow(site);
@@ -2239,9 +2286,45 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
                             : (bound.inheritedCaseEdgeProof
                                    ? "inherited_case_edge"
                                    : (bound.finiteCfgDomain ? "finite_cfg_domain"
-                                                            : "current_guard"))));
+                                                            : (bound.interproceduralEntryDomain
+                                                                   ? "interprocedural_entry_domain"
+                                                                   : "current_guard")))));
       if (!bound.rejection.empty())
         bounds << ':' << bound.rejection;
+    }
+    std::ostringstream entryDomains;
+    for (size_t index = 0; index < dataflow.entryRegisterDomains.size(); ++index) {
+      if (index)
+        entryDomains << ';';
+      const auto& domain = dataflow.entryRegisterDomains[index];
+      entryDomains << Hex(domain.entryAddress) << ":r"
+                   << static_cast<uint32_t>(domain.registerIndex) << ":refs="
+                   << (domain.allReferencesDirectCalls ? "all_direct_calls" : "incomplete")
+                   << ":domain=" << (domain.finiteDenseDomain ? "finite_dense" : "rejected")
+                   << ":values=";
+      for (size_t valueIndex = 0; valueIndex < domain.finiteValues.size(); ++valueIndex) {
+        if (valueIndex)
+          entryDomains << '|';
+        entryDomains << domain.finiteValues[valueIndex];
+      }
+      entryDomains << ":calls=";
+      for (size_t callIndex = 0; callIndex < domain.callsites.size(); ++callIndex) {
+        if (callIndex)
+          entryDomains << '|';
+        const auto& callsite = domain.callsites[callIndex];
+        entryDomains << Hex(callsite.callAddress) << '/'
+                     << (callsite.complete ? callsite.proofKind : "rejected");
+        if (!callsite.exhaustedBudget.empty()) {
+          entryDomains << "/budget=" << callsite.exhaustedBudget << ':' << callsite.budgetLimit
+                       << ':' << callsite.budgetObserved;
+        } else if (callsite.limitHit) {
+          entryDomains << "/limit=unattributed";
+        }
+        if (!callsite.rejections.empty())
+          entryDomains << "/reason=" << JoinStrings(callsite.rejections);
+      }
+      if (!domain.rejection.empty())
+        entryDomains << ":reason=" << domain.rejection;
     }
     std::string probe = "not_attempted";
     if (dataflow.diagnosticProbe.attempted) {
@@ -2299,13 +2382,18 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
             << ','
             << (dataflow.ctrSourceRegister == 0xFF ? ""
                                                    : std::to_string(dataflow.ctrSourceRegister))
-            << ',' << CsvEscape(dataflow.normalizedTargetExpression) << ','
-            << CsvEscape(JoinStrings(dataflow.indexTransformChain)) << ','
+            << ',' << CsvEscape(dataflow.normalizedTargetExpression) << ',';
+    for (size_t index = 0; index < dataflow.tableLoadInputRegisters.size(); ++index) {
+      if (index)
+        jumpCsv << ';';
+      jumpCsv << static_cast<uint32_t>(dataflow.tableLoadInputRegisters[index]);
+    }
+    jumpCsv << ',' << CsvEscape(JoinStrings(dataflow.indexTransformChain)) << ','
             << (dataflow.elementWidth ? std::to_string(dataflow.elementWidth) : "") << ','
             << dataflow.elementSignedness << ',' << dataflow.targetScale << ','
-            << CsvEscape(bounds.str()) << ',' << CsvEscape(probe) << ','
-            << CsvEscape(reachingPaths.str()) << ',' << CsvEscape(exhaustedBudgets.str()) << ','
-            << CsvEscape(limitRetry.str()) << ','
+            << CsvEscape(bounds.str()) << ',' << CsvEscape(entryDomains.str()) << ','
+            << CsvEscape(probe) << ',' << CsvEscape(reachingPaths.str()) << ','
+            << CsvEscape(exhaustedBudgets.str()) << ',' << CsvEscape(limitRetry.str()) << ','
             << CsvEscape(JoinStrings(dataflow.rejectionEvidence)) << '\n';
   }
   if (!WriteReportFile(outputDirectory / "jump-table-recovery.csv", jumpCsv.str())) {

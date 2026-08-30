@@ -407,6 +407,7 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
   dataflow.loopCarriedRegisters = {11};
   dataflow.ctrSourceRegister = 12;
   dataflow.normalizedTargetExpression = "load_u8(add(constant,loop_phi))";
+  dataflow.tableLoadInputRegisters = {7};
   dataflow.indexTransformChain = {"shift_left_2", "indexed_load_u8"};
   dataflow.elementWidth = 1;
   dataflow.elementSignedness = "unsigned";
@@ -425,6 +426,24 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
   dataflow.rejectionEvidence = {"missing_bound"};
   dataflow.diagnosticProbe.attempted = true;
   dataflow.diagnosticProbe.rejections = {"no_exact_dominating_unsigned_bound"};
+  JumpTableEntryRegisterDomainEvidence entryDomain;
+  entryDomain.entryAddress = kTextBase;
+  entryDomain.registerIndex = 7;
+  entryDomain.directCallSites = {kTextBase + 0x80};
+  entryDomain.allReferencesDirectCalls = true;
+  entryDomain.rejection = "one_or_more_callsite_domains_incomplete";
+  JumpTableEntryCallsiteDomainEvidence callsiteDomain;
+  callsiteDomain.callerAddress = kTextBase + 0x60;
+  callsiteDomain.callAddress = kTextBase + 0x80;
+  callsiteDomain.targetAddress = kTextBase;
+  callsiteDomain.registerIndex = 7;
+  callsiteDomain.rejections = {"callsite_reaching_definition_limit"};
+  callsiteDomain.exhaustedBudget = "max_states";
+  callsiteDomain.budgetLimit = 64;
+  callsiteDomain.budgetObserved = 65;
+  callsiteDomain.limitHit = true;
+  entryDomain.callsites.push_back(std::move(callsiteDomain));
+  dataflow.entryRegisterDomains.push_back(std::move(entryDomain));
   closureInput.jumpTableRecovery.indirectSites.push_back(std::move(indirect));
   auto report = AnalyzeEntrypointClosure(image.view(), std::move(closureInput));
 
@@ -462,18 +481,35 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
   {
     std::ifstream input(directory / "analysis" / "jump-table-recovery.json", std::ios::binary);
     const auto jumpReport = nlohmann::json::parse(input);
-    CHECK(jumpReport.at("schema_version") == 2);
-    CHECK(jumpReport.at("analyzer_version") == "2.0.0");
+    CHECK(jumpReport.at("schema_version") == 3);
+    CHECK(jumpReport.at("analyzer_version") == "3.0.0");
     REQUIRE(jumpReport.at("indirect_sites").size() == 1);
     const auto& site = jumpReport.at("indirect_sites").front();
     CHECK(site.at("loop_evidence").front().at("register") == 11);
     CHECK(site.at("dataflow").at("switch_likelihood") == "insufficient_static_evidence");
+    CHECK(site.at("dataflow").at("table_load_input_registers") == nlohmann::json::array({7}));
     CHECK(site.at("dataflow").at("diagnostic_probe").at("report_only") == true);
     CHECK(site.at("dataflow").at("diagnostic_probe").at("rejections").front() ==
           "no_exact_dominating_unsigned_bound");
+    const auto& entryDomain = site.at("dataflow").at("entry_register_domains").front();
+    CHECK(entryDomain.at("all_references_direct_calls") == true);
+    CHECK(entryDomain.at("finite_dense_domain") == false);
+    CHECK(entryDomain.at("rejection") == "one_or_more_callsite_domains_incomplete");
+    const auto& callsite = entryDomain.at("callsites").front();
+    CHECK(callsite.at("exhausted_budget") == "max_states");
+    CHECK(callsite.at("budget_limit") == 64);
+    CHECK(callsite.at("budget_observed") == 65);
+    CHECK(callsite.at("limit_hit") == true);
     REQUIRE(jumpReport.at("structural_clusters").size() == 1);
     CHECK(jumpReport.at("structural_clusters").front().at("site_count") == 1);
     CHECK(jumpReport.at("structural_clusters").front().at("synthetic_fixture_exists") == true);
+  }
+  {
+    std::ifstream input(directory / "analysis" / "jump-table-recovery.csv", std::ios::binary);
+    const std::string csv((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
+    CHECK(csv.find("entry_register_domains") != std::string::npos);
+    CHECK(csv.find("budget=max_states:64:65") != std::string::npos);
   }
   fs::remove_all(directory);
 }
