@@ -434,7 +434,8 @@ class Resolver {
           result.expression = MakeConstant(static_cast<uint32_t>(instruction.D.SIMM()));
         } else {
           auto source = ResolveBefore(static_cast<uint8_t>(instruction.D.RA), instruction.address);
-          if (source.ambiguous || source.limitHit || IsUnknown(source.expression)) {
+          if ((source.ambiguous || source.limitHit || IsUnknown(source.expression)) &&
+              !source.incompleteCaseEntryPath) {
             // A bound and table load that both consume this exact local addi
             // definition do not need the value of its live-in. Preserve the
             // definition identity instead of rejecting a switch because the
@@ -534,8 +535,9 @@ class Resolver {
         } else {
           auto resolvedBase =
               ResolveBefore(static_cast<uint8_t>(instruction.D.RA), instruction.address);
-          if (resolvedBase.ambiguous || resolvedBase.limitHit ||
-              IsUnknown(resolvedBase.expression)) {
+          if ((resolvedBase.ambiguous || resolvedBase.limitHit ||
+               IsUnknown(resolvedBase.expression)) &&
+              !resolvedBase.incompleteCaseEntryPath) {
             // As with a local arithmetic transform, the exact result of this
             // load can be the bounded index even when its address live-in is
             // path-dependent. Keep its definition identity; this cannot stand

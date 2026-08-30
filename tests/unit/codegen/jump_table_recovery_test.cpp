@@ -796,6 +796,48 @@ TEST_CASE("jump-table recovery accepts an exact local loaded index after ambiguo
         std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
 }
 
+TEST_CASE("local index fallbacks preserve incomplete prior-case paths",
+          "[codegen][jump-table]") {
+  auto analyze = [](bool loadedIndex) {
+    AbsoluteSwitch image;
+    StoreBe32(image.text, 0x00, Addi(6, 0, 7));
+    StoreBe32(image.text, 0x04, B(kTextBase + 0x04, kTextBase + 0x14));
+    StoreBe32(image.text, 0x10, B(kTextBase + 0x10, kTextBase + 0x14));
+    StoreBe32(image.text, 0x14,
+              loadedIndex ? 0x88660000 : Addi(3, 6, -1));  // lbz/addi r3, ...r6
+    StoreBe32(image.text, 0x18, 0x28030002);                // cmplwi r3, 2
+    StoreBe32(image.text, 0x1C, Bc(kTextBase + 0x1C, kTextBase + 0x38, 12, 1));
+    StoreBe32(image.text, 0x20, 0x3C802000);  // lis r4, table@h
+    StoreBe32(image.text, 0x24, Rlwinm(3, 3, 2, 0, 29));
+    StoreBe32(image.text, 0x28, Lwzx(5, 4, 3));
+    StoreBe32(image.text, 0x2C, Mtctr(5));
+    StoreBe32(image.text, 0x30, 0x4E800420);  // bctr
+
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const std::array blocks{Block{kTextBase, 0x08}, Block{kTextBase + 0x10, 0x04},
+                            Block{kTextBase + 0x14, 0x20}};
+    JumpTable prior;
+    prior.origin = JumpTableOrigin::Automatic;
+    prior.targets = {kTextBase + 0x10};
+    JumpTableRecoveryInput input{.site = kTextBase + 0x30,
+                                 .ownerAddress = kTextBase,
+                                 .preliminaryBlocks = blocks,
+                                 .containingRegion = decoded.regionContaining(kTextBase),
+                                 .priorAutomaticTable = &prior,
+                                 .limits = {}};
+    return AnalyzeIndirectSite(decoded, input);
+  };
+
+  for (bool loadedIndex : {false, true}) {
+    auto analysis = analyze(loadedIndex);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(analysis.incompleteCaseEntryPaths);
+    CHECK(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
+  }
+}
+
 TEST_CASE("jump-table recovery does not equate different local index definitions",
           "[codegen][jump-table]") {
   SECTION("addi") {
