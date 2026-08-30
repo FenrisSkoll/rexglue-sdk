@@ -41,7 +41,6 @@ enum class ExprKind : uint8_t {
   Constant,
   InputRegister,
   SymbolicDefinition,
-  MergedValue,
   Add,
   ShiftLeft,
   Load,
@@ -59,7 +58,6 @@ struct Expr {
   uint32_t origin = 0;
   ExprPtr lhs;
   ExprPtr rhs;
-  std::vector<ExprPtr> alternatives;
 };
 
 ExprPtr MakeUnknown() {
@@ -84,13 +82,6 @@ ExprPtr MakeSymbolicDefinition(uint32_t origin) {
   auto expression = std::make_shared<Expr>();
   expression->kind = ExprKind::SymbolicDefinition;
   expression->origin = origin;
-  return expression;
-}
-
-ExprPtr MakeMergedValue(std::vector<ExprPtr> alternatives) {
-  auto expression = std::make_shared<Expr>();
-  expression->kind = ExprKind::MergedValue;
-  expression->alternatives = std::move(alternatives);
   return expression;
 }
 
@@ -126,15 +117,6 @@ std::string ExprKey(const ExprPtr& expression) {
       return "r" + std::to_string(expression->reg);
     case ExprKind::SymbolicDefinition:
       return "d" + std::to_string(expression->origin);
-    case ExprKind::MergedValue: {
-      std::string key = "p(";
-      for (size_t index = 0; index < expression->alternatives.size(); ++index) {
-        if (index)
-          key += ',';
-        key += ExprKey(expression->alternatives[index]);
-      }
-      return key + ')';
-    }
     case ExprKind::Add: {
       auto lhs = ExprKey(expression->lhs);
       auto rhs = ExprKey(expression->rhs);
@@ -406,8 +388,8 @@ class Resolver {
     }
 
     if (alternatives.size() != 1) {
-      bool preciseCompleteAlternatives = true;
-      std::vector<ExprPtr> completeExpressions;
+      merged.expression = MakeUnknown();
+      merged.ambiguous = true;
       size_t completeAlternatives = 0;
       bool hasIncompleteAlternative = false;
       for (auto& [unused, result] : alternatives) {
@@ -415,36 +397,12 @@ class Resolver {
           hasIncompleteAlternative = true;
         } else {
           ++completeAlternatives;
-          preciseCompleteAlternatives = preciseCompleteAlternatives && !result.ambiguous &&
-                                        !result.limitHit && !IsUnknown(result.expression);
-          completeExpressions.push_back(result.expression);
         }
         merged.limitHit = merged.limitHit || result.limitHit;
         merged.evidence.insert(merged.evidence.end(), result.evidence.begin(),
                                result.evidence.end());
       }
-      if (!hasIncompleteAlternative && preciseCompleteAlternatives) {
-        // A path merge is not inherently ambiguous: a dominating bound can
-        // constrain the merged register value before the table consumes it.
-        // Keep the exact, deterministically ordered reaching alternatives so
-        // only the same merge can satisfy that bound.
-        merged.expression = MakeMergedValue(std::move(completeExpressions));
-      } else if (hasIncompleteAlternative && completeAlternatives != 0 &&
-                 preciseCompleteAlternatives) {
-        // Preserve a precise summary of the complete paths, but do not accept
-        // it as a new proof while a prior case entry remains incomplete. The
-        // fixpoint owner may retain its previously validated table without
-        // confusing multiple complete incoming values with a conflict.
-        merged.expression = completeExpressions.size() == 1
-                                ? completeExpressions.front()
-                                : MakeMergedValue(std::move(completeExpressions));
-        merged.ambiguous = true;
-        merged.incompleteCaseEntryPath = true;
-      } else {
-        merged.expression = MakeUnknown();
-        merged.ambiguous = true;
-        merged.incompleteCaseEntryPath = completeAlternatives == 1 && hasIncompleteAlternative;
-      }
+      merged.incompleteCaseEntryPath = completeAlternatives == 1 && hasIncompleteAlternative;
     } else {
       merged = std::move(alternatives.begin()->second);
     }
@@ -937,19 +895,9 @@ Evaluation Evaluate(const ExprPtr& expression, const std::string& indexKey, uint
     case ExprKind::Unknown:
     case ExprKind::InputRegister:
     case ExprKind::SymbolicDefinition:
-    case ExprKind::MergedValue:
       return {};
   }
   return {};
-}
-
-bool ContainsUnevaluatedMerge(const ExprPtr& expression, const std::string& indexKey) {
-  if (!expression || ExprKey(expression) == indexKey)
-    return false;
-  if (expression->kind == ExprKind::MergedValue)
-    return true;
-  return ContainsUnevaluatedMerge(expression->lhs, indexKey) ||
-         ContainsUnevaluatedMerge(expression->rhs, indexKey);
 }
 
 const Expr* FindPrimaryLoad(const ExprPtr& expression, const std::string& indexKey) {
@@ -1214,8 +1162,7 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       if (stats)
         stats->analysisLimitHit = true;
     }
-    if (target.ambiguous ||
-        (target.expression && target.expression->kind == ExprKind::MergedValue)) {
+    if (target.ambiguous) {
       AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
       analysis.incompleteCaseEntryPaths = target.incompleteCaseEntryPath;
     } else if (IsUnknown(target.expression) || !ContainsLoad(target.expression)) {
@@ -1282,8 +1229,6 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
         matchingBounds = std::move(mostDerivedBounds);
       }
       if (matchingBounds.empty()) {
-        if (ContainsUnevaluatedMerge(target.expression, ""))
-          AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
         AddFailure(analysis, bounds.empty() ? JumpTableFailure::MissingBound
                                             : JumpTableFailure::UnknownIndex);
       } else if (matchingBounds.size() != 1) {
@@ -1292,12 +1237,8 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
         auto& bound = matchingBounds.front();
         const std::string indexKey = ExprKey(bound.indexExpression);
         const Expr* primaryLoad = FindPrimaryLoad(target.expression, indexKey);
-        if (ContainsUnevaluatedMerge(target.expression, indexKey)) {
-          // A precise merge is safe only when it is the bounded index. A
-          // path-dependent table base or anchor remains unresolved.
-          AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
-        } else if (!primaryLoad || (primaryLoad->width != 1 && primaryLoad->width != 2 &&
-                                    primaryLoad->width != 4)) {
+        if (!primaryLoad ||
+            (primaryLoad->width != 1 && primaryLoad->width != 2 && primaryLoad->width != 4)) {
           AddFailure(analysis, JumpTableFailure::InvalidElementWidth);
         } else {
           JumpTable table;

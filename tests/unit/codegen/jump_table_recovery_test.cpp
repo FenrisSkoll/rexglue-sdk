@@ -570,67 +570,6 @@ TEST_CASE("jump-table recovery uses an exact transformed index despite ambiguous
         std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
 }
 
-TEST_CASE("jump-table recovery preserves a bounded merged index", "[codegen][jump-table]") {
-  AbsoluteSwitch image;
-  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 12, 2));
-  StoreBe32(image.text, 0x04, Addi(3, 0, 0));
-  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
-  StoreBe32(image.text, 0x0C, Addi(3, 0, 2));
-  StoreBe32(image.text, 0x10, 0x28030002);  // cmplwi r3, 2
-  StoreBe32(image.text, 0x14, Bc(kTextBase + 0x14, kTextBase + 0x34, 12, 1));
-  StoreBe32(image.text, 0x18, 0x3C802000);  // lis r4, table@h
-  StoreBe32(image.text, 0x1C, Rlwinm(3, 3, 2, 0, 29));
-  StoreBe32(image.text, 0x20, Lwzx(5, 4, 3));
-  StoreBe32(image.text, 0x24, Mtctr(5));
-  StoreBe32(image.text, 0x28, 0x4E800420);  // bctr
-
-  auto analysis = Analyze(image, kTextBase + 0x28);
-  REQUIRE(analysis.selectedTable);
-  CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
-  CHECK(analysis.selectedTable->caseCount == 3);
-  CHECK(analysis.selectedTable->targets ==
-        std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
-}
-
-TEST_CASE("jump-table recovery marks incomplete prior-case paths beside precise merges",
-          "[codegen][jump-table]") {
-  AbsoluteSwitch image;
-  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 12, 2));
-  StoreBe32(image.text, 0x04, Addi(3, 0, 0));
-  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
-  StoreBe32(image.text, 0x0C, Addi(3, 0, 2));
-  StoreBe32(image.text, 0x10, 0x28030002);  // cmplwi r3, 2
-  StoreBe32(image.text, 0x14, Bc(kTextBase + 0x14, kTextBase + 0x50, 12, 1));
-  StoreBe32(image.text, 0x18, 0x3C802000);  // lis r4, table@h
-  StoreBe32(image.text, 0x1C, Rlwinm(3, 3, 2, 0, 29));
-  StoreBe32(image.text, 0x20, Lwzx(5, 4, 3));
-  StoreBe32(image.text, 0x24, Mtctr(5));
-  StoreBe32(image.text, 0x28, 0x4E800420);  // bctr
-  StoreBe32(image.text, 0x30, Addi(3, 0, 1));
-  StoreBe32(image.text, 0x34, B(kTextBase + 0x34, kTextBase + 0x1C));
-  StoreBe32(image.text, 0x40, 0x60000000);  // prior case entry, live-in r3
-  StoreBe32(image.text, 0x44, B(kTextBase + 0x44, kTextBase + 0x1C));
-
-  auto view = image.view();
-  DecodedBinary decoded(view);
-  decoded.decode();
-  const std::array blocks{Block{kTextBase, 0x2C}, Block{kTextBase + 0x30, 0x08},
-                          Block{kTextBase + 0x40, 0x08}};
-  JumpTable prior;
-  prior.origin = JumpTableOrigin::Automatic;
-  prior.targets = {kTextBase + 0x40};
-  JumpTableRecoveryInput input{.site = kTextBase + 0x28,
-                               .ownerAddress = kTextBase,
-                               .preliminaryBlocks = blocks,
-                               .containingRegion = decoded.regionContaining(kTextBase),
-                               .priorAutomaticTable = &prior,
-                               .limits = {}};
-  auto analysis = AnalyzeIndirectSite(decoded, input);
-  CHECK_FALSE(analysis.selectedTable);
-  CHECK(analysis.incompleteCaseEntryPaths);
-  CHECK(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
-}
-
 TEST_CASE("jump-table recovery reports ambiguous CFG reaching definitions",
           "[codegen][jump-table]") {
   AbsoluteSwitch image;
@@ -643,7 +582,6 @@ TEST_CASE("jump-table recovery reports ambiguous CFG reaching definitions",
   StoreBe32(image.text, 0x1C, Mtctr(5));
   StoreBe32(image.text, 0x20, 0x4E800420);
   auto analysis = Analyze(image, kTextBase + 0x20);
-  INFO(FailureNames(analysis));
   CHECK_FALSE(analysis.selectedTable);
   CHECK(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
 }
