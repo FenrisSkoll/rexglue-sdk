@@ -501,6 +501,30 @@ TEST_CASE("jump-table recovery accepts a delayed guard with preserved condition 
         std::vector<uint32_t>{kTextBase + 0x180, kTextBase + 0x190, kTextBase + 0x1A0});
 }
 
+TEST_CASE("jump-table recovery uses an exact transformed index despite ambiguous live-ins",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 12, 2));
+  StoreBe32(image.text, 0x04, 0x38600000);  // li r3, 0
+  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
+  StoreBe32(image.text, 0x0C, 0x38600002);             // li r3, 2
+  StoreBe32(image.text, 0x10, Rlwinm(8, 3, 31, 1, 31));  // local transformed index
+  StoreBe32(image.text, 0x14, 0x28080002);               // cmplwi r8, 2
+  StoreBe32(image.text, 0x18, Bc(kTextBase + 0x18, kTextBase + 0x30, 12, 1));
+  StoreBe32(image.text, 0x1C, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x20, Rlwinm(8, 8, 2, 0, 29));
+  StoreBe32(image.text, 0x24, Lwzx(5, 4, 8));
+  StoreBe32(image.text, 0x28, Mtctr(5));
+  StoreBe32(image.text, 0x2C, 0x4E800420);  // bctr
+
+  auto analysis = Analyze(image, kTextBase + 0x2C);
+  REQUIRE(analysis.selectedTable);
+  CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
+  CHECK(analysis.selectedTable->caseCount == 3);
+  CHECK(analysis.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
+}
+
 TEST_CASE("jump-table recovery reports ambiguous CFG reaching definitions",
           "[codegen][jump-table]") {
   AbsoluteSwitch image;

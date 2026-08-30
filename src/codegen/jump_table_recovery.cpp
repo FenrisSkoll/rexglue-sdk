@@ -481,18 +481,24 @@ class Resolver {
         break;
       }
       case Opcode::rlwinm: {
-        auto source = operand(static_cast<uint8_t>(instruction.M.RS));
         // The common slwi alias: rlwinm rA,rS,SH,0,31-SH.
         if (instruction.M.MB == 0 && instruction.M.SH <= 31 &&
             instruction.M.ME == 31 - instruction.M.SH) {
           result.expression =
-              MakeUnary(ExprKind::ShiftLeft, source, instruction.M.SH, 0, instruction.address);
+              MakeUnary(ExprKind::ShiftLeft,
+                        operand(static_cast<uint8_t>(instruction.M.RS)), instruction.M.SH, 0,
+                        instruction.address);
         } else if (instruction.M.SH == 0 && instruction.M.ME == 31) {
           // clrlwi preserves the index lineage. Its range is considered by
           // bound recovery; it is not itself sufficient authority for a table.
-          result.expression = source;
+          result.expression = operand(static_cast<uint8_t>(instruction.M.RS));
         } else {
-          result.expression = MakeUnknown();
+          // Preserve the identity of an exact local transformation without
+          // recursively resolving live-ins that its dominating bound makes
+          // irrelevant. Evaluation still requires the table load and bound to
+          // use this same definition; a separately recomputed transform has a
+          // different key and remains rejected.
+          result.expression = MakeSymbolicDefinition(instruction.address);
         }
         break;
       }
