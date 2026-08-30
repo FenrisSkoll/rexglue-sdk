@@ -45,8 +45,8 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
                                          JumpTableRecoveryStats* stats = nullptr);
 
 /**
- * Re-analyze a previously validated automatic table with bounded larger
- * budgets when case-expanded CFG growth alone exhausts the normal limits.
+ * Re-analyze a previously validated automatic table with a bounded larger
+ * state budget when case-expanded CFG growth alone exhausts maxStates.
  *
  * The retry is accepted only when normal recovery fully validates a table
  * that is semantically identical to priorAutomaticTable. Ambiguous, changed,

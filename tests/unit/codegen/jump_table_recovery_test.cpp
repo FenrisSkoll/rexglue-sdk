@@ -243,6 +243,38 @@ std::string FailureNames(const IndirectSiteAnalysis& analysis) {
   return result;
 }
 
+bool SameValidatedTable(const JumpTable& lhs, const JumpTable& rhs) {
+  if (lhs.rawEntries.size() != rhs.rawEntries.size() || lhs.evidence.size() != rhs.evidence.size())
+    return false;
+  for (size_t index = 0; index < lhs.rawEntries.size(); ++index) {
+    if (lhs.rawEntries[index].storageAddress != rhs.rawEntries[index].storageAddress ||
+        lhs.rawEntries[index].rawValue != rhs.rawEntries[index].rawValue ||
+        lhs.rawEntries[index].target != rhs.rawEntries[index].target) {
+      return false;
+    }
+  }
+  for (size_t index = 0; index < lhs.evidence.size(); ++index) {
+    if (lhs.evidence[index].address != rhs.evidence[index].address ||
+        lhs.evidence[index].rawInstruction != rhs.evidence[index].rawInstruction ||
+        lhs.evidence[index].role != rhs.evidence[index].role ||
+        lhs.evidence[index].instruction != rhs.evidence[index].instruction) {
+      return false;
+    }
+  }
+  return lhs.bctrAddress == rhs.bctrAddress && lhs.tableAddress == rhs.tableAddress &&
+         lhs.indexRegister == rhs.indexRegister && lhs.targets == rhs.targets &&
+         lhs.kind == rhs.kind && lhs.origin == rhs.origin &&
+         lhs.manualComparison == rhs.manualComparison && lhs.ownerAddress == rhs.ownerAddress &&
+         lhs.storageEnd == rhs.storageEnd && lhs.boundValue == rhs.boundValue &&
+         lhs.caseCount == rhs.caseCount && lhs.defaultTarget == rhs.defaultTarget &&
+         lhs.anchorAddress == rhs.anchorAddress && lhs.targetScale == rhs.targetScale &&
+         lhs.elementWidth == rhs.elementWidth && lhs.elementSigned == rhs.elementSigned &&
+         lhs.boundInclusive == rhs.boundInclusive &&
+         lhs.defaultIsReturn == rhs.defaultIsReturn &&
+         lhs.tableInExecutableSection == rhs.tableInExecutableSection &&
+         lhs.boundSemantics == rhs.boundSemantics && lhs.conflicts == rhs.conflicts;
+}
+
 }  // namespace
 
 TEST_CASE("jump-table recovery validates a bounded absolute Xenon switch",
@@ -549,54 +581,78 @@ TEST_CASE("jump-table recovery accepts a delayed guard with preserved condition 
 TEST_CASE("case-expanded CFG limit retry requires an exact previously validated table",
           "[codegen][jump-table]") {
   AbsoluteSwitch image;
-  image.text.resize(0x200);
+  image.text.resize(0x500);
   for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
     StoreBe32(image.text, offset, 0x60000000);  // nop
-  StoreBe32(image.text, 0x00, 0x28030002);      // cmplwi r3, 2
-  StoreBe32(image.text, 0x04, Bc(kTextBase + 0x04, kTextBase + 0x1F0, 12, 1));
-  StoreBe32(image.text, 0x150, 0x3C802000);  // lis r4, table@h
-  StoreBe32(image.text, 0x154, Rlwinm(3, 3, 2, 0, 29));
-  StoreBe32(image.text, 0x158, Lwzx(5, 4, 3));
-  StoreBe32(image.text, 0x15C, Mtctr(5));
-  StoreBe32(image.text, 0x160, 0x4E800420);  // bctr
-  StoreBe32(image.text, 0x180, 0x4E800020);
-  StoreBe32(image.text, 0x190, 0x4E800020);
-  StoreBe32(image.text, 0x1A0, 0x4E800020);
-  StoreBe32(image.text, 0x1F0, 0x4E800020);  // default: blr
-  StoreBe32(image.table, 0x00, kTextBase + 0x180);
-  StoreBe32(image.table, 0x04, kTextBase + 0x190);
-  StoreBe32(image.table, 0x08, kTextBase + 0x1A0);
-
-  auto prior = Analyze(image, kTextBase + 0x160, nullptr, {}, 0x200);
-  REQUIRE(prior.selectedTable);
+  constexpr uint32_t kSwitch = kTextBase + 0x400;
+  constexpr uint32_t kSite = kSwitch + 0x18;
+  StoreBe32(image.text, 0x400, 0x28030002);  // cmplwi r3, 2
+  StoreBe32(image.text, 0x404, Bc(kSwitch + 0x04, kSwitch + 0x30, 12, 1));
+  StoreBe32(image.text, 0x408, 0x3C802000);              // lis r4, table@h
+  StoreBe32(image.text, 0x40C, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x410, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x414, Mtctr(5));
+  StoreBe32(image.text, 0x418, 0x4E800420);  // bctr
+  StoreBe32(image.text, 0x430, 0x4E800020);  // default: blr
 
   auto view = image.view();
   DecodedBinary decoded(view);
   decoded.decode();
-  const Block expandedBlock{kTextBase, 0x200};
+  const Block preliminaryBlock{kSwitch, 0x80};
+  JumpTableRecoveryInput preliminaryInput{
+      .site = kSite,
+      .ownerAddress = kSwitch,
+      .preliminaryBlocks = std::span<const Block>(&preliminaryBlock, 1),
+      .containingRegion = decoded.regionContaining(kSwitch),
+      .limits = {},
+  };
+  auto prior = AnalyzeIndirectSite(decoded, preliminaryInput);
+  REQUIRE(prior.selectedTable);
+  REQUIRE(prior.failures.empty());
+
+  // Case targets 0x40/0x50/0x60 enter the newly expanded block. Its long,
+  // definition-preserving fallthrough rejoins the original switch at 0x400.
+  const std::array expandedBlocks{Block{kTextBase + 0x40, 0x3C0}, preliminaryBlock};
   JumpTableRecoveryLimits truncatedLimits;
-  // The proportional retry (4 instructions) still cannot reach the guard;
-  // the bounded final retry must reproduce the exact prior table.
-  truncatedLimits.maxBackwardInstructions = 1;
+  truncatedLimits.maxStates = 64;
   JumpTableRecoveryInput input{
-      .site = kTextBase + 0x160,
-      .ownerAddress = kTextBase,
-      .preliminaryBlocks = std::span<const Block>(&expandedBlock, 1),
-      .containingRegion = decoded.regionContaining(kTextBase),
+      .site = kSite,
+      .ownerAddress = kSwitch,
+      .preliminaryBlocks = expandedBlocks,
+      .containingRegion = decoded.regionContaining(kSwitch),
       .priorAutomaticTable = &*prior.selectedTable,
       .limits = truncatedLimits,
   };
 
   auto truncated = AnalyzeIndirectSite(decoded, input);
   REQUIRE_FALSE(truncated.selectedTable);
-  REQUIRE(HasFailure(truncated, JumpTableFailure::AnalysisLimit));
+  CHECK(truncated.failures == std::vector{JumpTableFailure::AnalysisLimit});
+
+  JumpTableRecoveryInput directRetryInput = input;
+  directRetryInput.limits.maxStates = truncatedLimits.maxStates * 8;
+  auto directRetry = AnalyzeIndirectSite(decoded, directRetryInput);
+  REQUIRE(directRetry.selectedTable);
+  CHECK(directRetry.failures.empty());
+  CHECK(SameValidatedTable(*directRetry.selectedTable, *prior.selectedTable));
+  CHECK(directRetryInput.limits.maxBackwardInstructions ==
+        input.limits.maxBackwardInstructions);
+  CHECK(directRetryInput.limits.maxPredecessors == input.limits.maxPredecessors);
+  CHECK(directRetryInput.limits.maxEntries == input.limits.maxEntries);
 
   JumpTableRecoveryStats acceptedStats;
   auto accepted = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input, &acceptedStats);
   REQUIRE(accepted.selectedTable);
-  CHECK(accepted.selectedTable->targets == prior.selectedTable->targets);
-  CHECK(accepted.selectedTable->rawEntries.size() == prior.selectedTable->rawEntries.size());
+  CHECK(SameValidatedTable(*accepted.selectedTable, *prior.selectedTable));
   CHECK(accepted.selectedTable->confidence == "validated_after_expanded_cfg_limit_retry");
+  REQUIRE(accepted.limitRetry);
+  CHECK(accepted.limitRetry->exhaustedBudget == "max_states");
+  CHECK(accepted.limitRetry->initialBudgetValue == 64);
+  CHECK(accepted.limitRetry->retryBudgetValue == 512);
+  CHECK(accepted.limitRetry->initialFailures ==
+        std::vector{JumpTableFailure::AnalysisLimit});
+  CHECK(accepted.limitRetry->retryFailures.empty());
+  CHECK(accepted.limitRetry->exactPriorTableMatch);
+  CHECK(accepted.limitRetry->accepted);
   CHECK(acceptedStats.indirectSites == 1);
   CHECK(acceptedStats.recoveredTables == 1);
   CHECK(acceptedStats.unresolvedSites == 0);
@@ -607,7 +663,14 @@ TEST_CASE("case-expanded CFG limit retry requires an exact previously validated 
   JumpTableRecoveryStats rejectedStats;
   auto rejected = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input, &rejectedStats);
   CHECK_FALSE(rejected.selectedTable);
-  CHECK(HasFailure(rejected, JumpTableFailure::AnalysisLimit));
+  CHECK(rejected.failures == std::vector{JumpTableFailure::AnalysisLimit});
+  REQUIRE(rejected.limitRetry);
+  CHECK(rejected.limitRetry->exhaustedBudget == "max_states");
+  CHECK(rejected.limitRetry->initialFailures ==
+        std::vector{JumpTableFailure::AnalysisLimit});
+  CHECK(rejected.limitRetry->retryFailures.empty());
+  CHECK_FALSE(rejected.limitRetry->exactPriorTableMatch);
+  CHECK_FALSE(rejected.limitRetry->accepted);
   CHECK(rejectedStats.indirectSites == 1);
   CHECK(rejectedStats.recoveredTables == 0);
   CHECK(rejectedStats.unresolvedSites == 1);

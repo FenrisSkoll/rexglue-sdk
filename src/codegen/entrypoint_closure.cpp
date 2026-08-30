@@ -1390,6 +1390,25 @@ Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
   Json evidence = Json::array();
   for (const auto& item : site.evidence)
     evidence.push_back(JumpInstructionEvidenceJson(item));
+  Json limitRetry = nullptr;
+  if (site.limitRetry) {
+    Json initialFailures = Json::array();
+    for (auto failure : site.limitRetry->initialFailures)
+      initialFailures.push_back(JumpTableFailureName(failure));
+    Json retryFailures = Json::array();
+    for (auto failure : site.limitRetry->retryFailures)
+      retryFailures.push_back(JumpTableFailureName(failure));
+    limitRetry = Json{{"exhausted_budget",
+                       site.limitRetry->exhaustedBudget.empty()
+                           ? Json(nullptr)
+                           : Json(site.limitRetry->exhaustedBudget)},
+                      {"initial_budget_value", site.limitRetry->initialBudgetValue},
+                      {"retry_budget_value", site.limitRetry->retryBudgetValue},
+                      {"initial_failures", std::move(initialFailures)},
+                      {"retry_failures", std::move(retryFailures)},
+                      {"exact_prior_table_match", site.limitRetry->exactPriorTableMatch},
+                      {"accepted", site.limitRetry->accepted}};
+  }
   return Json{
       {"site", Hex(site.site)},
       {"owner_address", Hex(site.ownerAddress)},
@@ -1398,6 +1417,7 @@ Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
       {"conditional", site.conditional},
       {"uses_ctr", site.usesCtr},
       {"failures", std::move(failures)},
+      {"limit_retry", std::move(limitRetry)},
       {"instruction_evidence", std::move(evidence)},
       {"automatic_table",
        site.automaticTable ? JumpTableJson(*site.automaticTable) : Json(nullptr)},

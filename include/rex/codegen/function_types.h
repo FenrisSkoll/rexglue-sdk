@@ -340,6 +340,16 @@ struct JumpTable {
   std::vector<std::string> conflicts;
 };
 
+struct JumpTableLimitRetryEvidence {
+  std::string exhaustedBudget;
+  uint32_t initialBudgetValue = 0;
+  uint32_t retryBudgetValue = 0;
+  std::vector<JumpTableFailure> initialFailures;
+  std::vector<JumpTableFailure> retryFailures;
+  bool exactPriorTableMatch = false;
+  bool accepted = false;
+};
+
 struct IndirectSiteAnalysis {
   uint32_t site = 0;
   uint32_t ownerAddress = 0;
@@ -351,6 +361,7 @@ struct IndirectSiteAnalysis {
   std::vector<JumpTableInstructionEvidence> evidence;
   std::optional<JumpTable> automaticTable;
   std::optional<JumpTable> selectedTable;
+  std::optional<JumpTableLimitRetryEvidence> limitRetry;
   bool incompleteCaseEntryPaths = false;
 };
 

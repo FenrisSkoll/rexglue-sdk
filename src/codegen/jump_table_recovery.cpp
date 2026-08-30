@@ -1143,12 +1143,12 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       ctrDefinitions.instructions.size() == 1 && !ctrDefinitions.incompletePath
           ? ctrDefinitions.instructions.front()
           : nullptr;
-  if (ctrDefinitions.instructions.size() > 1 || ctrDefinitions.incompletePath)
-    AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
   if (limitHit) {
     AddFailure(analysis, JumpTableFailure::AnalysisLimit);
     if (stats)
       stats->analysisLimitHit = true;
+  } else if (ctrDefinitions.instructions.size() > 1 || ctrDefinitions.incompletePath) {
+    AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
   }
   if (!mtctr) {
     if (analysis.failures.empty())
@@ -1161,10 +1161,11 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
                              target.evidence.end());
     if (target.limitHit) {
       AddFailure(analysis, JumpTableFailure::AnalysisLimit);
+      analysis.incompleteCaseEntryPaths = target.incompleteCaseEntryPath;
+      analysis.classification = IndirectSiteClassification::OpaqueIndirectTransfer;
       if (stats)
         stats->analysisLimitHit = true;
-    }
-    if (target.ambiguous) {
+    } else if (target.ambiguous) {
       AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
       analysis.incompleteCaseEntryPaths = target.incompleteCaseEntryPath;
     } else if (IsUnknown(target.expression) || !ContainsLoad(target.expression)) {
@@ -1231,8 +1232,10 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
         matchingBounds = std::move(mostDerivedBounds);
       }
       if (matchingBounds.empty()) {
-        AddFailure(analysis, bounds.empty() ? JumpTableFailure::MissingBound
-                                            : JumpTableFailure::UnknownIndex);
+        if (!(limitHit && bounds.empty())) {
+          AddFailure(analysis, bounds.empty() ? JumpTableFailure::MissingBound
+                                              : JumpTableFailure::UnknownIndex);
+        }
       } else if (matchingBounds.size() != 1) {
         AddFailure(analysis, JumpTableFailure::AmbiguousBound);
       } else {
@@ -1377,17 +1380,10 @@ IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
     DecodedBinary& decoded, const JumpTableRecoveryInput& input,
     JumpTableRecoveryStats* stats) {
   auto analysis = AnalyzeIndirectSite(decoded, input, stats);
-  if (analysis.selectedTable || !input.priorAutomaticTable ||
-      std::find(analysis.failures.begin(), analysis.failures.end(),
-                JumpTableFailure::AnalysisLimit) == analysis.failures.end()) {
+  if (analysis.selectedTable || !input.priorAutomaticTable || analysis.failures.size() != 1 ||
+      analysis.failures.front() != JumpTableFailure::AnalysisLimit) {
     return analysis;
   }
-
-  auto growLimit = [](uint32_t value, uint32_t factor, uint32_t ceiling) {
-    const uint64_t grown = std::max<uint64_t>(static_cast<uint64_t>(value) + 1,
-                                              static_cast<uint64_t>(value) * factor);
-    return static_cast<uint32_t>(std::min<uint64_t>(grown, ceiling));
-  };
 
   auto sameRawEntries = [](const std::vector<JumpTableRawEntry>& lhs,
                            const std::vector<JumpTableRawEntry>& rhs) {
@@ -1401,10 +1397,25 @@ IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
     }
     return true;
   };
-  auto sameSemanticTable = [&](const JumpTable& lhs, const JumpTable& rhs) {
+  auto sameInstructionEvidence = [](const std::vector<JumpTableInstructionEvidence>& lhs,
+                                    const std::vector<JumpTableInstructionEvidence>& rhs) {
+    if (lhs.size() != rhs.size())
+      return false;
+    for (size_t index = 0; index < lhs.size(); ++index) {
+      if (lhs[index].address != rhs[index].address ||
+          lhs[index].rawInstruction != rhs[index].rawInstruction ||
+          lhs[index].role != rhs[index].role ||
+          lhs[index].instruction != rhs[index].instruction) {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto sameValidatedTable = [&](const JumpTable& lhs, const JumpTable& rhs) {
     return lhs.bctrAddress == rhs.bctrAddress && lhs.tableAddress == rhs.tableAddress &&
            lhs.indexRegister == rhs.indexRegister && lhs.targets == rhs.targets &&
            lhs.kind == rhs.kind && lhs.origin == rhs.origin &&
+           lhs.manualComparison == rhs.manualComparison &&
            lhs.ownerAddress == rhs.ownerAddress && lhs.storageEnd == rhs.storageEnd &&
            lhs.boundValue == rhs.boundValue && lhs.caseCount == rhs.caseCount &&
            lhs.defaultTarget == rhs.defaultTarget && lhs.anchorAddress == rhs.anchorAddress &&
@@ -1413,70 +1424,56 @@ IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
            lhs.defaultIsReturn == rhs.defaultIsReturn &&
            lhs.tableInExecutableSection == rhs.tableInExecutableSection &&
            lhs.boundSemantics == rhs.boundSemantics &&
-           sameRawEntries(lhs.rawEntries, rhs.rawEntries);
+           sameRawEntries(lhs.rawEntries, rhs.rawEntries) &&
+           sameInstructionEvidence(lhs.evidence, rhs.evidence) && lhs.conflicts == rhs.conflicts;
   };
 
-  uint32_t retryCount = 0;
-  uint32_t unresolvedAttempts = 1;
-  uint32_t recoveredAttempts = 0;
-  auto normalizeStats = [&](bool accepted) {
-    if (!stats)
-      return;
-    stats->indirectSites -= std::min(stats->indirectSites, retryCount);
-    const uint32_t expectedUnresolved = accepted ? 0 : 1;
-    const uint32_t excessUnresolved = unresolvedAttempts - expectedUnresolved;
-    stats->unresolvedSites -= std::min(stats->unresolvedSites, excessUnresolved);
-    const uint32_t expectedRecovered = accepted ? 1 : 0;
-    const uint32_t excessRecovered = recoveredAttempts - expectedRecovered;
-    stats->recoveredTables -= std::min(stats->recoveredTables, excessRecovered);
-  };
+  JumpTableRecoveryInput retryInput = input;
+  const uint64_t grownStates =
+      std::max<uint64_t>(static_cast<uint64_t>(input.limits.maxStates) + 1,
+                         static_cast<uint64_t>(input.limits.maxStates) * 8);
+  retryInput.limits.maxStates =
+      static_cast<uint32_t>(std::min<uint64_t>(grownStates, 1000000));
+  auto retry = AnalyzeIndirectSite(decoded, retryInput, stats);
 
-  JumpTableRecoveryLimits retryLimits = input.limits;
-  for (uint32_t attempt = 0; attempt < 2; ++attempt) {
-    JumpTableRecoveryInput retryInput = input;
-    if (attempt == 0) {
-      retryLimits.maxBackwardInstructions =
-          growLimit(input.limits.maxBackwardInstructions, 4, 10000);
-      retryLimits.maxPredecessors = growLimit(input.limits.maxPredecessors, 2, 100000);
-      retryLimits.maxStates = growLimit(input.limits.maxStates, 8, 1000000);
-    } else {
-      // A large case-expanded owner may exceed the proportional retry even
-      // though the site-local idiom remains exact. The final attempt is still
-      // hard-bounded and may only reproduce the prior fully validated table.
-      retryLimits.maxBackwardInstructions = 10000;
-      retryLimits.maxPredecessors = 100000;
-      retryLimits.maxStates = 1000000;
-    }
-    retryInput.limits = retryLimits;
+  JumpTableLimitRetryEvidence retryEvidence;
+  retryEvidence.initialBudgetValue = input.limits.maxStates;
+  retryEvidence.retryBudgetValue = retryInput.limits.maxStates;
+  retryEvidence.initialFailures = analysis.failures;
+  retryEvidence.retryFailures = retry.failures;
+  retryEvidence.exhaustedBudget = retry.selectedTable ? "max_states" : "";
+  retryEvidence.exactPriorTableMatch =
+      retry.selectedTable && retry.automaticTable &&
+      retry.selectedTable->origin == JumpTableOrigin::Automatic &&
+      sameValidatedTable(*retry.selectedTable, *input.priorAutomaticTable) &&
+      sameValidatedTable(*retry.automaticTable, *input.priorAutomaticTable);
+  retryEvidence.accepted = retryEvidence.exactPriorTableMatch;
 
-    auto retry = AnalyzeIndirectSite(decoded, retryInput, stats);
-    ++retryCount;
-    if (retry.selectedTable)
-      ++recoveredAttempts;
-    else
-      ++unresolvedAttempts;
-
-    const bool accepted = retry.selectedTable &&
-                          retry.selectedTable->origin == JumpTableOrigin::Automatic &&
-                          retry.automaticTable &&
-                          sameSemanticTable(*retry.selectedTable, *input.priorAutomaticTable);
-    if (accepted) {
-      normalizeStats(true);
-      retry.automaticTable->confidence = "validated_after_expanded_cfg_limit_retry";
-      retry.selectedTable->confidence = "validated_after_expanded_cfg_limit_retry";
-      return retry;
-    }
-
-    if (retry.selectedTable ||
-        std::find(retry.failures.begin(), retry.failures.end(),
-                  JumpTableFailure::AnalysisLimit) == retry.failures.end()) {
-      normalizeStats(false);
-      return analysis;
+  if (stats) {
+    // Both analyses contribute real elapsed and decoded-instruction work, but
+    // together they still classify one site and have one final resolution.
+    if (stats->indirectSites > 0)
+      --stats->indirectSites;
+    if (retryEvidence.accepted) {
+      if (stats->unresolvedSites > 0)
+        --stats->unresolvedSites;
+    } else if (retry.selectedTable) {
+      if (stats->recoveredTables > 0)
+        --stats->recoveredTables;
+    } else if (stats->unresolvedSites > 0) {
+      --stats->unresolvedSites;
     }
   }
 
-  normalizeStats(false);
-  return analysis;
+  if (!retryEvidence.accepted) {
+    analysis.limitRetry = std::move(retryEvidence);
+    return analysis;
+  }
+
+  retry.limitRetry = std::move(retryEvidence);
+  retry.automaticTable->confidence = "validated_after_expanded_cfg_limit_retry";
+  retry.selectedTable->confidence = "validated_after_expanded_cfg_limit_retry";
+  return retry;
 }
 
 }  // namespace rex::codegen
