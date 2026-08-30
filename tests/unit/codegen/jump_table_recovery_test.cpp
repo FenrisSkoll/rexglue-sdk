@@ -26,6 +26,12 @@ void StoreBe32(std::vector<uint8_t>& bytes, uint32_t offset, uint32_t value) {
   bytes[offset + 3] = static_cast<uint8_t>(value);
 }
 
+void StoreBe16(std::vector<uint8_t>& bytes, uint32_t offset, uint16_t value) {
+  REQUIRE(offset + 2 <= bytes.size());
+  bytes[offset] = static_cast<uint8_t>(value >> 8);
+  bytes[offset + 1] = static_cast<uint8_t>(value);
+}
+
 uint32_t Bc(uint32_t site, uint32_t target, uint8_t bo, uint8_t bi) {
   const int32_t displacement = static_cast<int32_t>(target - site);
   return 0x40000000u | (static_cast<uint32_t>(bo) << 21) | (static_cast<uint32_t>(bi) << 16) |
@@ -1142,4 +1148,56 @@ TEST_CASE("a table invalidated by expanded CFG is quarantined instead of oscilla
   CHECK_FALSE(dispatch->selectedTable);
   CHECK(HasFailure(*dispatch, JumpTableFailure::AmbiguousReachingDefinition));
   CHECK_FALSE(result.jumpTableRecovery.analysisLimitHit);
+}
+
+TEST_CASE("stack-relative index reloads do not spend CFG states resolving r1",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  image.text.resize(0xC00);
+  std::fill(image.text.begin(), image.text.end(), 0);
+  for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
+    StoreBe32(image.text, offset, 0x60000000);  // nop
+
+  constexpr uint32_t kSwitchOffset = 0xA00;
+  constexpr uint32_t kSwitch = kTextBase + kSwitchOffset;
+  constexpr uint32_t kSite = kSwitch + 0x34;
+  StoreBe32(image.text, kSwitchOffset + 0x00, 0x82610020);  // lwz r19, 32(r1)
+  StoreBe32(image.text, kSwitchOffset + 0x04, Addi(11, 19, -99));
+  StoreBe32(image.text, kSwitchOffset + 0x08, 0x280B0018);  // cmplwi r11, 24
+  StoreBe32(image.text, kSwitchOffset + 0x0C,
+            Bc(kSwitch + 0x0C, kSwitch + 0x80, 12, 1));  // bgt default
+  StoreBe32(image.text, kSwitchOffset + 0x10, 0x3D802000);  // lis r12, table@h
+  StoreBe32(image.text, kSwitchOffset + 0x14, Addi(12, 12, 0));
+  StoreBe32(image.text, kSwitchOffset + 0x18, Rlwinm(0, 11, 1, 0, 30));
+  StoreBe32(image.text, kSwitchOffset + 0x1C, Lhzx(0, 12, 0));
+  StoreBe32(image.text, kSwitchOffset + 0x20, 0x3D801000);  // lis r12, anchor@h
+  StoreBe32(image.text, kSwitchOffset + 0x24, Addi(12, 12, 0));
+  StoreBe32(image.text, kSwitchOffset + 0x28, Add(12, 12, 0));
+  StoreBe32(image.text, kSwitchOffset + 0x2C, Mtctr(12));
+  StoreBe32(image.text, kSwitchOffset + 0x30, 0x60000000);  // nop
+  StoreBe32(image.text, kSwitchOffset + 0x34, 0x4E800420);  // bctr
+  StoreBe32(image.text, kSwitchOffset + 0x80, 0x4E800020);  // default: blr
+  StoreBe32(image.text, 0xB00, 0x4E800020);
+  StoreBe32(image.text, 0xB10, 0x4E800020);
+  StoreBe32(image.text, 0xB20, 0x4E800020);
+  for (uint32_t index = 0; index < 25; ++index)
+    StoreBe16(image.table, index * 2, static_cast<uint16_t>(0xB00 + (index % 3) * 0x10));
+
+  JumpTableRecoveryLimits limits;
+  limits.maxStates = 512;
+  auto recovered = Analyze(image, kSite, nullptr, limits, 0xC00);
+  REQUIRE(recovered.selectedTable);
+  CHECK(recovered.failures.empty());
+  CHECK(recovered.selectedTable->kind == JumpTableKind::RelativeOffset);
+  CHECK(recovered.selectedTable->caseCount == 25);
+  CHECK(recovered.selectedTable->tableAddress == kTableBase);
+  CHECK(recovered.selectedTable->anchorAddress == kTextBase);
+
+  // A non-stack base retains the bounded failure. This proves that recovery
+  // still refuses an equivalent load whose address lineage is not known to be
+  // the stable PPC stack pointer.
+  StoreBe32(image.text, kSwitchOffset + 0x00, 0x82620020);  // lwz r19, 32(r2)
+  auto unknownBase = Analyze(image, kSite, nullptr, limits, 0xC00);
+  CHECK_FALSE(unknownBase.selectedTable);
+  CHECK(unknownBase.failures == std::vector{JumpTableFailure::AnalysisLimit});
 }

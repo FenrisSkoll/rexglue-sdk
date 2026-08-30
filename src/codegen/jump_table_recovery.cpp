@@ -532,6 +532,15 @@ class Resolver {
         ExprPtr base;
         if (instruction.D.RA == 0) {
           base = MakeConstant(0);
+        } else if (instruction.D.RA == 1) {
+          // Stack-relative loads commonly reload a switch index saved earlier
+          // in a large function. The stack address does not establish the
+          // loaded value, and recursively resolving r1 can enumerate the
+          // entire CFG before reaching the same symbolic fallback below. Keep
+          // stable stack-slot lineage without resolving r1; a bound and table
+          // expression must still consume the same load before recovery can
+          // validate, and different offsets or widths remain distinct.
+          base = MakeInputRegister(1);
         } else {
           auto resolvedBase =
               ResolveBefore(static_cast<uint8_t>(instruction.D.RA), instruction.address);
