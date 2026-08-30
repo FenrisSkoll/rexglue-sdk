@@ -249,8 +249,7 @@ class LocalCfg {
     if (!contains(owner_) || !contains(candidate) || !contains(target))
       return false;
     // If target remains reachable from the owner after removing candidate,
-    // candidate does not dominate it. Callers must treat a query limit as an
-    // incomplete proof even though Reaches returns false in that case.
+    // candidate does not dominate it.
     return !Reaches(owner_, target, candidate, limits, limitHit);
   }
 
@@ -759,13 +758,8 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
     const auto* compare = decoded.get(address);
     if (!compare || (compare->opcode != Opcode::cmpli && compare->opcode != Opcode::cmpi))
       continue;
-    bool candidateLimit = false;
-    const bool dominates = cfg.Dominates(address, site, limits, &candidateLimit);
-    if (candidateLimit || !dominates) {
-      if (candidateLimit && limitHit)
-        *limitHit = true;
+    if (!cfg.Dominates(address, site, limits, limitHit))
       continue;
-    }
 
     // The guard is normally immediately after the compare. Permit a bounded
     // linear schedule of intervening instructions, but never cross another
@@ -803,21 +797,14 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
     bool defaultIsReturn = false;
     if (guard->opcode == Opcode::bclr || guard->opcode == Opcode::bclrl) {
       defaultIsReturn = true;
-      fallthroughReachesSite =
-          cfg.Reaches(guard->address + 4, site, address, limits, &candidateLimit);
+      fallthroughReachesSite = cfg.Reaches(guard->address + 4, site, address, limits, limitHit);
     } else if (guard->branch_target) {
       // Judge the two successors for this dynamic guard occurrence. A default
       // path may loop through the compare and reach the dispatch in a later
       // iteration after recomputing the index; that does not make it a case
       // path for the current bounded transfer.
-      takenReachesSite = cfg.Reaches(*guard->branch_target, site, address, limits, &candidateLimit);
-      fallthroughReachesSite =
-          cfg.Reaches(guard->address + 4, site, address, limits, &candidateLimit);
-    }
-    if (candidateLimit) {
-      if (limitHit)
-        *limitHit = true;
-      continue;
+      takenReachesSite = cfg.Reaches(*guard->branch_target, site, address, limits, limitHit);
+      fallthroughReachesSite = cfg.Reaches(guard->address + 4, site, address, limits, limitHit);
     }
     if (takenReachesSite == fallthroughReachesSite)
       continue;
@@ -851,8 +838,6 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
       continue;
 
     auto resolved = resolver.Resolve(candidate.indexRegister, address);
-    if (resolved.limitHit && limitHit)
-      *limitHit = true;
     if (resolved.ambiguous || resolved.limitHit || IsUnknown(resolved.expression))
       continue;
     candidate.indexExpression = resolved.expression;
@@ -1227,10 +1212,9 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       analysis.classification = IndirectSiteClassification::ComputedTailBctr;
     } else {
       auto bounds = FindBounds(decoded, cfg, resolver, input.site, input.limits, &limitHit);
-      // Candidate-specific dominance and path limits reject that candidate in
-      // FindBounds. A broad backward census can still encounter an unrelated
-      // loop after a complete bound has been proven; retain that proof only
-      // when the search did produce a bound.
+      // A bounded reachability query can encounter an unrelated loop after a
+      // complete dominating bound has already been found. Preserve that valid
+      // result, but make a truncated, unsuccessful bound search explicit.
       if (limitHit && bounds.empty()) {
         AddFailure(analysis, JumpTableFailure::AnalysisLimit);
         if (stats)
