@@ -629,7 +629,7 @@ TEST_CASE("case-expanded CFG limit retry requires an exact previously validated 
   CHECK(truncated.failures == std::vector{JumpTableFailure::AnalysisLimit});
 
   JumpTableRecoveryInput directRetryInput = input;
-  directRetryInput.limits.maxStates = truncatedLimits.maxStates * 8;
+  directRetryInput.limits.maxStates = truncatedLimits.maxStates * 32;
   auto directRetry = AnalyzeIndirectSite(decoded, directRetryInput);
   REQUIRE(directRetry.selectedTable);
   CHECK(directRetry.failures.empty());
@@ -647,7 +647,7 @@ TEST_CASE("case-expanded CFG limit retry requires an exact previously validated 
   REQUIRE(accepted.limitRetry);
   CHECK(accepted.limitRetry->exhaustedBudget == "max_states");
   CHECK(accepted.limitRetry->initialBudgetValue == 64);
-  CHECK(accepted.limitRetry->retryBudgetValue == 512);
+  CHECK(accepted.limitRetry->retryBudgetValue == 2048);
   CHECK(accepted.limitRetry->initialFailures ==
         std::vector{JumpTableFailure::AnalysisLimit});
   CHECK(accepted.limitRetry->retryFailures.empty());

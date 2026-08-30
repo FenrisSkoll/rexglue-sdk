@@ -1431,7 +1431,7 @@ IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
   JumpTableRecoveryInput retryInput = input;
   const uint64_t grownStates =
       std::max<uint64_t>(static_cast<uint64_t>(input.limits.maxStates) + 1,
-                         static_cast<uint64_t>(input.limits.maxStates) * 8);
+                         static_cast<uint64_t>(input.limits.maxStates) * 32);
   retryInput.limits.maxStates =
       static_cast<uint32_t>(std::min<uint64_t>(grownStates, 1000000));
   auto retry = AnalyzeIndirectSite(decoded, retryInput, stats);
