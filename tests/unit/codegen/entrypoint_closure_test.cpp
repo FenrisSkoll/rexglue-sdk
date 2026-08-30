@@ -380,7 +380,53 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
   SyntheticImage image;
   StoreBe32(image.text, 0x40, 0x4E800020);
   StoreBe32(image.readOnly, 0x00, kTextBase + 0x40);
-  auto report = AnalyzeEntrypointClosure(image.view(), DefaultInput());
+  auto closureInput = DefaultInput();
+  IndirectSiteAnalysis indirect;
+  indirect.site = kTextBase + 0x30;
+  indirect.ownerAddress = kTextBase;
+  indirect.classification = IndirectSiteClassification::ComputedTailBctr;
+  indirect.usesCtr = true;
+  indirect.failures = {JumpTableFailure::MissingBound};
+  indirect.loopEvidence.push_back({.registerIndex = 11,
+                                   .headerAddress = kTextBase + 0x10,
+                                   .entryDefinitionAddresses = {kTextBase},
+                                   .backedgeDefinitionAddresses = {kTextBase + 0x20},
+                                   .entryValues = {0},
+                                   .backedgeValues = {1},
+                                   .finiteValues = {0, 1},
+                                   .identityBackedge = true,
+                                   .finiteEntryDomain = true,
+                                   .converged = true});
+  indirect.dataflow = std::make_shared<JumpTableSiteDataflowEvidence>();
+  auto& dataflow = *indirect.dataflow;
+  dataflow.preliminaryBlockStart = kTextBase;
+  dataflow.preliminaryBlockEnd = kTextBase + 0x40;
+  dataflow.predecessors = {kTextBase + 0x2C};
+  dataflow.reachingDefinitionInScc = true;
+  dataflow.loopHeaders = {kTextBase + 0x10};
+  dataflow.loopCarriedRegisters = {11};
+  dataflow.ctrSourceRegister = 12;
+  dataflow.normalizedTargetExpression = "load_u8(add(constant,loop_phi))";
+  dataflow.indexTransformChain = {"shift_left_2", "indexed_load_u8"};
+  dataflow.elementWidth = 1;
+  dataflow.elementSignedness = "unsigned";
+  dataflow.targetScale = 4;
+  dataflow.tableKindHypothesis = "relative_offset";
+  dataflow.tableBaseConstruction = "constant_materialization";
+  dataflow.mergeShape = "finite_loop_phi";
+  dataflow.failureStage = "bound_and_index_matching";
+  dataflow.dispatchKind = "bctr";
+  dataflow.clusterId =
+      "dispatch=bctr|form=relative_offset|element=unsigned8|scale=4|bound=none|"
+      "index=shift_left_2>indexed_load_u8|cfg=loop_carried|merge=finite_loop_phi|"
+      "base=constant_materialization|slice=load_u8(add(constant,loop_phi))|"
+      "stage=bound_and_index_matching|reason=missing_bound";
+  dataflow.switchLikelihood = JumpTableSwitchLikelihood::InsufficientStaticEvidence;
+  dataflow.rejectionEvidence = {"missing_bound"};
+  dataflow.diagnosticProbe.attempted = true;
+  dataflow.diagnosticProbe.rejections = {"no_exact_dominating_unsigned_bound"};
+  closureInput.jumpTableRecovery.indirectSites.push_back(std::move(indirect));
+  auto report = AnalyzeEntrypointClosure(image.view(), std::move(closureInput));
 
   const fs::path directory = fs::temp_directory_path() / "rexglue-entrypoint-closure-report-test";
   fs::create_directories(directory);
@@ -412,6 +458,22 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
     CHECK(volatileReport.at("elapsed_milliseconds") == 123);
     CHECK(volatileReport.at("stage_elapsed_microseconds").at("gap_fill_phase") == 456);
     CHECK(volatileReport.at("serialization_elapsed_microseconds").contains("total"));
+  }
+  {
+    std::ifstream input(directory / "analysis" / "jump-table-recovery.json", std::ios::binary);
+    const auto jumpReport = nlohmann::json::parse(input);
+    CHECK(jumpReport.at("schema_version") == 2);
+    CHECK(jumpReport.at("analyzer_version") == "2.0.0");
+    REQUIRE(jumpReport.at("indirect_sites").size() == 1);
+    const auto& site = jumpReport.at("indirect_sites").front();
+    CHECK(site.at("loop_evidence").front().at("register") == 11);
+    CHECK(site.at("dataflow").at("switch_likelihood") == "insufficient_static_evidence");
+    CHECK(site.at("dataflow").at("diagnostic_probe").at("report_only") == true);
+    CHECK(site.at("dataflow").at("diagnostic_probe").at("rejections").front() ==
+          "no_exact_dominating_unsigned_bound");
+    REQUIRE(jumpReport.at("structural_clusters").size() == 1);
+    CHECK(jumpReport.at("structural_clusters").front().at("site_count") == 1);
+    CHECK(jumpReport.at("structural_clusters").front().at("synthetic_fixture_exists") == true);
   }
   fs::remove_all(directory);
 }

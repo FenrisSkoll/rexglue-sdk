@@ -124,6 +124,7 @@ enum class Opcode : uint16_t {
   srw,     // Shift right word
   sraw,    // Shift right algebraic word
   srawi,   // Shift right algebraic word immediate
+  rlwimi,  // Rotate left word immediate then mask insert
   rlwinm,  // Rotate left word immediate then AND with mask
   rlwnm,   // Rotate left word then AND with mask
   cntlzw,  // Count leading zeros word

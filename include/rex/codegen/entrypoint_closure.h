@@ -267,12 +267,28 @@ struct JumpTableBoundaryEffect {
   bool changed = false;
 };
 
+struct JumpTableClusterSummary {
+  std::string clusterId;
+  uint32_t siteCount = 0;
+  uint32_t recoveredCount = 0;
+  uint32_t unresolvedCount = 0;
+  std::vector<uint32_t> representativeSites;
+  std::map<std::string, uint32_t> failureCounts;
+  std::map<std::string, uint32_t> switchLikelihoodCounts;
+  std::string normalizedSlice;
+  std::vector<std::string> switchEvidence;
+  std::string proposedGenericCorrection;
+  bool syntheticFixtureExists = false;
+  bool blocksPhase3Closure = false;
+};
+
 struct EntrypointJumpTableRecovery {
-  uint32_t schemaVersion = 1;
-  std::string analyzerVersion = "1.0.0";
+  uint32_t schemaVersion = 2;
+  std::string analyzerVersion = "2.0.0";
   JumpTableRecoveryLimits limits;
   JumpTableRecoveryStats stats;
   std::vector<IndirectSiteAnalysis> indirectSites;
+  std::vector<JumpTableClusterSummary> clusters;
   std::vector<JumpTableBoundaryEffect> boundaryEffects;
   std::vector<uint32_t> staticCandidatesReclassifiedAsCases;
 };

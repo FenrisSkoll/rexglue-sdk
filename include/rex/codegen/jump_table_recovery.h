@@ -12,6 +12,7 @@
 #pragma once
 
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <rex/codegen/code_region.h>
@@ -24,12 +25,22 @@ class DecodedBinary;
 struct JumpTableRecoveryInput {
   uint32_t site = 0;
   uint32_t ownerAddress = 0;
+  // Exclusive trusted owner envelope (for example an exact .pdata range).
+  // This permits validated case edges across discontinuous executable body
+  // fragments without treating the entire envelope as a linear code region.
+  uint32_t trustedOwnerEnd = 0;
   std::span<const Block> preliminaryBlocks;
   const CodeRegion* containingRegion = nullptr;
   const std::unordered_set<uint32_t>* independentlyCallableEntries = nullptr;
   const std::unordered_set<uint32_t>* knownIndirectSites = nullptr;
+  // Previously validated tables owned by this function. Their case edges are
+  // part of the case-expanded CFG used to analyze downstream indirect sites;
+  // the current site is excluded and still follows priorAutomaticTable's
+  // stricter exact-retention lifecycle.
+  const std::unordered_map<uint32_t, JumpTable>* validatedOwnerTables = nullptr;
   const JumpTable* priorAutomaticTable = nullptr;
   const JumpTable* manualTable = nullptr;
+  bool allowPriorLocalSliceRecovery = false;
   JumpTableRecoveryLimits limits;
 };
 
@@ -55,5 +66,12 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
 IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
     DecodedBinary& decoded, const JumpTableRecoveryInput& input,
     JumpTableRecoveryStats* stats = nullptr);
+
+/**
+ * Recompute final failure stage, likelihood, rejection evidence, and stable
+ * structural cluster after fixpoint retention or quarantine changes the
+ * selected-table disposition.
+ */
+void FinalizeJumpTableSiteDisposition(IndirectSiteAnalysis& analysis);
 
 }  // namespace rex::codegen

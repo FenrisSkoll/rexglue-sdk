@@ -150,6 +150,9 @@ static const std::array<OpcodeInfo, 320> g_opcode_table = {{
     // Primary opcode 10: cmpli
     {Opcode::cmpli, InstrFormat::kD, OpcodeGroup::kGeneral, "cmpli", 10, 0, false},
 
+    // Primary opcode 20: rlwimi
+    {Opcode::rlwimi, InstrFormat::kM, OpcodeGroup::kGeneral, "rlwimi", 20, 0, false},
+
     // Primary opcode 21: rlwinm
     {Opcode::rlwinm, InstrFormat::kM, OpcodeGroup::kGeneral, "rlwinm", 21, 0, false},
 
@@ -448,7 +451,7 @@ static const std::array<OpcodeInfo, 320> g_opcode_table = {{
     //=========================================================================
     {Opcode::lbzx, InstrFormat::kX, OpcodeGroup::kMemory, "lbzx", 31, 87, true},
     {Opcode::lhzx, InstrFormat::kX, OpcodeGroup::kMemory, "lhzx", 31, 279, true},
-    {Opcode::lhax, InstrFormat::kX, OpcodeGroup::kMemory, "lhax", 31, 311, true},
+    {Opcode::lhax, InstrFormat::kX, OpcodeGroup::kMemory, "lhax", 31, 343, true},
     {Opcode::lwzx, InstrFormat::kX, OpcodeGroup::kMemory, "lwzx", 31, 23, true},
     {Opcode::ldx, InstrFormat::kX, OpcodeGroup::kMemory, "ldx", 31, 21, true},
     {Opcode::stbx, InstrFormat::kX, OpcodeGroup::kMemory, "stbx", 31, 215, true},
@@ -536,6 +539,8 @@ Opcode lookup_opcode(u32 code) {
         return Opcode::ba;
       return Opcode::b;
     }
+    case 20:
+      return Opcode::rlwimi;
     case 21:
       return Opcode::rlwinm;
     case 23:
@@ -662,7 +667,7 @@ Opcode lookup_opcode(u32 code) {
         return Opcode::lhzx;
       case 284:
         return Opcode::eqv;
-      case 311:
+      case 343:
         return Opcode::lhax;
       case 316:
         return Opcode::xor_;

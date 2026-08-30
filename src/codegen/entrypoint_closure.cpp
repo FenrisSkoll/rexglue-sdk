@@ -1101,6 +1101,103 @@ static EntrypointClosureReport AnalyzeEntrypointClosureDecoded(const BinaryView&
   EntrypointClosureReport report;
   report.image = std::move(input.image);
   report.jumpTableRecovery = std::move(input.jumpTableRecovery);
+  std::map<std::string, JumpTableClusterSummary> clusterMap;
+  for (auto& site : report.jumpTableRecovery.indirectSites) {
+    if (!site.usesCtr || site.link)
+      continue;
+
+    if (!site.dataflow)
+      site.dataflow = std::make_shared<JumpTableSiteDataflowEvidence>();
+    auto& dataflow = *site.dataflow;
+    if (dataflow.dispatchKind == "other")
+      dataflow.dispatchKind = site.conditional ? "conditional_bctr" : "bctr";
+    if (dataflow.clusterId.empty()) {
+      std::string failures = "none";
+      if (!site.failures.empty()) {
+        failures.clear();
+        for (auto failure : site.failures) {
+          if (!failures.empty())
+            failures += '+';
+          failures += JumpTableFailureName(failure);
+        }
+      }
+      dataflow.clusterId = "dispatch=" + dataflow.dispatchKind +
+                           "|form=unknown|element=unknown|scale=0|bound=none|index=none|cfg="
+                           "acyclic|merge=unknown|base=unknown_or_runtime|slice=|stage=" +
+                           dataflow.failureStage + "|reason=" + failures;
+      dataflow.switchLikelihood = site.selectedTable
+                                      ? JumpTableSwitchLikelihood::ResolvedSwitch
+                                      : JumpTableSwitchLikelihood::OpaqueNonTableDispatch;
+    }
+
+    auto& cluster = clusterMap[dataflow.clusterId];
+    cluster.clusterId = dataflow.clusterId;
+    ++cluster.siteCount;
+    if (site.selectedTable)
+      ++cluster.recoveredCount;
+    else
+      ++cluster.unresolvedCount;
+    if (cluster.representativeSites.size() < 5)
+      cluster.representativeSites.push_back(site.site);
+    for (auto failure : site.failures)
+      ++cluster.failureCounts[JumpTableFailureName(failure)];
+    ++cluster.switchLikelihoodCounts[JumpTableSwitchLikelihoodName(dataflow.switchLikelihood)];
+    if (cluster.normalizedSlice.empty())
+      cluster.normalizedSlice = dataflow.normalizedTargetExpression;
+    auto addEvidence = [&](std::string evidence) {
+      if (std::find(cluster.switchEvidence.begin(), cluster.switchEvidence.end(), evidence) ==
+          cluster.switchEvidence.end()) {
+        cluster.switchEvidence.push_back(std::move(evidence));
+      }
+    };
+    if (dataflow.elementWidth)
+      addEvidence("table_like_indexed_load");
+    const bool matchingFiniteBound = std::any_of(
+        dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(), [&](const auto& bound) {
+          return bound.finiteDenseDomain && dataflow.indexRegister != 0xFF &&
+                 bound.indexRegister == dataflow.indexRegister;
+        });
+    const bool unmatchedFiniteBound =
+        !matchingFiniteBound &&
+        std::any_of(dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
+                    [](const auto& bound) { return bound.finiteDenseDomain; });
+    if (matchingFiniteBound)
+      addEvidence("finite_dominating_bound_for_table_index");
+    if (unmatchedFiniteBound)
+      addEvidence("finite_bound_for_unrelated_register");
+    if (dataflow.reachingDefinitionInScc)
+      addEvidence("loop_carried_reaching_definition");
+    if (dataflow.diagnosticProbe.hypothesisComplete && dataflow.diagnosticProbe.allTargetsValid) {
+      addEvidence("report_probe_complete_valid_table");
+    }
+    if (dataflow.diagnosticProbe.mixedValidity)
+      addEvidence("report_probe_mixed_validity");
+    if (site.selectedTable)
+      addEvidence("production_table_recovered");
+    if (dataflow.mergeShape == "finite_loop_phi" || dataflow.mergeShape == "finite_cfg_domain" ||
+        dataflow.mergeShape == "bounded_direct_index")
+      cluster.syntheticFixtureExists = true;
+  }
+  for (auto& [unused, cluster] : clusterMap) {
+    const auto count = [&](JumpTableSwitchLikelihood likelihood) {
+      auto found = cluster.switchLikelihoodCounts.find(JumpTableSwitchLikelihoodName(likelihood));
+      return found == cluster.switchLikelihoodCounts.end() ? 0u : found->second;
+    };
+    cluster.blocksPhase3Closure = count(JumpTableSwitchLikelihood::ConfirmedSwitchMiss) != 0 ||
+                                  count(JumpTableSwitchLikelihood::ProbableSwitchMiss) != 0 ||
+                                  count(JumpTableSwitchLikelihood::PlausibleSwitchCandidate) != 0;
+    if (count(JumpTableSwitchLikelihood::ProbableSwitchMiss) != 0) {
+      cluster.proposedGenericCorrection =
+          "reconcile the production recognizer with the complete report-only table hypothesis";
+    } else if (count(JumpTableSwitchLikelihood::PlausibleSwitchCandidate) != 0) {
+      cluster.proposedGenericCorrection =
+          "inspect the bounded symbolic slice; retain rejection until every target validates";
+    } else {
+      cluster.proposedGenericCorrection = "none_without_additional_static_evidence";
+    }
+    std::sort(cluster.switchEvidence.begin(), cluster.switchEvidence.end());
+    report.jumpTableRecovery.clusters.push_back(std::move(cluster));
+  }
   report.limits = input.limits;
   report.limitDiagnostics = input.producerDiagnostics;
   report.counts.relocationStorageSites =
@@ -1383,6 +1480,164 @@ Json JumpTableJson(const JumpTable& table) {
       {"conflicts", table.conflicts}};
 }
 
+Json HexAddressArray(const std::vector<uint32_t>& addresses) {
+  Json output = Json::array();
+  for (uint32_t address : addresses)
+    output.push_back(Hex(address));
+  return output;
+}
+
+Json RegisterArray(const std::vector<uint8_t>& registers) {
+  Json output = Json::array();
+  for (uint8_t reg : registers)
+    output.push_back(reg);
+  return output;
+}
+
+Json StringArray(const std::vector<std::string>& values) {
+  Json output = Json::array();
+  for (const auto& value : values)
+    output.push_back(value);
+  return output;
+}
+
+Json JumpLoopEvidenceJson(const JumpTableLoopEvidence& loop) {
+  return Json{{"register", loop.registerIndex},
+              {"header_address", Hex(loop.headerAddress)},
+              {"entry_definition_addresses", HexAddressArray(loop.entryDefinitionAddresses)},
+              {"backedge_definition_addresses", HexAddressArray(loop.backedgeDefinitionAddresses)},
+              {"entry_values", loop.entryValues},
+              {"backedge_values", loop.backedgeValues},
+              {"finite_values", loop.finiteValues},
+              {"identity_backedge", loop.identityBackedge},
+              {"finite_entry_domain", loop.finiteEntryDomain},
+              {"converged", loop.converged}};
+}
+
+Json JumpCfgEdgeJson(const JumpTableCfgEdgeEvidence& edge) {
+  return Json{{"source", Hex(edge.source)}, {"target", Hex(edge.target)}};
+}
+
+Json JumpBoundCandidateJson(const JumpTableBoundCandidateEvidence& bound) {
+  Json finiteValues = Json::array();
+  for (uint32_t value : bound.finiteValues)
+    finiteValues.push_back(value);
+  return Json{
+      {"compare_address", bound.compareAddress ? Json(Hex(bound.compareAddress)) : Json(nullptr)},
+      {"guard_address", bound.guardAddress ? Json(Hex(bound.guardAddress)) : Json(nullptr)},
+      {"domain_origin_address",
+       bound.domainOriginAddress ? Json(Hex(bound.domainOriginAddress)) : Json(nullptr)},
+      {"value", bound.value},
+      {"case_count", bound.caseCount},
+      {"default_target", bound.defaultTarget ? Json(Hex(bound.defaultTarget)) : Json(nullptr)},
+      {"index_register", bound.indexRegister == 0xFF ? Json(nullptr) : Json(bound.indexRegister)},
+      {"inclusive", bound.inclusive},
+      {"signed_compare", bound.signedCompare},
+      {"default_is_return", bound.defaultIsReturn},
+      {"dominates_dispatch", bound.dominatesDispatch},
+      {"finite_dense_domain", bound.finiteDenseDomain},
+      {"prior_exact_revalidation", bound.priorExactRevalidation},
+      {"prior_direct_bounded_index_revalidation", bound.priorDirectBoundedIndexRevalidation},
+      {"inherited_case_edge_proof", bound.inheritedCaseEdgeProof},
+      {"finite_cfg_domain", bound.finiteCfgDomain},
+      {"finite_values", std::move(finiteValues)},
+      {"rejection", bound.rejection.empty() ? Json(nullptr) : Json(bound.rejection)}};
+}
+
+Json JumpBudgetExhaustionJson(const JumpTableBudgetExhaustionEvidence& exhaustion) {
+  return Json{{"budget", exhaustion.budget},
+              {"limit", exhaustion.limit},
+              {"observed", exhaustion.observed}};
+}
+
+Json JumpReachingDefinitionPathJson(const JumpTableReachingDefinitionPathEvidence& path) {
+  return Json{{"register", path.registerIndex},
+              {"merge_address", Hex(path.mergeAddress)},
+              {"predecessor", Hex(path.predecessor)},
+              {"loop_header", Hex(path.loopHeader)},
+              {"backedge", path.backedge},
+              {"limit_hit", path.limitHit},
+              {"expression", path.expression},
+              {"normalized_expression", path.normalizedExpression},
+              {"disposition", path.disposition}};
+}
+
+Json JumpDiagnosticProbeJson(const JumpTableDiagnosticProbe& probe) {
+  return Json{{"attempted", probe.attempted},
+              {"report_only", probe.reportOnly},
+              {"hypothesis_complete", probe.hypothesisComplete},
+              {"all_targets_valid", probe.allTargetsValid},
+              {"mixed_validity", probe.mixedValidity},
+              {"decoded_entries", probe.decodedEntries},
+              {"aligned_executable_targets", probe.alignedExecutableTargets},
+              {"assumptions", StringArray(probe.assumptions)},
+              {"rejections", StringArray(probe.rejections)},
+              {"candidate_table",
+               probe.candidateTable ? JumpTableJson(*probe.candidateTable) : Json(nullptr)}};
+}
+
+Json JumpSiteDataflowJson(const JumpTableSiteDataflowEvidence& dataflow) {
+  Json caseEdges = Json::array();
+  for (const auto& edge : dataflow.caseExpansionEdges)
+    caseEdges.push_back(JumpCfgEdgeJson(edge));
+  Json backedges = Json::array();
+  for (const auto& edge : dataflow.backedges)
+    backedges.push_back(JumpCfgEdgeJson(edge));
+  Json bounds = Json::array();
+  for (const auto& bound : dataflow.boundCandidates)
+    bounds.push_back(JumpBoundCandidateJson(bound));
+  Json exhaustedBudgets = Json::array();
+  for (const auto& exhaustion : dataflow.exhaustedBudgets)
+    exhaustedBudgets.push_back(JumpBudgetExhaustionJson(exhaustion));
+  Json reachingPaths = Json::array();
+  for (const auto& path : dataflow.reachingDefinitionPaths)
+    reachingPaths.push_back(JumpReachingDefinitionPathJson(path));
+  return Json{
+      {"preliminary_cfg_block", dataflow.preliminaryBlockStart
+                                    ? Json{{"start", Hex(dataflow.preliminaryBlockStart)},
+                                           {"end", Hex(dataflow.preliminaryBlockEnd)}}
+                                    : Json(nullptr)},
+      {"predecessors", HexAddressArray(dataflow.predecessors)},
+      {"case_expanded_cfg", dataflow.caseExpandedCfg},
+      {"case_expansion_edges", std::move(caseEdges)},
+      {"source_in_scc", dataflow.sourceInScc},
+      {"reaching_definition_in_scc", dataflow.reachingDefinitionInScc},
+      {"loop_headers", HexAddressArray(dataflow.loopHeaders)},
+      {"backedges", std::move(backedges)},
+      {"loop_carried_registers", RegisterArray(dataflow.loopCarriedRegisters)},
+      {"ctr_source_register",
+       dataflow.ctrSourceRegister == 0xFF ? Json(nullptr) : Json(dataflow.ctrSourceRegister)},
+      {"target_expression", dataflow.targetExpression},
+      {"normalized_target_expression", dataflow.normalizedTargetExpression},
+      {"reaching_definition_alternatives", StringArray(dataflow.reachingDefinitionAlternatives)},
+      {"normalized_reaching_definitions", StringArray(dataflow.normalizedReachingDefinitions)},
+      {"reaching_definition_paths", std::move(reachingPaths)},
+      {"table_base_candidates", HexAddressArray(dataflow.tableBaseCandidates)},
+      {"anchor_candidates", HexAddressArray(dataflow.anchorCandidates)},
+      {"index_register",
+       dataflow.indexRegister == 0xFF ? Json(nullptr) : Json(dataflow.indexRegister)},
+      {"index_transform_chain", StringArray(dataflow.indexTransformChain)},
+      {"element_width", dataflow.elementWidth},
+      {"element_signedness", dataflow.elementSignedness},
+      {"target_scale", dataflow.targetScale},
+      {"bound_candidates", std::move(bounds)},
+      {"table_kind_hypothesis", dataflow.tableKindHypothesis},
+      {"table_base_construction", dataflow.tableBaseConstruction},
+      {"merge_shape", dataflow.mergeShape},
+      {"failure_stage", dataflow.failureStage},
+      {"dispatch_kind", dataflow.dispatchKind},
+      {"cluster_id", dataflow.clusterId},
+      {"switch_likelihood", JumpTableSwitchLikelihoodName(dataflow.switchLikelihood)},
+      {"rejection_evidence", StringArray(dataflow.rejectionEvidence)},
+      {"exhausted_budgets", std::move(exhaustedBudgets)},
+      {"diagnostic_probe", JumpDiagnosticProbeJson(dataflow.diagnosticProbe)}};
+}
+
+const JumpTableSiteDataflowEvidence& JumpSiteDataflow(const IndirectSiteAnalysis& site) {
+  static const JumpTableSiteDataflowEvidence empty;
+  return site.dataflow ? *site.dataflow : empty;
+}
+
 Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
   Json failures = Json::array();
   for (auto failure : site.failures)
@@ -1398,10 +1653,9 @@ Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
     Json retryFailures = Json::array();
     for (auto failure : site.limitRetry->retryFailures)
       retryFailures.push_back(JumpTableFailureName(failure));
-    limitRetry = Json{{"exhausted_budget",
-                       site.limitRetry->exhaustedBudget.empty()
-                           ? Json(nullptr)
-                           : Json(site.limitRetry->exhaustedBudget)},
+    limitRetry = Json{{"exhausted_budget", site.limitRetry->exhaustedBudget.empty()
+                                               ? Json(nullptr)
+                                               : Json(site.limitRetry->exhaustedBudget)},
                       {"initial_budget_value", site.limitRetry->initialBudgetValue},
                       {"retry_budget_value", site.limitRetry->retryBudgetValue},
                       {"initial_failures", std::move(initialFailures)},
@@ -1409,6 +1663,9 @@ Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
                       {"exact_prior_table_match", site.limitRetry->exactPriorTableMatch},
                       {"accepted", site.limitRetry->accepted}};
   }
+  Json loops = Json::array();
+  for (const auto& loop : site.loopEvidence)
+    loops.push_back(JumpLoopEvidenceJson(loop));
   return Json{
       {"site", Hex(site.site)},
       {"owner_address", Hex(site.ownerAddress)},
@@ -1418,10 +1675,29 @@ Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
       {"uses_ctr", site.usesCtr},
       {"failures", std::move(failures)},
       {"limit_retry", std::move(limitRetry)},
+      {"loop_evidence", std::move(loops)},
+      {"dataflow", site.usesCtr && !site.link && site.dataflow
+                       ? JumpSiteDataflowJson(*site.dataflow)
+                       : Json(nullptr)},
       {"instruction_evidence", std::move(evidence)},
       {"automatic_table",
        site.automaticTable ? JumpTableJson(*site.automaticTable) : Json(nullptr)},
       {"selected_table", site.selectedTable ? JumpTableJson(*site.selectedTable) : Json(nullptr)}};
+}
+
+Json JumpClusterJson(const JumpTableClusterSummary& cluster) {
+  return Json{{"cluster_id", cluster.clusterId},
+              {"site_count", cluster.siteCount},
+              {"recovered_count", cluster.recoveredCount},
+              {"unresolved_count", cluster.unresolvedCount},
+              {"representative_sites", HexAddressArray(cluster.representativeSites)},
+              {"failure_counts", cluster.failureCounts},
+              {"switch_likelihood_counts", cluster.switchLikelihoodCounts},
+              {"normalized_slice", cluster.normalizedSlice},
+              {"switch_evidence", StringArray(cluster.switchEvidence)},
+              {"proposed_generic_correction", cluster.proposedGenericCorrection},
+              {"synthetic_fixture_exists", cluster.syntheticFixtureExists},
+              {"blocks_phase3_closure", cluster.blocksPhase3Closure}};
 }
 
 Json BoundaryEffectJson(const JumpTableBoundaryEffect& effect) {
@@ -1461,6 +1737,9 @@ Json JumpTableRecoveryJson(const EntrypointJumpTableRecovery& recovery,
   Json reclassified = Json::array();
   for (uint32_t address : recovery.staticCandidatesReclassifiedAsCases)
     reclassified.push_back(Hex(address));
+  Json clusters = Json::array();
+  for (const auto& cluster : recovery.clusters)
+    clusters.push_back(JumpClusterJson(cluster));
   return Json{
       {"schema_version", recovery.schemaVersion},
       {"analyzer_version", recovery.analyzerVersion},
@@ -1476,6 +1755,7 @@ Json JumpTableRecoveryJson(const EntrypointJumpTableRecovery& recovery,
       {"limits", Json{{"max_backward_instructions", recovery.limits.maxBackwardInstructions},
                       {"max_predecessors", recovery.limits.maxPredecessors},
                       {"max_states", recovery.limits.maxStates},
+                      {"max_cfg_topology_nodes", recovery.limits.maxCfgTopologyNodes},
                       {"max_entries", recovery.limits.maxEntries},
                       {"max_fixpoint_iterations", recovery.limits.maxFixpointIterations}}},
       {"stats", Json{{"decoded_instructions", recovery.stats.decodedInstructions},
@@ -1486,6 +1766,7 @@ Json JumpTableRecoveryJson(const EntrypointJumpTableRecovery& recovery,
                      {"unresolved_relevant_ctr_sites", recovery.stats.unresolvedSites},
                      {"analysis_limit_hit", recovery.stats.analysisLimitHit}}},
       {"indirect_sites", std::move(sites)},
+      {"structural_clusters", std::move(clusters)},
       {"boundary_effects", std::move(effects)},
       {"static_candidates_reclassified_as_cases", std::move(reclassified)},
       {"manual_tables_authoritative", true},
@@ -1566,6 +1847,15 @@ std::string CsvEscape(std::string value) {
     position += 2;
   }
   return '"' + value + '"';
+}
+
+std::string MarkdownTableEscape(std::string value) {
+  size_t position = 0;
+  while ((position = value.find('|', position)) != std::string::npos) {
+    value.insert(position, 1, '\\');
+    position += 2;
+  }
+  return value;
 }
 
 std::string JoinEvidenceKinds(const EntrypointCandidate& candidate) {
@@ -1899,9 +2189,14 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
   formatStarted = Clock::now();
   std::ostringstream jumpCsv;
   jumpCsv << "site,owner,classification,link,conditional,uses_ctr,recovered,origin,kind,"
-             "table_start,table_end,case_count,targets,failures,manual_comparison\n";
+             "table_start,table_end,case_count,targets,failures,manual_comparison,cluster_id,"
+             "switch_likelihood,preliminary_block,predecessors,case_expanded_cfg,source_in_scc,"
+             "loop_headers,ctr_source_register,normalized_target_expression,index_transforms,"
+             "element_width,element_signedness,target_scale,bound_candidates,diagnostic_probe,"
+             "reaching_definition_paths,exhausted_budgets,limit_retry,rejection_evidence\n";
   for (const auto& site : report.jumpTableRecovery.indirectSites) {
     const JumpTable* table = site.selectedTable ? &*site.selectedTable : nullptr;
+    const auto& dataflow = JumpSiteDataflow(site);
     std::ostringstream targets;
     if (table) {
       for (size_t index = 0; index < table->targets.size(); ++index) {
@@ -1916,6 +2211,75 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
         failures << ';';
       failures << JumpTableFailureName(site.failures[index]);
     }
+    std::ostringstream predecessors;
+    for (size_t index = 0; index < dataflow.predecessors.size(); ++index) {
+      if (index)
+        predecessors << ';';
+      predecessors << Hex(dataflow.predecessors[index]);
+    }
+    std::ostringstream loopHeaders;
+    for (size_t index = 0; index < dataflow.loopHeaders.size(); ++index) {
+      if (index)
+        loopHeaders << ';';
+      loopHeaders << Hex(dataflow.loopHeaders[index]);
+    }
+    std::ostringstream bounds;
+    for (size_t index = 0; index < dataflow.boundCandidates.size(); ++index) {
+      if (index)
+        bounds << ';';
+      const auto& bound = dataflow.boundCandidates[index];
+      bounds << (bound.compareAddress ? Hex(bound.compareAddress) : Hex(bound.domainOriginAddress))
+             << ':' << bound.caseCount << ':'
+             << (bound.dominatesDispatch ? "dominates" : "not_dominating") << ':'
+             << (bound.finiteDenseDomain ? "finite" : "rejected") << ':'
+             << (bound.priorDirectBoundedIndexRevalidation
+                     ? "direct_bounded_prior"
+                     : (bound.priorExactRevalidation
+                            ? "exact_prior"
+                            : (bound.inheritedCaseEdgeProof
+                                   ? "inherited_case_edge"
+                                   : (bound.finiteCfgDomain ? "finite_cfg_domain"
+                                                            : "current_guard"))));
+      if (!bound.rejection.empty())
+        bounds << ':' << bound.rejection;
+    }
+    std::string probe = "not_attempted";
+    if (dataflow.diagnosticProbe.attempted) {
+      if (dataflow.diagnosticProbe.hypothesisComplete && dataflow.diagnosticProbe.allTargetsValid) {
+        probe = "complete_valid";
+      } else if (dataflow.diagnosticProbe.mixedValidity) {
+        probe = "mixed_validity";
+      } else {
+        probe = "rejected:" + JoinStrings(dataflow.diagnosticProbe.rejections);
+      }
+    }
+    std::ostringstream reachingPaths;
+    for (size_t index = 0; index < dataflow.reachingDefinitionPaths.size(); ++index) {
+      if (index)
+        reachingPaths << ';';
+      const auto& path = dataflow.reachingDefinitionPaths[index];
+      reachingPaths << 'r' << static_cast<uint32_t>(path.registerIndex) << ':'
+                    << Hex(path.mergeAddress) << "<-" << Hex(path.predecessor) << ':'
+                    << path.normalizedExpression << ':' << path.disposition;
+    }
+    std::ostringstream exhaustedBudgets;
+    for (size_t index = 0; index < dataflow.exhaustedBudgets.size(); ++index) {
+      if (index)
+        exhaustedBudgets << ';';
+      const auto& budget = dataflow.exhaustedBudgets[index];
+      exhaustedBudgets << budget.budget << ':' << budget.limit << ':' << budget.observed;
+    }
+    std::ostringstream limitRetry;
+    if (site.limitRetry) {
+      limitRetry << site.limitRetry->exhaustedBudget << ':' << site.limitRetry->initialBudgetValue
+                 << "->" << site.limitRetry->retryBudgetValue
+                 << ":exact=" << (site.limitRetry->exactPriorTableMatch ? "true" : "false")
+                 << ":accepted=" << (site.limitRetry->accepted ? "true" : "false");
+    }
+    const std::string preliminaryBlock =
+        dataflow.preliminaryBlockStart
+            ? Hex(dataflow.preliminaryBlockStart) + "-" + Hex(dataflow.preliminaryBlockEnd)
+            : "";
     jumpCsv << Hex(site.site) << ',' << Hex(site.ownerAddress) << ','
             << IndirectSiteClassificationName(site.classification) << ','
             << (site.link ? "true" : "false") << ',' << (site.conditional ? "true" : "false") << ','
@@ -1926,7 +2290,23 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
             << (table ? Hex(table->storageEnd) : "") << ','
             << (table ? std::to_string(table->caseCount) : "") << ',' << CsvEscape(targets.str())
             << ',' << CsvEscape(failures.str()) << ','
-            << (table ? JumpTableManualComparisonName(table->manualComparison) : "") << '\n';
+            << (table ? JumpTableManualComparisonName(table->manualComparison) : "") << ','
+            << CsvEscape(dataflow.clusterId) << ','
+            << JumpTableSwitchLikelihoodName(dataflow.switchLikelihood) << ','
+            << CsvEscape(preliminaryBlock) << ',' << CsvEscape(predecessors.str()) << ','
+            << (dataflow.caseExpandedCfg ? "true" : "false") << ','
+            << (dataflow.sourceInScc ? "true" : "false") << ',' << CsvEscape(loopHeaders.str())
+            << ','
+            << (dataflow.ctrSourceRegister == 0xFF ? ""
+                                                   : std::to_string(dataflow.ctrSourceRegister))
+            << ',' << CsvEscape(dataflow.normalizedTargetExpression) << ','
+            << CsvEscape(JoinStrings(dataflow.indexTransformChain)) << ','
+            << (dataflow.elementWidth ? std::to_string(dataflow.elementWidth) : "") << ','
+            << dataflow.elementSignedness << ',' << dataflow.targetScale << ','
+            << CsvEscape(bounds.str()) << ',' << CsvEscape(probe) << ','
+            << CsvEscape(reachingPaths.str()) << ',' << CsvEscape(exhaustedBudgets.str()) << ','
+            << CsvEscape(limitRetry.str()) << ','
+            << CsvEscape(JoinStrings(dataflow.rejectionEvidence)) << '\n';
   }
   if (!WriteReportFile(outputDirectory / "jump-table-recovery.csv", jumpCsv.str())) {
     return Err(ErrorCategory::IO, "Unable to write jump-table-recovery.csv");
@@ -1935,10 +2315,13 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
 
   std::map<std::string, uint32_t> classifications;
   std::map<std::string, uint32_t> failures;
+  std::map<std::string, uint32_t> switchLikelihoods;
   for (const auto& site : report.jumpTableRecovery.indirectSites) {
     classifications[IndirectSiteClassificationName(site.classification)]++;
     for (auto failure : site.failures)
       failures[JumpTableFailureName(failure)]++;
+    if (site.usesCtr && !site.link)
+      switchLikelihoods[JumpTableSwitchLikelihoodName(JumpSiteDataflow(site).switchLikelihood)]++;
   }
   formatStarted = Clock::now();
   std::ostringstream jumpMarkdown;
@@ -1969,6 +2352,49 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
   jumpMarkdown << "\n## Unresolved reasons\n\n";
   for (const auto& [name, count] : failures)
     jumpMarkdown << "- `" << name << "`: " << count << "\n";
+  jumpMarkdown << "\n## Switch-likelihood census\n\n";
+  for (const auto& [name, count] : switchLikelihoods)
+    jumpMarkdown << "- `" << name << "`: " << count << "\n";
+  jumpMarkdown << "\n## Structural clusters\n\n"
+                  "| Cluster | Sites | Recovered | Unresolved | Likelihoods | Representatives | "
+                  "Blocks closure |\n"
+                  "|---|---:|---:|---:|---|---|---|\n";
+  for (const auto& cluster : report.jumpTableRecovery.clusters) {
+    std::ostringstream likelihoods;
+    for (const auto& [name, count] : cluster.switchLikelihoodCounts) {
+      if (likelihoods.tellp() > 0)
+        likelihoods << "; ";
+      likelihoods << name << '=' << count;
+    }
+    std::ostringstream representatives;
+    for (size_t index = 0; index < cluster.representativeSites.size(); ++index) {
+      if (index)
+        representatives << ' ';
+      representatives << '`' << Hex(cluster.representativeSites[index]) << '`';
+    }
+    jumpMarkdown << "| `" << MarkdownTableEscape(cluster.clusterId) << "` | " << cluster.siteCount
+                 << " | " << cluster.recoveredCount << " | " << cluster.unresolvedCount << " | `"
+                 << likelihoods.str() << "` | " << representatives.str() << " | "
+                 << (cluster.blocksPhase3Closure ? "yes" : "no") << " |\n";
+  }
+  jumpMarkdown << "\n## Structural-cluster evidence\n\n";
+  for (const auto& cluster : report.jumpTableRecovery.clusters) {
+    std::ostringstream failureCensus;
+    for (const auto& [name, count] : cluster.failureCounts) {
+      if (failureCensus.tellp() > 0)
+        failureCensus << "; ";
+      failureCensus << name << '=' << count;
+    }
+    jumpMarkdown << "### `" << cluster.clusterId << "`\n\n"
+                 << "- Normalized slice: `" << cluster.normalizedSlice << "`\n"
+                 << "- Failure census: `" << failureCensus.str() << "`\n"
+                 << "- Switch evidence: `" << JoinStrings(cluster.switchEvidence) << "`\n"
+                 << "- Proposed generic correction: " << cluster.proposedGenericCorrection << "\n"
+                 << "- Synthetic fixture: " << (cluster.syntheticFixtureExists ? "yes" : "no")
+                 << "\n"
+                 << "- Blocks Phase 3 closure: " << (cluster.blocksPhase3Closure ? "yes" : "no")
+                 << "\n\n";
+  }
   jumpMarkdown << "\n## Recovered tables\n\n"
                   "| Dispatch | Owner | Kind | Cases | Storage | Manual comparison |\n"
                   "|---|---|---|---:|---|---|\n";
@@ -1981,18 +2407,29 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
                  << Hex(table.tableAddress) << "-" << Hex(table.storageEnd) << "` | `"
                  << JumpTableManualComparisonName(table.manualComparison) << "` |\n";
   }
-  jumpMarkdown << "\n## Unresolved relevant CTR sites\n\n"
-                  "| Site | Owner | Classification | Reasons |\n"
-                  "|---|---|---|---|\n";
+  jumpMarkdown
+      << "\n## Unresolved relevant CTR sites\n\n"
+         "| Site | Owner | Classification | Reasons | Switch likelihood | Probe | Cluster |\n"
+         "|---|---|---|---|---|---|---|\n";
   for (const auto& site : report.jumpTableRecovery.indirectSites) {
     if (!site.usesCtr || site.link || site.selectedTable)
       continue;
+    const auto& dataflow = JumpSiteDataflow(site);
     std::ostringstream reasons;
     for (auto failure : site.failures)
       reasons << JumpTableFailureName(failure) << ' ';
+    std::string probe = "not attempted";
+    if (dataflow.diagnosticProbe.hypothesisComplete && dataflow.diagnosticProbe.allTargetsValid) {
+      probe = "complete valid table";
+    } else if (dataflow.diagnosticProbe.mixedValidity) {
+      probe = "mixed validity";
+    } else if (dataflow.diagnosticProbe.attempted) {
+      probe = JoinStrings(dataflow.diagnosticProbe.rejections);
+    }
     jumpMarkdown << "| `" << Hex(site.site) << "` | `" << Hex(site.ownerAddress) << "` | `"
                  << IndirectSiteClassificationName(site.classification) << "` | `" << reasons.str()
-                 << "` |\n";
+                 << "` | `" << JumpTableSwitchLikelihoodName(dataflow.switchLikelihood) << "` | "
+                 << probe << " | `" << MarkdownTableEscape(dataflow.clusterId) << "` |\n";
   }
   if (!WriteReportFile(outputDirectory / "jump-table-recovery.md", jumpMarkdown.str())) {
     return Err(ErrorCategory::IO, "Unable to write jump-table-recovery.md");

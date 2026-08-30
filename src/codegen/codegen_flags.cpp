@@ -87,7 +87,12 @@ REXCVAR_DEFINE_UINT32(jump_table_max_predecessors, 64, "Codegen",
     .range(1, 100000);
 
 REXCVAR_DEFINE_UINT32(jump_table_max_states, 512, "Codegen",
-                      "Max local dataflow/CFG states explored per indirect site")
+                      "Max local dataflow states explored per indirect site")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly)
+    .range(8, 1000000);
+
+REXCVAR_DEFINE_UINT32(jump_table_max_cfg_topology_nodes, 65536, "Codegen",
+                      "Max nodes in local jump-table CFG topology analysis")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)
     .range(8, 1000000);
 

@@ -2095,11 +2095,15 @@ BlockDiscoveryResult discoverBlocks(
   std::vector<Block> preliminaryBlocks;
   std::unordered_set<uint32_t> rejectedAutomaticSites;
   std::unordered_map<uint32_t, std::vector<JumpTableFailure>> rejectionReasons;
+  std::unordered_map<uint32_t, std::shared_ptr<JumpTableSiteDataflowEvidence>> rejectionDataflow;
+  std::unordered_map<uint32_t, std::vector<JumpTableLoopEvidence>> rejectionLoopEvidence;
+  std::unordered_map<uint32_t, std::optional<JumpTableLimitRetryEvidence>> rejectionLimitRetry;
   JumpTableRecoveryLimits limits;
   limits.maxBackwardInstructions = REXCVAR_GET(backward_scan_limit);
   limits.maxEntries = REXCVAR_GET(max_jump_table_entries);
   limits.maxPredecessors = REXCVAR_GET(jump_table_max_predecessors);
   limits.maxStates = REXCVAR_GET(jump_table_max_states);
+  limits.maxCfgTopologyNodes = REXCVAR_GET(jump_table_max_cfg_topology_nodes);
   limits.maxFixpointIterations = REXCVAR_GET(jump_table_fixpoint_iterations);
 
   for (uint32_t iteration = 1; iteration <= limits.maxFixpointIterations; ++iteration) {
@@ -2146,9 +2150,12 @@ BlockDiscoveryResult discoverBlocks(
       JumpTableRecoveryInput input;
       input.site = site;
       input.ownerAddress = entryPoint;
+      if (pdataSize != 0 && pdataSize <= std::numeric_limits<uint32_t>::max() - entryPoint)
+        input.trustedOwnerEnd = entryPoint + pdataSize;
       input.preliminaryBlocks = result.blocks;
       input.containingRegion = &containingRegion;
       input.independentlyCallableEntries = &knownFunctions;
+      input.validatedOwnerTables = &selectedTables;
       auto previous = selectedTables.find(site);
       if (previous != selectedTables.end() &&
           previous->second.origin == JumpTableOrigin::Automatic) {
@@ -2159,17 +2166,17 @@ BlockDiscoveryResult discoverBlocks(
       auto analysis = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input, &iterationStats);
       if (!analysis.selectedTable && previous != selectedTables.end() &&
           previous->second.origin == JumpTableOrigin::Automatic) {
-        if (analysis.incompleteCaseEntryPaths) {
-          JumpTable retained = previous->second;
-          retained.confidence = "validated_before_incomplete_case_entry_reanalysis";
-          analysis.automaticTable = retained;
-          analysis.selectedTable = std::move(retained);
-          analysis.failures.clear();
-          analysis.classification = IndirectSiteClassification::SwitchBctr;
-        } else {
-          rejectedAutomaticSites.insert(site);
-          rejectionReasons[site] = analysis.failures;
-        }
+        // A case-expanded CFG can expose a disconnected prior case root, but
+        // that diagnostic alone is not a proof that every newly reachable path
+        // preserves the table's bound and dataflow semantics. Only the normal
+        // analyzer or its exact-table maxStates retry may retain an automatic
+        // table. Quarantine every failed reanalysis so an incompatible or
+        // unguarded backedge cannot be masked by the prior validation.
+        rejectedAutomaticSites.insert(site);
+        rejectionReasons[site] = analysis.failures;
+        rejectionDataflow[site] = analysis.dataflow;
+        rejectionLoopEvidence[site] = analysis.loopEvidence;
+        rejectionLimitRetry[site] = analysis.limitRetry;
       }
       if (rejectedAutomaticSites.contains(site) && analysis.selectedTable &&
           analysis.selectedTable->origin == JumpTableOrigin::Automatic) {
@@ -2181,10 +2188,14 @@ BlockDiscoveryResult discoverBlocks(
         analysis.selectedTable.reset();
         analysis.failures = rejectionReasons[site];
         analysis.classification = IndirectSiteClassification::ComputedTailBctr;
+        analysis.dataflow = rejectionDataflow[site];
+        analysis.loopEvidence = rejectionLoopEvidence[site];
+        analysis.limitRetry = rejectionLimitRetry[site];
       }
       if (analysis.selectedTable) {
         nextTables[site] = *analysis.selectedTable;
       }
+      FinalizeJumpTableSiteDisposition(analysis);
       analyses.push_back(std::move(analysis));
     }
 
