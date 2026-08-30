@@ -37,6 +37,11 @@ uint32_t B(uint32_t site, uint32_t target) {
   return 0x48000000u | (static_cast<uint32_t>(displacement) & 0x03FFFFFCu);
 }
 
+uint32_t Addi(uint8_t rt, uint8_t ra, int16_t immediate) {
+  return 0x38000000u | (static_cast<uint32_t>(rt) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         static_cast<uint16_t>(immediate);
+}
+
 uint32_t Rlwinm(uint8_t ra, uint8_t rs, uint8_t sh, uint8_t mb, uint8_t me) {
   return 0x54000000u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16) |
          (static_cast<uint32_t>(sh) << 11) | (static_cast<uint32_t>(mb) << 6) |
@@ -354,6 +359,46 @@ TEST_CASE("jump-table recovery reports unknown index and ambiguous bounds",
   CHECK(HasFailure(ambiguous, JumpTableFailure::AmbiguousBound));
 }
 
+TEST_CASE("jump-table recovery selects the bound on a normalized local index",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, 0x28030005);  // outer cmplwi r3, 5
+  StoreBe32(image.text, 0x04, Bc(kTextBase + 0x04, kTextBase + 0x34, 12, 1));
+  StoreBe32(image.text, 0x08, Addi(3, 3, -3));
+  StoreBe32(image.text, 0x0C, 0x28030002);  // normalized cmplwi r3, 2
+  StoreBe32(image.text, 0x10, Bc(kTextBase + 0x10, kTextBase + 0x34, 12, 1));
+  StoreBe32(image.text, 0x14, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x18, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x1C, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x20, Mtctr(5));
+  StoreBe32(image.text, 0x24, 0x4E800420);  // bctr
+
+  auto analysis = Analyze(image, kTextBase + 0x24);
+  REQUIRE(analysis.selectedTable);
+  CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AmbiguousBound));
+  CHECK(analysis.selectedTable->boundValue == 2);
+  CHECK(analysis.selectedTable->caseCount == 3);
+}
+
+TEST_CASE("jump-table recovery coalesces exact-equivalent dominating bounds",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, 0x28030002);  // cmplwi r3, 2
+  StoreBe32(image.text, 0x04, Bc(kTextBase + 0x04, kTextBase + 0x34, 12, 1));
+  StoreBe32(image.text, 0x08, 0x28030002);  // equivalent repeated guard
+  StoreBe32(image.text, 0x0C, Bc(kTextBase + 0x0C, kTextBase + 0x34, 12, 1));
+  StoreBe32(image.text, 0x10, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x14, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x18, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x1C, Mtctr(5));
+  StoreBe32(image.text, 0x20, 0x4E800420);  // bctr
+
+  auto analysis = Analyze(image, kTextBase + 0x20);
+  REQUIRE(analysis.selectedTable);
+  CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AmbiguousBound));
+  CHECK(analysis.selectedTable->caseCount == 3);
+}
+
 TEST_CASE("jump-table recovery reports target validation failures without accepting prefixes",
           "[codegen][jump-table]") {
   AbsoluteSwitch image;
@@ -507,7 +552,7 @@ TEST_CASE("jump-table recovery uses an exact transformed index despite ambiguous
   StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 12, 2));
   StoreBe32(image.text, 0x04, 0x38600000);  // li r3, 0
   StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
-  StoreBe32(image.text, 0x0C, 0x38600002);             // li r3, 2
+  StoreBe32(image.text, 0x0C, 0x38600002);               // li r3, 2
   StoreBe32(image.text, 0x10, Rlwinm(8, 3, 31, 1, 31));  // local transformed index
   StoreBe32(image.text, 0x14, 0x28080002);               // cmplwi r8, 2
   StoreBe32(image.text, 0x18, Bc(kTextBase + 0x18, kTextBase + 0x30, 12, 1));
@@ -518,6 +563,28 @@ TEST_CASE("jump-table recovery uses an exact transformed index despite ambiguous
   StoreBe32(image.text, 0x2C, 0x4E800420);  // bctr
 
   auto analysis = Analyze(image, kTextBase + 0x2C);
+  REQUIRE(analysis.selectedTable);
+  CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
+  CHECK(analysis.selectedTable->caseCount == 3);
+  CHECK(analysis.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
+}
+
+TEST_CASE("jump-table recovery preserves a bounded merged index", "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 12, 2));
+  StoreBe32(image.text, 0x04, Addi(3, 0, 0));
+  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
+  StoreBe32(image.text, 0x0C, Addi(3, 0, 2));
+  StoreBe32(image.text, 0x10, 0x28030002);  // cmplwi r3, 2
+  StoreBe32(image.text, 0x14, Bc(kTextBase + 0x14, kTextBase + 0x34, 12, 1));
+  StoreBe32(image.text, 0x18, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x1C, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x20, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x24, Mtctr(5));
+  StoreBe32(image.text, 0x28, 0x4E800420);  // bctr
+
+  auto analysis = Analyze(image, kTextBase + 0x28);
   REQUIRE(analysis.selectedTable);
   CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
   CHECK(analysis.selectedTable->caseCount == 3);
@@ -537,6 +604,7 @@ TEST_CASE("jump-table recovery reports ambiguous CFG reaching definitions",
   StoreBe32(image.text, 0x1C, Mtctr(5));
   StoreBe32(image.text, 0x20, 0x4E800420);
   auto analysis = Analyze(image, kTextBase + 0x20);
+  INFO(FailureNames(analysis));
   CHECK_FALSE(analysis.selectedTable);
   CHECK(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
 }
@@ -701,6 +769,99 @@ TEST_CASE("jump-table recovery reports an analysis safety limit", "[codegen][jum
   auto analysis = Analyze(image, kTextBase + 0x18, nullptr, limits);
   CHECK_FALSE(analysis.selectedTable);
   CHECK(HasFailure(analysis, JumpTableFailure::AnalysisLimit));
+}
+
+TEST_CASE("jump-table recovery accepts an exact local addi index after ambiguous live-ins",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 4, 2));
+  StoreBe32(image.text, 0x04, Addi(6, 0, 7));
+  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
+  StoreBe32(image.text, 0x0C, Addi(6, 0, 9));
+  StoreBe32(image.text, 0x10, Addi(3, 6, -1));
+  StoreBe32(image.text, 0x14, 0x28030002);  // cmplwi r3, 2
+  StoreBe32(image.text, 0x18, Bc(kTextBase + 0x18, kTextBase + 0x34, 12, 1));
+  StoreBe32(image.text, 0x1C, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x20, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x24, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x28, Mtctr(5));
+  StoreBe32(image.text, 0x2C, 0x4E800420);  // bctr
+
+  auto analysis = Analyze(image, kTextBase + 0x2C);
+  REQUIRE(analysis.selectedTable);
+  CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
+  CHECK(analysis.selectedTable->indexRegister == 3);
+  CHECK(analysis.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
+}
+
+TEST_CASE("jump-table recovery accepts an exact local loaded index after ambiguous bases",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 4, 2));
+  StoreBe32(image.text, 0x04, Addi(6, 0, 7));
+  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
+  StoreBe32(image.text, 0x0C, Addi(6, 0, 9));
+  StoreBe32(image.text, 0x10, 0x88660000);  // lbz r3, 0(r6)
+  StoreBe32(image.text, 0x14, 0x28030002);  // cmplwi r3, 2
+  StoreBe32(image.text, 0x18, Bc(kTextBase + 0x18, kTextBase + 0x34, 12, 1));
+  StoreBe32(image.text, 0x1C, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x20, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x24, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x28, Mtctr(5));
+  StoreBe32(image.text, 0x2C, 0x4E800420);  // bctr
+
+  auto analysis = Analyze(image, kTextBase + 0x2C);
+  REQUIRE(analysis.selectedTable);
+  CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
+  CHECK(analysis.selectedTable->indexRegister == 3);
+  CHECK(analysis.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
+}
+
+TEST_CASE("jump-table recovery does not equate different local index definitions",
+          "[codegen][jump-table]") {
+  SECTION("addi") {
+    AbsoluteSwitch image;
+    StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 4, 2));
+    StoreBe32(image.text, 0x04, Addi(6, 0, 7));
+    StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
+    StoreBe32(image.text, 0x0C, Addi(6, 0, 9));
+    StoreBe32(image.text, 0x10, Addi(3, 6, -1));
+    StoreBe32(image.text, 0x14, 0x28030002);  // cmplwi r3, 2
+    StoreBe32(image.text, 0x18, Bc(kTextBase + 0x18, kTextBase + 0x38, 12, 1));
+    StoreBe32(image.text, 0x1C, Addi(7, 6, -2));  // different local transform
+    StoreBe32(image.text, 0x20, 0x3C802000);      // lis r4, table@h
+    StoreBe32(image.text, 0x24, Rlwinm(7, 7, 2, 0, 29));
+    StoreBe32(image.text, 0x28, Lwzx(5, 4, 7));
+    StoreBe32(image.text, 0x2C, Mtctr(5));
+    StoreBe32(image.text, 0x30, 0x4E800420);  // bctr
+
+    auto analysis = Analyze(image, kTextBase + 0x30);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(HasFailure(analysis, JumpTableFailure::UnknownIndex));
+  }
+
+  SECTION("load") {
+    AbsoluteSwitch image;
+    StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x0C, 4, 2));
+    StoreBe32(image.text, 0x04, Addi(6, 0, 7));
+    StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x10));
+    StoreBe32(image.text, 0x0C, Addi(6, 0, 9));
+    StoreBe32(image.text, 0x10, 0x88660000);  // lbz r3, 0(r6)
+    StoreBe32(image.text, 0x14, 0x28030002);  // cmplwi r3, 2
+    StoreBe32(image.text, 0x18, Bc(kTextBase + 0x18, kTextBase + 0x38, 12, 1));
+    StoreBe32(image.text, 0x1C, 0x88E60001);  // different local load address
+    StoreBe32(image.text, 0x20, 0x3C802000);  // lis r4, table@h
+    StoreBe32(image.text, 0x24, Rlwinm(7, 7, 2, 0, 29));
+    StoreBe32(image.text, 0x28, Lwzx(5, 4, 7));
+    StoreBe32(image.text, 0x2C, Mtctr(5));
+    StoreBe32(image.text, 0x30, 0x4E800420);  // bctr
+
+    auto analysis = Analyze(image, kTextBase + 0x30);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(HasFailure(analysis, JumpTableFailure::UnknownIndex));
+  }
 }
 
 TEST_CASE("block discovery expands recovered switch cases before final boundaries",

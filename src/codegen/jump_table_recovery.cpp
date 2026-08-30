@@ -41,6 +41,7 @@ enum class ExprKind : uint8_t {
   Constant,
   InputRegister,
   SymbolicDefinition,
+  MergedValue,
   Add,
   ShiftLeft,
   Load,
@@ -58,6 +59,7 @@ struct Expr {
   uint32_t origin = 0;
   ExprPtr lhs;
   ExprPtr rhs;
+  std::vector<ExprPtr> alternatives;
 };
 
 ExprPtr MakeUnknown() {
@@ -82,6 +84,13 @@ ExprPtr MakeSymbolicDefinition(uint32_t origin) {
   auto expression = std::make_shared<Expr>();
   expression->kind = ExprKind::SymbolicDefinition;
   expression->origin = origin;
+  return expression;
+}
+
+ExprPtr MakeMergedValue(std::vector<ExprPtr> alternatives) {
+  auto expression = std::make_shared<Expr>();
+  expression->kind = ExprKind::MergedValue;
+  expression->alternatives = std::move(alternatives);
   return expression;
 }
 
@@ -117,6 +126,15 @@ std::string ExprKey(const ExprPtr& expression) {
       return "r" + std::to_string(expression->reg);
     case ExprKind::SymbolicDefinition:
       return "d" + std::to_string(expression->origin);
+    case ExprKind::MergedValue: {
+      std::string key = "p(";
+      for (size_t index = 0; index < expression->alternatives.size(); ++index) {
+        if (index)
+          key += ',';
+        key += ExprKey(expression->alternatives[index]);
+      }
+      return key + ')';
+    }
     case ExprKind::Add: {
       auto lhs = ExprKey(expression->lhs);
       auto rhs = ExprKey(expression->rhs);
@@ -231,7 +249,8 @@ class LocalCfg {
     if (!contains(owner_) || !contains(candidate) || !contains(target))
       return false;
     // If target remains reachable from the owner after removing candidate,
-    // candidate does not dominate it.
+    // candidate does not dominate it. Callers must treat a query limit as an
+    // incomplete proof even though Reaches returns false in that case.
     return !Reaches(owner_, target, candidate, limits, limitHit);
   }
 
@@ -388,8 +407,8 @@ class Resolver {
     }
 
     if (alternatives.size() != 1) {
-      merged.expression = MakeUnknown();
-      merged.ambiguous = true;
+      bool preciseMerge = true;
+      std::vector<ExprPtr> mergedExpressions;
       size_t completeAlternatives = 0;
       bool hasIncompleteAlternative = false;
       for (auto& [unused, result] : alternatives) {
@@ -399,10 +418,23 @@ class Resolver {
           ++completeAlternatives;
         }
         merged.limitHit = merged.limitHit || result.limitHit;
+        preciseMerge = preciseMerge && !result.ambiguous && !result.limitHit &&
+                       !result.incompleteCaseEntryPath && !IsUnknown(result.expression);
+        mergedExpressions.push_back(result.expression);
         merged.evidence.insert(merged.evidence.end(), result.evidence.begin(),
                                result.evidence.end());
       }
-      merged.incompleteCaseEntryPath = completeAlternatives == 1 && hasIncompleteAlternative;
+      if (preciseMerge) {
+        // A path merge is not inherently ambiguous: a dominating bound can
+        // constrain the merged register value before the table consumes it.
+        // Keep the exact, deterministically ordered reaching alternatives so
+        // only the same merge can satisfy that bound.
+        merged.expression = MakeMergedValue(std::move(mergedExpressions));
+      } else {
+        merged.expression = MakeUnknown();
+        merged.ambiguous = true;
+        merged.incompleteCaseEntryPath = completeAlternatives == 1 && hasIncompleteAlternative;
+      }
     } else {
       merged = std::move(alternatives.begin()->second);
     }
@@ -433,9 +465,24 @@ class Resolver {
         if (instruction.D.RA == 0) {
           result.expression = MakeConstant(static_cast<uint32_t>(instruction.D.SIMM()));
         } else {
-          result.expression = MakeBinary(
-              ExprKind::Add, operand(static_cast<uint8_t>(instruction.D.RA)),
-              MakeConstant(static_cast<uint32_t>(instruction.D.SIMM())), instruction.address);
+          auto source = ResolveBefore(static_cast<uint8_t>(instruction.D.RA), instruction.address);
+          if (source.ambiguous || source.limitHit || IsUnknown(source.expression)) {
+            // A bound and table load that both consume this exact local addi
+            // definition do not need the value of its live-in. Preserve the
+            // definition identity instead of rejecting a switch because the
+            // incoming value crosses a large or reentrant CFG. Separately
+            // recomputed additions have different origins and remain rejected.
+            result.expression = MakeSymbolicDefinition(instruction.address);
+          } else {
+            result.ambiguous = source.ambiguous;
+            result.limitHit = source.limitHit;
+            result.incompleteCaseEntryPath = source.incompleteCaseEntryPath;
+            result.evidence.insert(result.evidence.end(), source.evidence.begin(),
+                                   source.evidence.end());
+            result.expression = MakeBinary(
+                ExprKind::Add, source.expression,
+                MakeConstant(static_cast<uint32_t>(instruction.D.SIMM())), instruction.address);
+          }
         }
         break;
       }
@@ -485,9 +532,8 @@ class Resolver {
         if (instruction.M.MB == 0 && instruction.M.SH <= 31 &&
             instruction.M.ME == 31 - instruction.M.SH) {
           result.expression =
-              MakeUnary(ExprKind::ShiftLeft,
-                        operand(static_cast<uint8_t>(instruction.M.RS)), instruction.M.SH, 0,
-                        instruction.address);
+              MakeUnary(ExprKind::ShiftLeft, operand(static_cast<uint8_t>(instruction.M.RS)),
+                        instruction.M.SH, 0, instruction.address);
         } else if (instruction.M.SH == 0 && instruction.M.ME == 31) {
           // clrlwi preserves the index lineage. Its range is considered by
           // bound recovery; it is not itself sufficient authority for a table.
@@ -514,8 +560,29 @@ class Resolver {
       case Opcode::lbz: {
         const uint8_t width =
             instruction.opcode == Opcode::lwz ? 4 : (instruction.opcode == Opcode::lhz ? 2 : 1);
-        ExprPtr base = instruction.D.RA == 0 ? MakeConstant(0)
-                                             : operand(static_cast<uint8_t>(instruction.D.RA));
+        ExprPtr base;
+        if (instruction.D.RA == 0) {
+          base = MakeConstant(0);
+        } else {
+          auto resolvedBase =
+              ResolveBefore(static_cast<uint8_t>(instruction.D.RA), instruction.address);
+          if (resolvedBase.ambiguous || resolvedBase.limitHit ||
+              IsUnknown(resolvedBase.expression)) {
+            // As with a local arithmetic transform, the exact result of this
+            // load can be the bounded index even when its address live-in is
+            // path-dependent. Keep its definition identity; this cannot stand
+            // in for another load and cannot make an unknown table base
+            // evaluable.
+            result.expression = MakeSymbolicDefinition(instruction.address);
+            break;
+          }
+          result.ambiguous = resolvedBase.ambiguous;
+          result.limitHit = resolvedBase.limitHit;
+          result.incompleteCaseEntryPath = resolvedBase.incompleteCaseEntryPath;
+          result.evidence.insert(result.evidence.end(), resolvedBase.evidence.begin(),
+                                 resolvedBase.evidence.end());
+          base = resolvedBase.expression;
+        }
         auto address = MakeBinary(ExprKind::Add, base,
                                   MakeConstant(static_cast<uint32_t>(instruction.D.SIMM())),
                                   instruction.address);
@@ -692,8 +759,13 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
     const auto* compare = decoded.get(address);
     if (!compare || (compare->opcode != Opcode::cmpli && compare->opcode != Opcode::cmpi))
       continue;
-    if (!cfg.Dominates(address, site, limits, limitHit))
+    bool candidateLimit = false;
+    const bool dominates = cfg.Dominates(address, site, limits, &candidateLimit);
+    if (candidateLimit || !dominates) {
+      if (candidateLimit && limitHit)
+        *limitHit = true;
       continue;
+    }
 
     // The guard is normally immediately after the compare. Permit a bounded
     // linear schedule of intervening instructions, but never cross another
@@ -731,14 +803,21 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
     bool defaultIsReturn = false;
     if (guard->opcode == Opcode::bclr || guard->opcode == Opcode::bclrl) {
       defaultIsReturn = true;
-      fallthroughReachesSite = cfg.Reaches(guard->address + 4, site, address, limits, limitHit);
+      fallthroughReachesSite =
+          cfg.Reaches(guard->address + 4, site, address, limits, &candidateLimit);
     } else if (guard->branch_target) {
       // Judge the two successors for this dynamic guard occurrence. A default
       // path may loop through the compare and reach the dispatch in a later
       // iteration after recomputing the index; that does not make it a case
       // path for the current bounded transfer.
-      takenReachesSite = cfg.Reaches(*guard->branch_target, site, address, limits, limitHit);
-      fallthroughReachesSite = cfg.Reaches(guard->address + 4, site, address, limits, limitHit);
+      takenReachesSite = cfg.Reaches(*guard->branch_target, site, address, limits, &candidateLimit);
+      fallthroughReachesSite =
+          cfg.Reaches(guard->address + 4, site, address, limits, &candidateLimit);
+    }
+    if (candidateLimit) {
+      if (limitHit)
+        *limitHit = true;
+      continue;
     }
     if (takenReachesSite == fallthroughReachesSite)
       continue;
@@ -772,6 +851,8 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
       continue;
 
     auto resolved = resolver.Resolve(candidate.indexRegister, address);
+    if (resolved.limitHit && limitHit)
+      *limitHit = true;
     if (resolved.ambiguous || resolved.limitHit || IsUnknown(resolved.expression))
       continue;
     candidate.indexExpression = resolved.expression;
@@ -860,9 +941,19 @@ Evaluation Evaluate(const ExprPtr& expression, const std::string& indexKey, uint
     case ExprKind::Unknown:
     case ExprKind::InputRegister:
     case ExprKind::SymbolicDefinition:
+    case ExprKind::MergedValue:
       return {};
   }
   return {};
+}
+
+bool ContainsUnevaluatedMerge(const ExprPtr& expression, const std::string& indexKey) {
+  if (!expression || ExprKey(expression) == indexKey)
+    return false;
+  if (expression->kind == ExprKind::MergedValue)
+    return true;
+  return ContainsUnevaluatedMerge(expression->lhs, indexKey) ||
+         ContainsUnevaluatedMerge(expression->rhs, indexKey);
 }
 
 const Expr* FindPrimaryLoad(const ExprPtr& expression, const std::string& indexKey) {
@@ -1127,7 +1218,8 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       if (stats)
         stats->analysisLimitHit = true;
     }
-    if (target.ambiguous) {
+    if (target.ambiguous ||
+        (target.expression && target.expression->kind == ExprKind::MergedValue)) {
       AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
       analysis.incompleteCaseEntryPaths = target.incompleteCaseEntryPath;
     } else if (IsUnknown(target.expression) || !ContainsLoad(target.expression)) {
@@ -1135,9 +1227,10 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       analysis.classification = IndirectSiteClassification::ComputedTailBctr;
     } else {
       auto bounds = FindBounds(decoded, cfg, resolver, input.site, input.limits, &limitHit);
-      // A bounded reachability query can encounter an unrelated loop after a
-      // complete dominating bound has already been found. Preserve that valid
-      // result, but make a truncated, unsuccessful bound search explicit.
+      // Candidate-specific dominance and path limits reject that candidate in
+      // FindBounds. A broad backward census can still encounter an unrelated
+      // loop after a complete bound has been proven; retain that proof only
+      // when the search did produce a bound.
       if (limitHit && bounds.empty()) {
         AddFailure(analysis, JumpTableFailure::AnalysisLimit);
         if (stats)
@@ -1148,7 +1241,54 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
         if (ContainsExpression(target.expression, ExprKey(bound.indexExpression)))
           matchingBounds.push_back(std::move(bound));
       }
+      if (matchingBounds.size() > 1) {
+        // Repeated loop guards can provide the same proof. Coalesce only
+        // bounds whose index expression, range, and default edge are exact;
+        // retain the closest proof for deterministic evidence.
+        std::map<std::string, BoundCandidate> equivalentBounds;
+        for (auto& bound : matchingBounds) {
+          const std::string key =
+              ExprKey(bound.indexExpression) + ":" + std::to_string(bound.value) + ":" +
+              std::to_string(bound.caseCount) + ":" + std::to_string(bound.inclusive) + ":" +
+              std::to_string(bound.defaultTarget) + ":" + std::to_string(bound.defaultIsReturn);
+          auto existing = equivalentBounds.find(key);
+          if (existing == equivalentBounds.end() ||
+              existing->second.compareAddress < bound.compareAddress) {
+            equivalentBounds[key] = std::move(bound);
+          }
+        }
+        matchingBounds.clear();
+        for (auto& [unused, bound] : equivalentBounds)
+          matchingBounds.push_back(std::move(bound));
+
+        // An outer range check and a later bound on a normalized index both
+        // occur in common compiler output. If one bounded expression strictly
+        // contains another, the more-derived expression is the value that the
+        // table load consumes. Incomparable or conflicting proofs remain
+        // ambiguous.
+        std::vector<bool> shadowed(matchingBounds.size(), false);
+        for (size_t derived = 0; derived < matchingBounds.size(); ++derived) {
+          const std::string derivedKey = ExprKey(matchingBounds[derived].indexExpression);
+          for (size_t ancestor = 0; ancestor < matchingBounds.size(); ++ancestor) {
+            if (derived == ancestor)
+              continue;
+            const std::string ancestorKey = ExprKey(matchingBounds[ancestor].indexExpression);
+            if (derivedKey != ancestorKey &&
+                ContainsExpression(matchingBounds[derived].indexExpression, ancestorKey)) {
+              shadowed[ancestor] = true;
+            }
+          }
+        }
+        std::vector<BoundCandidate> mostDerivedBounds;
+        for (size_t index = 0; index < matchingBounds.size(); ++index) {
+          if (!shadowed[index])
+            mostDerivedBounds.push_back(std::move(matchingBounds[index]));
+        }
+        matchingBounds = std::move(mostDerivedBounds);
+      }
       if (matchingBounds.empty()) {
+        if (ContainsUnevaluatedMerge(target.expression, ""))
+          AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
         AddFailure(analysis, bounds.empty() ? JumpTableFailure::MissingBound
                                             : JumpTableFailure::UnknownIndex);
       } else if (matchingBounds.size() != 1) {
@@ -1157,8 +1297,12 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
         auto& bound = matchingBounds.front();
         const std::string indexKey = ExprKey(bound.indexExpression);
         const Expr* primaryLoad = FindPrimaryLoad(target.expression, indexKey);
-        if (!primaryLoad ||
-            (primaryLoad->width != 1 && primaryLoad->width != 2 && primaryLoad->width != 4)) {
+        if (ContainsUnevaluatedMerge(target.expression, indexKey)) {
+          // A precise merge is safe only when it is the bounded index. A
+          // path-dependent table base or anchor remains unresolved.
+          AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
+        } else if (!primaryLoad || (primaryLoad->width != 1 && primaryLoad->width != 2 &&
+                                    primaryLoad->width != 4)) {
           AddFailure(analysis, JumpTableFailure::InvalidElementWidth);
         } else {
           JumpTable table;
