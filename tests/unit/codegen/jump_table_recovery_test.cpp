@@ -575,7 +575,9 @@ TEST_CASE("case-expanded CFG limit retry requires an exact previously validated 
   decoded.decode();
   const Block expandedBlock{kTextBase, 0x200};
   JumpTableRecoveryLimits truncatedLimits;
-  truncatedLimits.maxBackwardInstructions = 64;
+  // The proportional retry (4 instructions) still cannot reach the guard;
+  // the bounded final retry must reproduce the exact prior table.
+  truncatedLimits.maxBackwardInstructions = 1;
   JumpTableRecoveryInput input{
       .site = kTextBase + 0x160,
       .ownerAddress = kTextBase,

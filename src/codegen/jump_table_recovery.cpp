@@ -1389,13 +1389,6 @@ IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
     return static_cast<uint32_t>(std::min<uint64_t>(grown, ceiling));
   };
 
-  JumpTableRecoveryInput retryInput = input;
-  retryInput.limits.maxBackwardInstructions =
-      growLimit(input.limits.maxBackwardInstructions, 4, 10000);
-  retryInput.limits.maxPredecessors = growLimit(input.limits.maxPredecessors, 2, 100000);
-  retryInput.limits.maxStates = growLimit(input.limits.maxStates, 8, 1000000);
-
-  auto retry = AnalyzeIndirectSite(decoded, retryInput, stats);
   auto sameRawEntries = [](const std::vector<JumpTableRawEntry>& lhs,
                            const std::vector<JumpTableRawEntry>& rhs) {
     if (lhs.size() != rhs.size())
@@ -1423,33 +1416,67 @@ IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
            sameRawEntries(lhs.rawEntries, rhs.rawEntries);
   };
 
-  const bool accepted = retry.selectedTable &&
-                        retry.selectedTable->origin == JumpTableOrigin::Automatic &&
-                        retry.automaticTable &&
-                        sameSemanticTable(*retry.selectedTable, *input.priorAutomaticTable);
-  if (stats) {
-    // Both analyses contribute real elapsed and decoded-instruction work, but
-    // together they still classify one site and have one final resolution.
-    if (stats->indirectSites > 0)
-      --stats->indirectSites;
+  uint32_t retryCount = 0;
+  uint32_t unresolvedAttempts = 1;
+  uint32_t recoveredAttempts = 0;
+  auto normalizeStats = [&](bool accepted) {
+    if (!stats)
+      return;
+    stats->indirectSites -= std::min(stats->indirectSites, retryCount);
+    const uint32_t expectedUnresolved = accepted ? 0 : 1;
+    const uint32_t excessUnresolved = unresolvedAttempts - expectedUnresolved;
+    stats->unresolvedSites -= std::min(stats->unresolvedSites, excessUnresolved);
+    const uint32_t expectedRecovered = accepted ? 1 : 0;
+    const uint32_t excessRecovered = recoveredAttempts - expectedRecovered;
+    stats->recoveredTables -= std::min(stats->recoveredTables, excessRecovered);
+  };
+
+  JumpTableRecoveryLimits retryLimits = input.limits;
+  for (uint32_t attempt = 0; attempt < 2; ++attempt) {
+    JumpTableRecoveryInput retryInput = input;
+    if (attempt == 0) {
+      retryLimits.maxBackwardInstructions =
+          growLimit(input.limits.maxBackwardInstructions, 4, 10000);
+      retryLimits.maxPredecessors = growLimit(input.limits.maxPredecessors, 2, 100000);
+      retryLimits.maxStates = growLimit(input.limits.maxStates, 8, 1000000);
+    } else {
+      // A large case-expanded owner may exceed the proportional retry even
+      // though the site-local idiom remains exact. The final attempt is still
+      // hard-bounded and may only reproduce the prior fully validated table.
+      retryLimits.maxBackwardInstructions = 10000;
+      retryLimits.maxPredecessors = 100000;
+      retryLimits.maxStates = 1000000;
+    }
+    retryInput.limits = retryLimits;
+
+    auto retry = AnalyzeIndirectSite(decoded, retryInput, stats);
+    ++retryCount;
+    if (retry.selectedTable)
+      ++recoveredAttempts;
+    else
+      ++unresolvedAttempts;
+
+    const bool accepted = retry.selectedTable &&
+                          retry.selectedTable->origin == JumpTableOrigin::Automatic &&
+                          retry.automaticTable &&
+                          sameSemanticTable(*retry.selectedTable, *input.priorAutomaticTable);
     if (accepted) {
-      if (stats->unresolvedSites > 0)
-        --stats->unresolvedSites;
-    } else if (retry.selectedTable) {
-      if (stats->recoveredTables > 0)
-        --stats->recoveredTables;
-    } else if (stats->unresolvedSites > 0) {
-      --stats->unresolvedSites;
+      normalizeStats(true);
+      retry.automaticTable->confidence = "validated_after_expanded_cfg_limit_retry";
+      retry.selectedTable->confidence = "validated_after_expanded_cfg_limit_retry";
+      return retry;
+    }
+
+    if (retry.selectedTable ||
+        std::find(retry.failures.begin(), retry.failures.end(),
+                  JumpTableFailure::AnalysisLimit) == retry.failures.end()) {
+      normalizeStats(false);
+      return analysis;
     }
   }
 
-  if (!accepted) {
-    return analysis;
-  }
-
-  retry.automaticTable->confidence = "validated_after_expanded_cfg_limit_retry";
-  retry.selectedTable->confidence = "validated_after_expanded_cfg_limit_retry";
-  return retry;
+  normalizeStats(false);
+  return analysis;
 }
 
 }  // namespace rex::codegen
