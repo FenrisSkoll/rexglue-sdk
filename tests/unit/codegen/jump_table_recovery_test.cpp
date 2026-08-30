@@ -467,7 +467,7 @@ TEST_CASE("jump-table recovery accepts a delayed guard with preserved condition 
   for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
     StoreBe32(image.text, offset, 0x60000000);  // nop
   StoreBe32(image.text, 0x00, 0x28030002);      // cmplwi r3, 2
-  StoreBe32(image.text, 0x04, 0x80C40000);      // lwz r6, 0(r4)
+  StoreBe32(image.text, 0x04, 0x100B61CB);      // stvx128 v64, r11, r12 (not Rc)
   StoreBe32(image.text, 0x08, 0x90C40000);      // stw r6, 0(r4)
   StoreBe32(image.text, 0x0C, 0x80E40004);      // lwz r7, 4(r4)
   StoreBe32(image.text, 0x10, 0x90E40004);      // stw r7, 4(r4)
