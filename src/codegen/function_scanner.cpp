@@ -2149,14 +2149,27 @@ BlockDiscoveryResult discoverBlocks(
       input.preliminaryBlocks = result.blocks;
       input.containingRegion = &containingRegion;
       input.independentlyCallableEntries = &knownFunctions;
+      auto previous = selectedTables.find(site);
+      if (previous != selectedTables.end() &&
+          previous->second.origin == JumpTableOrigin::Automatic) {
+        input.priorAutomaticTable = &previous->second;
+      }
       input.manualTable = manual;
       input.limits = limits;
       auto analysis = AnalyzeIndirectSite(decoded, input, &iterationStats);
-      auto previous = selectedTables.find(site);
       if (!analysis.selectedTable && previous != selectedTables.end() &&
           previous->second.origin == JumpTableOrigin::Automatic) {
-        rejectedAutomaticSites.insert(site);
-        rejectionReasons[site] = analysis.failures;
+        if (analysis.incompleteCaseEntryPaths) {
+          JumpTable retained = previous->second;
+          retained.confidence = "validated_before_incomplete_case_entry_reanalysis";
+          analysis.automaticTable = retained;
+          analysis.selectedTable = std::move(retained);
+          analysis.failures.clear();
+          analysis.classification = IndirectSiteClassification::SwitchBctr;
+        } else {
+          rejectedAutomaticSites.insert(site);
+          rejectionReasons[site] = analysis.failures;
+        }
       }
       if (rejectedAutomaticSites.contains(site) && analysis.selectedTable &&
           analysis.selectedTable->origin == JumpTableOrigin::Automatic) {

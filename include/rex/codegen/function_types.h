@@ -351,6 +351,7 @@ struct IndirectSiteAnalysis {
   std::vector<JumpTableInstructionEvidence> evidence;
   std::optional<JumpTable> automaticTable;
   std::optional<JumpTable> selectedTable;
+  bool incompleteCaseEntryPaths = false;
 };
 
 struct JumpTableRecoveryLimits {

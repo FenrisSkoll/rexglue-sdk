@@ -134,12 +134,12 @@ struct AbsoluteSwitch {
 };
 
 IndirectSiteAnalysis Analyze(AbsoluteSwitch& image, uint32_t site = kTextBase + 0x18,
-                             const JumpTable* manual = nullptr,
-                             JumpTableRecoveryLimits limits = {}) {
+                             const JumpTable* manual = nullptr, JumpTableRecoveryLimits limits = {},
+                             uint32_t blockSize = 0x80) {
   auto view = image.view();
   DecodedBinary decoded(view);
   decoded.decode();
-  const Block block{kTextBase, 0x80};
+  const Block block{kTextBase, blockSize};
   const auto* region = decoded.regionContaining(kTextBase);
   REQUIRE(region != nullptr);
   JumpTableRecoveryInput input;
@@ -447,8 +447,8 @@ TEST_CASE("jump-table recovery preserves a bounded index defined by srawi",
   JumpTableRecoveryLimits limits;
   limits.maxStates = 16;
   auto analysis = Analyze(image, kTextBase + 0x34, nullptr, limits);
-  REQUIRE(analysis.selectedTable);
   CHECK_FALSE(HasFailure(analysis, JumpTableFailure::AnalysisLimit));
+  REQUIRE(analysis.selectedTable);
   CHECK(analysis.selectedTable->caseCount == 3);
   CHECK(analysis.selectedTable->tableAddress == kTableBase);
   CHECK(analysis.selectedTable->targets ==
@@ -458,6 +458,47 @@ TEST_CASE("jump-table recovery preserves a bounded index defined by srawi",
                       return evidence.address == kTextBase + 0x10 &&
                              evidence.role == "reaching_definition";
                     }));
+}
+
+TEST_CASE("jump-table recovery accepts a delayed guard with preserved condition state",
+          "[codegen][jump-table]") {
+  AbsoluteSwitch image;
+  image.text.resize(0x200);
+  for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
+    StoreBe32(image.text, offset, 0x60000000);  // nop
+  StoreBe32(image.text, 0x00, 0x28030002);      // cmplwi r3, 2
+  StoreBe32(image.text, 0x04, 0x80C40000);      // lwz r6, 0(r4)
+  StoreBe32(image.text, 0x08, 0x90C40000);      // stw r6, 0(r4)
+  StoreBe32(image.text, 0x0C, 0x80E40004);      // lwz r7, 4(r4)
+  StoreBe32(image.text, 0x10, 0x90E40004);      // stw r7, 4(r4)
+  StoreBe32(image.text, 0x14, 0x81040008);      // lwz r8, 8(r4)
+  StoreBe32(image.text, 0x18, 0x91040008);      // stw r8, 8(r4)
+  StoreBe32(image.text, 0x1C, Bc(kTextBase + 0x1C, kTextBase + 0x1F0, 12, 1));
+  StoreBe32(image.text, 0x150, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x154, Rlwinm(3, 3, 2, 0, 29));
+  StoreBe32(image.text, 0x158, Lwzx(5, 4, 3));
+  StoreBe32(image.text, 0x15C, Mtctr(5));
+  StoreBe32(image.text, 0x160, 0x4E800420);  // bctr
+  StoreBe32(image.text, 0x180, 0x4E800020);  // blr
+  StoreBe32(image.text, 0x190, 0x4E800020);  // blr
+  StoreBe32(image.text, 0x1A0, 0x4E800020);  // blr
+  StoreBe32(image.text, 0x1F0, 0x4E800020);  // default: blr
+  StoreBe32(image.table, 0x00, kTextBase + 0x180);
+  StoreBe32(image.table, 0x04, kTextBase + 0x190);
+  StoreBe32(image.table, 0x08, kTextBase + 0x1A0);
+
+  JumpTableRecoveryLimits truncatedLimits;
+  truncatedLimits.maxBackwardInstructions = 64;
+  auto truncated = Analyze(image, kTextBase + 0x160, nullptr, truncatedLimits, 0x200);
+  CHECK_FALSE(truncated.selectedTable);
+  CHECK(HasFailure(truncated, JumpTableFailure::AnalysisLimit));
+
+  auto analysis = Analyze(image, kTextBase + 0x160, nullptr, {}, 0x200);
+  REQUIRE(analysis.selectedTable);
+  CHECK(analysis.selectedTable->caseCount == 3);
+  CHECK(analysis.selectedTable->defaultTarget == kTextBase + 0x1F0);
+  CHECK(analysis.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x180, kTextBase + 0x190, kTextBase + 0x1A0});
 }
 
 TEST_CASE("jump-table recovery reports ambiguous CFG reaching definitions",
@@ -694,6 +735,43 @@ TEST_CASE("case expansion exposes and recovers another indirect site at fixpoint
   CHECK(result.labels.contains(kTextBase + 0xA0));
 }
 
+TEST_CASE("case expansion preserves a switch with an equivalent guarded loop",
+          "[codegen][jump-table][integration]") {
+  AbsoluteSwitch image;
+  StoreBe32(image.text, 0x00, 0x80660000);  // lwz r3, 0(r6)
+  StoreBe32(image.text, 0x04, 0x28030002);  // cmplwi r3, 2
+  StoreBe32(image.text, 0x08, Bc(kTextBase + 0x08, kTextBase + 0x30, 12, 1));
+  StoreBe32(image.text, 0x0C, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x10, Mr(7, 3));
+  StoreBe32(image.text, 0x14, Rlwinm(7, 7, 2, 0, 29));
+  StoreBe32(image.text, 0x18, Lwzx(5, 4, 7));
+  StoreBe32(image.text, 0x1C, Mtctr(5));
+  StoreBe32(image.text, 0x20, 0x4E800420);  // bctr
+  StoreBe32(image.text, 0x40, 0x80660000);  // lwz r3, 0(r6)
+  StoreBe32(image.text, 0x44, 0x28030002);  // cmplwi r3, 2
+  StoreBe32(image.text, 0x48, Bc(kTextBase + 0x48, kTextBase + 0x30, 12, 1));
+  StoreBe32(image.text, 0x4C, B(kTextBase + 0x4C, kTextBase + 0x0C));
+
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+  const std::unordered_set<uint32_t> functions{kTextBase};
+  auto result = discoverBlocks(decoded, kTextBase, *region, functions, 0x80);
+  auto dispatch = std::find_if(result.indirectSites.begin(), result.indirectSites.end(),
+                               [](const auto& site) { return site.site == kTextBase + 0x20; });
+  REQUIRE(dispatch != result.indirectSites.end());
+  CHECK_FALSE(HasFailure(*dispatch, JumpTableFailure::AmbiguousReachingDefinition));
+  CHECK_FALSE(HasFailure(*dispatch, JumpTableFailure::AmbiguousBound));
+  CHECK_FALSE(HasFailure(*dispatch, JumpTableFailure::MissingBound));
+  REQUIRE(result.jumpTables.size() == 1);
+  CHECK(result.jumpTableRecovery.fixpointIterations == 2);
+  CHECK(result.jumpTableRecovery.recoveredTables == 1);
+  CHECK(result.jumpTables[0].targets ==
+        std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
+}
+
 TEST_CASE("independent callable evidence keeps a case as a separate function entry",
           "[codegen][jump-table][integration]") {
   AbsoluteSwitch image;
@@ -714,7 +792,8 @@ TEST_CASE("independent callable evidence keeps a case as a separate function ent
 TEST_CASE("a table invalidated by expanded CFG is quarantined instead of oscillating",
           "[codegen][jump-table][integration]") {
   AbsoluteSwitch image;
-  StoreBe32(image.text, 0x40, B(kTextBase + 0x40, kTextBase + 0x14));
+  StoreBe32(image.text, 0x40, 0x38A00000);  // li r5, 0: conflict with table load
+  StoreBe32(image.text, 0x44, B(kTextBase + 0x44, kTextBase + 0x14));
   auto view = image.view();
   DecodedBinary decoded(view);
   decoded.decode();

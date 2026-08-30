@@ -71,7 +71,7 @@ REXCVAR_DEFINE_UINT32(max_seh_scope_entries, 100, "Codegen",
 // Codegen/Discovery
 //=============================================================================
 
-REXCVAR_DEFINE_UINT32(backward_scan_limit, 64, "Codegen",
+REXCVAR_DEFINE_UINT32(backward_scan_limit, 96, "Codegen",
                       "Max instructions to scan backward for jump table patterns")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)
     .range(1, 10000);

@@ -28,6 +28,7 @@ struct JumpTableRecoveryInput {
   const CodeRegion* containingRegion = nullptr;
   const std::unordered_set<uint32_t>* independentlyCallableEntries = nullptr;
   const std::unordered_set<uint32_t>* knownIndirectSites = nullptr;
+  const JumpTable* priorAutomaticTable = nullptr;
   const JumpTable* manualTable = nullptr;
   JumpTableRecoveryLimits limits;
 };

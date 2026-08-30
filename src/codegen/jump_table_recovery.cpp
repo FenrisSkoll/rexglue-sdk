@@ -312,14 +312,19 @@ struct ResolveResult {
   ExprPtr expression;
   bool ambiguous = false;
   bool limitHit = false;
+  bool incompleteCaseEntryPath = false;
   std::vector<JumpTableInstructionEvidence> evidence;
 };
 
 class Resolver {
  public:
   Resolver(DecodedBinary& decoded, const LocalCfg& cfg, const JumpTableRecoveryLimits& limits,
-           JumpTableRecoveryStats* stats)
-      : decoded_(decoded), cfg_(cfg), limits_(limits), stats_(stats) {}
+           const JumpTable* priorAutomaticTable, JumpTableRecoveryStats* stats)
+      : decoded_(decoded),
+        cfg_(cfg),
+        limits_(limits),
+        priorAutomaticTable_(priorAutomaticTable),
+        stats_(stats) {}
 
   ResolveResult Resolve(uint8_t reg, uint32_t before) {
     active_.clear();
@@ -328,6 +333,12 @@ class Resolver {
   }
 
  private:
+  bool IsPriorCaseEntry(uint32_t address) const {
+    return priorAutomaticTable_ &&
+           std::find(priorAutomaticTable_->targets.begin(), priorAutomaticTable_->targets.end(),
+                     address) != priorAutomaticTable_->targets.end();
+  }
+
   ResolveResult ResolveBefore(uint8_t reg, uint32_t before) {
     ResolveResult merged;
     std::map<std::string, ResolveResult> alternatives;
@@ -347,6 +358,7 @@ class Resolver {
     const auto& predecessors = cfg_.predecessors(before);
     if (predecessors.empty()) {
       merged.expression = MakeInputRegister(reg);
+      merged.incompleteCaseEntryPath = IsPriorCaseEntry(before);
       active_.erase(key);
       return merged;
     }
@@ -366,17 +378,31 @@ class Resolver {
         result = ResolveBefore(reg, predecessor);
       }
       const std::string expressionKey = ExprKey(result.expression);
-      alternatives.try_emplace(expressionKey, std::move(result));
+      auto alternative = alternatives.find(expressionKey);
+      if (alternative == alternatives.end()) {
+        alternatives.emplace(expressionKey, std::move(result));
+      } else {
+        alternative->second.incompleteCaseEntryPath =
+            alternative->second.incompleteCaseEntryPath && result.incompleteCaseEntryPath;
+      }
     }
 
     if (alternatives.size() != 1) {
       merged.expression = MakeUnknown();
       merged.ambiguous = true;
+      size_t completeAlternatives = 0;
+      bool hasIncompleteAlternative = false;
       for (auto& [unused, result] : alternatives) {
+        if (result.incompleteCaseEntryPath) {
+          hasIncompleteAlternative = true;
+        } else {
+          ++completeAlternatives;
+        }
         merged.limitHit = merged.limitHit || result.limitHit;
         merged.evidence.insert(merged.evidence.end(), result.evidence.begin(),
                                result.evidence.end());
       }
+      merged.incompleteCaseEntryPath = completeAlternatives == 1 && hasIncompleteAlternative;
     } else {
       merged = std::move(alternatives.begin()->second);
     }
@@ -394,6 +420,8 @@ class Resolver {
       auto resolved = ResolveBefore(reg, instruction.address);
       result.ambiguous = result.ambiguous || resolved.ambiguous;
       result.limitHit = result.limitHit || resolved.limitHit;
+      result.incompleteCaseEntryPath =
+          result.incompleteCaseEntryPath || resolved.incompleteCaseEntryPath;
       result.evidence.insert(result.evidence.end(), resolved.evidence.begin(),
                              resolved.evidence.end());
       return resolved.expression;
@@ -523,6 +551,7 @@ class Resolver {
   DecodedBinary& decoded_;
   const LocalCfg& cfg_;
   const JumpTableRecoveryLimits& limits_;
+  const JumpTable* priorAutomaticTable_ = nullptr;
   JumpTableRecoveryStats* stats_;
   uint32_t visitedStates_ = 0;
   std::unordered_set<uint64_t> active_;
@@ -553,6 +582,26 @@ std::optional<bool> BranchWhenCrBitTrue(const Instruction& instruction) {
 uint8_t BranchConditionBit(const Instruction& instruction) {
   return static_cast<uint8_t>(
       (instruction.format == ppc::InstrFormat::kB ? instruction.B.BI : instruction.XL.BI) % 4);
+}
+
+bool MayWriteConditionRegister(const Instruction& instruction) {
+  if (instruction.is_record_form())
+    return true;
+  switch (instruction.opcode) {
+    case Opcode::cmp:
+    case Opcode::cmpi:
+    case Opcode::cmpl:
+    case Opcode::cmpli:
+    case Opcode::fcmpu:
+    case Opcode::fcmpo:
+    case Opcode::mtcr:
+    case Opcode::addic_:
+    case Opcode::andi_:
+    case Opcode::andis_:
+      return true;
+    default:
+      return false;
+  }
 }
 
 std::vector<uint32_t> BackwardReachable(const LocalCfg& cfg, uint32_t site,
@@ -640,19 +689,23 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
     if (!cfg.Dominates(address, site, limits, limitHit))
       continue;
 
-    // The guard is normally immediately after the compare. Permit intervening
-    // non-branch instructions, but never cross another CR-writing compare.
+    // The guard is normally immediately after the compare. Permit a bounded
+    // linear schedule of intervening instructions, but never cross another
+    // control transfer, unknown opcode, or condition-register write.
     const Instruction* guard = nullptr;
+    constexpr uint32_t kMaxGuardLookaheadInstructions = 16;
     for (uint32_t cursor = address + 4;
-         cursor < site && cursor <= address + 16 && cfg.contains(cursor); cursor += 4) {
+         cursor < site && cursor <= address + kMaxGuardLookaheadInstructions * 4 &&
+         cfg.contains(cursor);
+         cursor += 4) {
       const auto* instruction = decoded.get(cursor);
       if (!instruction)
         break;
-      if (instruction->opcode == Opcode::cmp || instruction->opcode == Opcode::cmpi ||
-          instruction->opcode == Opcode::cmpl || instruction->opcode == Opcode::cmpli)
+      if (instruction->opcode == Opcode::kUnknown || MayWriteConditionRegister(*instruction))
         break;
-      if (instruction->is_branch() && instruction->is_conditional()) {
-        guard = instruction;
+      if (instruction->is_branch()) {
+        if (instruction->is_conditional())
+          guard = instruction;
         break;
       }
     }
@@ -1038,7 +1091,7 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
   }
 
   LocalCfg cfg(decoded, input.preliminaryBlocks, input.ownerAddress);
-  Resolver resolver(decoded, cfg, input.limits, stats);
+  Resolver resolver(decoded, cfg, input.limits, input.priorAutomaticTable, stats);
 
   bool limitHit = false;
   auto ctrDefinitions =
@@ -1070,11 +1123,20 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
     }
     if (target.ambiguous) {
       AddFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition);
+      analysis.incompleteCaseEntryPaths = target.incompleteCaseEntryPath;
     } else if (IsUnknown(target.expression) || !ContainsLoad(target.expression)) {
       AddFailure(analysis, JumpTableFailure::UnknownTableBase);
       analysis.classification = IndirectSiteClassification::ComputedTailBctr;
     } else {
       auto bounds = FindBounds(decoded, cfg, resolver, input.site, input.limits, &limitHit);
+      // A bounded reachability query can encounter an unrelated loop after a
+      // complete dominating bound has already been found. Preserve that valid
+      // result, but make a truncated, unsuccessful bound search explicit.
+      if (limitHit && bounds.empty()) {
+        AddFailure(analysis, JumpTableFailure::AnalysisLimit);
+        if (stats)
+          stats->analysisLimitHit = true;
+      }
       std::vector<BoundCandidate> matchingBounds;
       for (auto& bound : bounds) {
         if (ContainsExpression(target.expression, ExprKey(bound.indexExpression)))
