@@ -387,6 +387,17 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
   indirect.classification = IndirectSiteClassification::ComputedTailBctr;
   indirect.usesCtr = true;
   indirect.failures = {JumpTableFailure::MissingBound};
+  indirect.limitRetry = JumpTableLimitRetryEvidence{
+      .exhaustedBudget = "max_states",
+      .initialBudgetValue = 64,
+      .retryBudgetValue = 2048,
+      .initialFailures = {JumpTableFailure::AnalysisLimit},
+      .retryFailures = {},
+      .initialExhaustedBudgets = {{"max_states", 64, 65}},
+      .retryExhaustedBudgets = {},
+      .exactPriorTableMatch = true,
+      .accepted = true,
+  };
   indirect.loopEvidence.push_back({.registerIndex = 11,
                                    .headerAddress = kTextBase + 0x10,
                                    .entryDefinitionAddresses = {kTextBase},
@@ -530,6 +541,15 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
     CHECK(jumpReport.at("analyzer_version") == "3.0.0");
     REQUIRE(jumpReport.at("indirect_sites").size() == 1);
     const auto& site = jumpReport.at("indirect_sites").front();
+    CHECK(site.at("limit_retry").at("exhausted_budget") == "max_states");
+    CHECK(site.at("limit_retry").at("initial_failures") ==
+          nlohmann::json::array({"analysis_limit"}));
+    CHECK(site.at("limit_retry").at("retry_failures") == nlohmann::json::array());
+    CHECK(site.at("limit_retry").at("initial_exhausted_budgets").front().at("budget") ==
+          "max_states");
+    CHECK(site.at("limit_retry").at("initial_exhausted_budgets").front().at("limit") == 64);
+    CHECK(site.at("limit_retry").at("initial_exhausted_budgets").front().at("observed") == 65);
+    CHECK(site.at("limit_retry").at("retry_exhausted_budgets") == nlohmann::json::array());
     CHECK(site.at("loop_evidence").front().at("register") == 11);
     CHECK(site.at("dataflow").at("switch_likelihood") == "insufficient_static_evidence");
     CHECK(site.at("dataflow").at("table_load_input_registers") == nlohmann::json::array({7}));
@@ -581,6 +601,8 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
                           std::istreambuf_iterator<char>());
     CHECK(csv.find("entry_register_domains") != std::string::npos);
     CHECK(csv.find("budget=max_states:64:65") != std::string::npos);
+    CHECK(csv.find("initial_failures=analysis_limit:retry_failures=") != std::string::npos);
+    CHECK(csv.find("initial_exhausted=max_states:64:65:retry_exhausted=") != std::string::npos);
   }
   fs::remove_all(directory);
 }

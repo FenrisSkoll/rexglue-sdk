@@ -2148,6 +2148,12 @@ BlockDiscoveryResult discoverBlocks(
       }
     }
     JumpTableRecoveryStats iterationStats;
+    struct PendingInlineBootstrap {
+      size_t analysisIndex = 0;
+      uint32_t site = 0;
+      JumpTable candidate;
+    };
+    std::vector<PendingInlineBootstrap> pendingInlineBootstraps;
 
     for (uint32_t site : sites) {
       const JumpTable* manual = nullptr;
@@ -2177,7 +2183,18 @@ BlockDiscoveryResult discoverBlocks(
       }
       input.manualTable = manual;
       input.limits = limits;
-      auto analysis = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input, &iterationStats);
+      JumpTableRecoveryInput analysisInput = input;
+      if (input.priorAutomaticTable && !input.priorAutomaticTable->boundValueIsFiniteIndexDomain &&
+          input.priorAutomaticTable->boundSemantics ==
+              "self_delimiting_inline_absolute_table_extent") {
+        // The discovery pass has already materialised every currently selected
+        // case block. Revalidating a storage-only table must use that ordinary
+        // CFG without also treating unrelated selected-table edges as an index
+        // domain or multiplying resolver states.
+        analysisInput.validatedOwnerTables = nullptr;
+      }
+      auto analysis =
+          AnalyzeIndirectSiteWithPriorLimitRetry(decoded, analysisInput, &iterationStats);
 
       // A self-delimiting inline table can describe a state-machine loop whose
       // backedge is invisible until that same table's case edges are present.
@@ -2188,11 +2205,25 @@ BlockDiscoveryResult discoverBlocks(
           analysis.failures.size() == 1 &&
           (analysis.failures.front() == JumpTableFailure::AmbiguousReachingDefinition ||
            analysis.failures.front() == JumpTableFailure::AnalysisLimit);
-      const bool onlyResolverStateBudgetExhausted =
+      const bool resolverStateBudgetExhausted =
+          analysis.dataflow &&
+          std::any_of(analysis.dataflow->exhaustedBudgets.begin(),
+                      analysis.dataflow->exhaustedBudgets.end(),
+                      [](const auto& exhaustion) { return exhaustion.budget == "max_states"; });
+      const bool onlyCompatibleBootstrapBudgets =
           analysis.dataflow &&
           std::all_of(analysis.dataflow->exhaustedBudgets.begin(),
                       analysis.dataflow->exhaustedBudgets.end(),
-                      [](const auto& exhaustion) { return exhaustion.budget == "max_states"; });
+                      [](const auto& exhaustion) {
+                        return exhaustion.budget == "max_states" ||
+                               exhaustion.budget == "bound_census_max_states" ||
+                               exhaustion.budget == "bound_recovery_max_states" ||
+                               exhaustion.budget == "bound_census_max_backward_instructions" ||
+                               exhaustion.budget == "bound_recovery_max_backward_instructions";
+                      }) &&
+          exactBootstrapFailure &&
+          (analysis.failures.front() == JumpTableFailure::AmbiguousReachingDefinition ||
+           resolverStateBudgetExhausted);
       const JumpTable* reportOnlyCandidate =
           analysis.dataflow && analysis.dataflow->diagnosticProbe.reportOnly &&
                   analysis.dataflow->diagnosticProbe.hypothesisComplete &&
@@ -2210,7 +2241,7 @@ BlockDiscoveryResult discoverBlocks(
           reportOnlyCandidate->targets.size() == reportOnlyCandidate->caseCount &&
           reportOnlyCandidate->rawEntries.size() == reportOnlyCandidate->caseCount;
       if (previous == selectedTables.end() && !analysis.selectedTable && exactBootstrapFailure &&
-          onlyResolverStateBudgetExhausted && exactInlineCandidate) {
+          onlyCompatibleBootstrapBudgets && exactInlineCandidate) {
         const JumpTable candidate = *reportOnlyCandidate;
         auto provisionalTables = selectedTables;
         provisionalTables.emplace(site, candidate);
@@ -2238,8 +2269,15 @@ BlockDiscoveryResult discoverBlocks(
                           return bound.selfDelimitedInlineTableExtent &&
                                  bound.inlineCaseLoopCfgVerified;
                         });
+        const bool exactLimitRetry = provisional.limitRetry && provisional.limitRetry->accepted &&
+                                     provisional.limitRetry->exactPriorTableMatch &&
+                                     provisional.limitRetry->exhaustedBudget == "max_states" &&
+                                     provisional.limitRetry->initialFailures ==
+                                         std::vector{JumpTableFailure::AnalysisLimit} &&
+                                     provisional.limitRetry->retryFailures.empty();
         const bool accepted =
-            provisional.selectedTable && provisional.automaticTable && loopProof &&
+            provisional.selectedTable && provisional.automaticTable &&
+            (loopProof || exactLimitRetry) &&
             JumpTableRecoveryTablesExactlyMatch(*provisional.selectedTable, candidate) &&
             JumpTableRecoveryTablesExactlyMatch(*provisional.automaticTable, candidate);
         if (accepted) {
@@ -2257,6 +2295,8 @@ BlockDiscoveryResult discoverBlocks(
           analysis.dataflow->rejectionEvidence.push_back(
               "provisional_inline_case_expansion:" +
               (failures.empty() ? std::string("exact_case_loop_not_proven") : failures));
+          pendingInlineBootstraps.push_back(
+              {.analysisIndex = analyses.size(), .site = site, .candidate = candidate});
         }
       }
       if (!analysis.selectedTable && previous != selectedTables.end() &&
@@ -2292,6 +2332,147 @@ BlockDiscoveryResult discoverBlocks(
       }
       FinalizeJumpTableSiteDisposition(analysis);
       analyses.push_back(std::move(analysis));
+    }
+
+    // Some compiler-generated owners contain a mutually dependent group of
+    // self-delimiting inline tables: each complete report-only candidate is
+    // needed only to expose blocks that let every member undergo ordinary
+    // exact reanalysis. Bootstrap the complete group together, but make the
+    // group atomic—one failure leaves every candidate report-only. This avoids
+    // a one-target-at-a-time recovery loop without granting authority to any
+    // provisional edge or partial table.
+    if (pendingInlineBootstraps.size() > 1) {
+      auto batchTables = selectedTables;
+      for (const auto& pending : pendingInlineBootstraps)
+        batchTables.emplace(pending.site, pending.candidate);
+
+      const auto batchCfgStarted = Clock::now();
+      auto batchBlocks = discoverBlocksPass(decoded, entryPoint, containingRegion, knownFunctions,
+                                            pdataSize, &batchTables);
+      aggregate.caseExpansionCfgMicroseconds += elapsedMicroseconds(batchCfgStarted);
+
+      std::vector<IndirectSiteAnalysis> batchAnalyses;
+      batchAnalyses.reserve(pendingInlineBootstraps.size());
+      bool batchAccepted = true;
+      for (const auto& pending : pendingInlineBootstraps) {
+        JumpTableRecoveryInput batchInput;
+        batchInput.site = pending.site;
+        batchInput.ownerAddress = entryPoint;
+        if (pdataSize != 0 && pdataSize <= std::numeric_limits<uint32_t>::max() - entryPoint)
+          batchInput.trustedOwnerEnd = entryPoint + pdataSize;
+        batchInput.preliminaryBlocks = batchBlocks.blocks;
+        batchInput.containingRegion = &containingRegion;
+        batchInput.independentlyCallableEntries = &knownFunctions;
+        // The provisional group is authority only for block discovery. The
+        // storage-only revalidation consumes the resulting ordinary CFG, not
+        // synthetic edges from either provisional or previously selected
+        // tables; those edges are runtime-domain evidence only when a separate
+        // inherited-domain proof requests them.
+        batchInput.validatedOwnerTables = nullptr;
+        if (entryRegisterDomainsBySite) {
+          const auto domains = entryRegisterDomainsBySite->find(pending.site);
+          if (domains != entryRegisterDomainsBySite->end())
+            batchInput.entryRegisterDomains = &domains->second;
+        }
+        batchInput.priorAutomaticTable = &pending.candidate;
+        batchInput.limits = limits;
+
+        JumpTableRecoveryStats batchStats;
+        auto batchAnalysis =
+            AnalyzeIndirectSiteWithPriorLimitRetry(decoded, batchInput, &batchStats);
+        iterationStats.elapsedMicroseconds += batchStats.elapsedMicroseconds;
+        iterationStats.decodedInstructions += batchStats.decodedInstructions;
+        iterationStats.analysisLimitHit =
+            iterationStats.analysisLimitHit || batchStats.analysisLimitHit;
+
+        const bool loopProof =
+            batchAnalysis.dataflow &&
+            std::any_of(batchAnalysis.dataflow->boundCandidates.begin(),
+                        batchAnalysis.dataflow->boundCandidates.end(), [](const auto& bound) {
+                          return bound.selfDelimitedInlineTableExtent &&
+                                 bound.inlineCaseLoopCfgVerified;
+                        });
+        const bool exactLimitRetry = batchAnalysis.limitRetry &&
+                                     batchAnalysis.limitRetry->accepted &&
+                                     batchAnalysis.limitRetry->exactPriorTableMatch &&
+                                     batchAnalysis.limitRetry->exhaustedBudget == "max_states" &&
+                                     batchAnalysis.limitRetry->initialFailures ==
+                                         std::vector{JumpTableFailure::AnalysisLimit} &&
+                                     batchAnalysis.limitRetry->retryFailures.empty();
+        const bool exact =
+            batchAnalysis.selectedTable && batchAnalysis.automaticTable &&
+            (loopProof || exactLimitRetry) &&
+            JumpTableRecoveryTablesExactlyMatch(*batchAnalysis.selectedTable, pending.candidate) &&
+            JumpTableRecoveryTablesExactlyMatch(*batchAnalysis.automaticTable, pending.candidate);
+        batchAccepted = batchAccepted && exact;
+        batchAnalyses.push_back(std::move(batchAnalysis));
+      }
+
+      if (batchAccepted) {
+        for (size_t index = 0; index < pendingInlineBootstraps.size(); ++index) {
+          const auto& pending = pendingInlineBootstraps[index];
+          if (iterationStats.unresolvedSites > 0)
+            --iterationStats.unresolvedSites;
+          ++iterationStats.recoveredTables;
+          nextTables[pending.site] = *batchAnalyses[index].selectedTable;
+          analyses[pending.analysisIndex] = std::move(batchAnalyses[index]);
+          rejectedAutomaticSites.erase(pending.site);
+          rejectionReasons.erase(pending.site);
+          rejectionDataflow.erase(pending.site);
+          rejectionLoopEvidence.erase(pending.site);
+          rejectionLimitRetry.erase(pending.site);
+          FinalizeJumpTableSiteDisposition(analyses[pending.analysisIndex]);
+        }
+      } else {
+        for (size_t index = 0; index < pendingInlineBootstraps.size(); ++index) {
+          auto& original = analyses[pendingInlineBootstraps[index].analysisIndex];
+          if (!original.dataflow)
+            continue;
+          std::string failures;
+          for (auto failure : batchAnalyses[index].failures) {
+            if (!failures.empty())
+              failures += '+';
+            failures += JumpTableFailureName(failure);
+          }
+          std::string budgets;
+          if (batchAnalyses[index].dataflow) {
+            for (const auto& exhausted : batchAnalyses[index].dataflow->exhaustedBudgets) {
+              if (!budgets.empty())
+                budgets += '+';
+              budgets += exhausted.budget + ':' + std::to_string(exhausted.limit) + ':' +
+                         std::to_string(exhausted.observed);
+            }
+          }
+          std::string retry;
+          if (batchAnalyses[index].limitRetry) {
+            retry =
+                ":retry=" + std::to_string(batchAnalyses[index].limitRetry->initialBudgetValue) +
+                "->" + std::to_string(batchAnalyses[index].limitRetry->retryBudgetValue) +
+                ":accepted=" + std::to_string(batchAnalyses[index].limitRetry->accepted) +
+                ":exact=" + std::to_string(batchAnalyses[index].limitRetry->exactPriorTableMatch) +
+                ":retry_failures=";
+            for (auto failure : batchAnalyses[index].limitRetry->retryFailures) {
+              if (!retry.ends_with('='))
+                retry += '+';
+              retry += JumpTableFailureName(failure);
+            }
+            retry += ":retry_exhausted=";
+            bool firstRetryBudget = true;
+            for (const auto& exhausted : batchAnalyses[index].limitRetry->retryExhaustedBudgets) {
+              if (!firstRetryBudget)
+                retry += '+';
+              firstRetryBudget = false;
+              retry += exhausted.budget + ':' + std::to_string(exhausted.limit) + ':' +
+                       std::to_string(exhausted.observed);
+            }
+          }
+          original.dataflow->rejectionEvidence.push_back(
+              "provisional_inline_batch_expansion:" +
+              (failures.empty() ? std::string("group_not_exact") : failures) +
+              (budgets.empty() ? std::string() : ":budgets=" + budgets) + retry);
+          FinalizeJumpTableSiteDisposition(original);
+        }
+      }
     }
 
     const auto fixpointOverheadStarted = Clock::now();
@@ -2343,10 +2524,26 @@ BlockDiscoveryResult discoverBlocks(
   result.jumpTableLimits = limits;
   result.preliminaryBlocks = std::move(preliminaryBlocks);
   for (auto& site : result.indirectSites) {
+    if (site.dataflow) {
+      const JumpTableBudgetExhaustionEvidence exhaustion{"function_fixpoint_iterations",
+                                                         limits.maxFixpointIterations,
+                                                         limits.maxFixpointIterations + 1};
+      const auto existing = std::find_if(
+          site.dataflow->exhaustedBudgets.begin(), site.dataflow->exhaustedBudgets.end(),
+          [&](const auto& candidate) { return candidate.budget == exhaustion.budget; });
+      if (existing == site.dataflow->exhaustedBudgets.end())
+        site.dataflow->exhaustedBudgets.push_back(exhaustion);
+      if (std::find(site.dataflow->rejectionEvidence.begin(),
+                    site.dataflow->rejectionEvidence.end(),
+                    "function_fixpoint_limit") == site.dataflow->rejectionEvidence.end()) {
+        site.dataflow->rejectionEvidence.push_back("function_fixpoint_limit");
+      }
+    }
     if (std::find(site.failures.begin(), site.failures.end(), JumpTableFailure::AnalysisLimit) ==
         site.failures.end()) {
       site.failures.push_back(JumpTableFailure::AnalysisLimit);
     }
+    FinalizeJumpTableSiteDisposition(site);
   }
   return result;
 }

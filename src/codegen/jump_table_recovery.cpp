@@ -24,6 +24,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -355,6 +356,9 @@ JumpTableInstructionEvidence Evidence(const Instruction& instruction, std::strin
 }
 
 bool WritesRegister(const Instruction& instruction, uint8_t reg);
+std::optional<bool> BranchWhenCrBitTrue(const Instruction& instruction);
+uint8_t BranchConditionBit(const Instruction& instruction);
+bool MayWriteConditionRegister(const Instruction& instruction);
 
 class LocalCfg {
  public:
@@ -860,6 +864,267 @@ class Resolver {
     if (definition)
       it->second.expression = MakeConstant(definition->value, definition->address);
     return it->second;
+  }
+
+  ResolveResult ResolveGuardedFinitePathDomain(uint8_t reg, uint32_t before) {
+    ResolveResult proof;
+    std::set<std::string> rejections;
+    const auto reject = [&](std::string reason) { rejections.insert(std::move(reason)); };
+    const auto finishRejected = [&]() {
+      for (const auto& rejection : rejections)
+        proof.alternatives.push_back("guarded_path_domain_rejected:" + rejection);
+      return proof;
+    };
+    bool topologyLimit = false;
+    if (cfg_.IsInCycle(before, limits_, &topologyLimit)) {
+      reject("use_is_in_cfg_cycle");
+      return finishRejected();
+    }
+    if (topologyLimit) {
+      proof.limitHit = true;
+      reject("cfg_topology_limit");
+      return finishRejected();
+    }
+
+    struct State {
+      uint32_t address = 0;
+      uint32_t successor = 0;
+      uint32_t depth = 0;
+      bool hasDomain = false;
+      std::vector<uint32_t> domain;
+      std::vector<JumpTableInstructionEvidence> evidence;
+    };
+    struct CompletedPath {
+      uint32_t definition = 0;
+      std::vector<uint32_t> domain;
+      std::vector<JumpTableInstructionEvidence> evidence;
+    };
+
+    const auto finiteConstraintForEdge = [&](const Instruction& guard, uint32_t successor)
+        -> std::optional<std::pair<std::vector<uint32_t>, const Instruction*>> {
+      if (!guard.is_conditional() || guard.format != ppc::InstrFormat::kB || !guard.branch_target) {
+        return std::nullopt;
+      }
+      const bool taken = successor == *guard.branch_target;
+      const bool fallthrough = successor == guard.address + 4;
+      if (taken == fallthrough)
+        return std::nullopt;
+      const auto branchTrue = BranchWhenCrBitTrue(guard);
+      if (!branchTrue)
+        return std::nullopt;
+      const bool conditionTrue = taken ? *branchTrue : !*branchTrue;
+      const uint8_t conditionBit = BranchConditionBit(guard);
+      const uint8_t guardCr = static_cast<uint8_t>(guard.B.BI / 4);
+
+      const Instruction* compare = nullptr;
+      uint32_t cursor = guard.address;
+      constexpr uint32_t kMaxCompareDistance = 16;
+      for (uint32_t distance = 0; distance < kMaxCompareDistance; ++distance) {
+        const auto& predecessors = cfg_.predecessors(cursor);
+        if (predecessors.size() != 1 || predecessors.front() + 4 != cursor)
+          break;
+        cursor = predecessors.front();
+        const auto* instruction = decoded_.get(cursor);
+        if (!instruction)
+          break;
+        if (MayWriteConditionRegister(*instruction)) {
+          if ((instruction->opcode == Opcode::cmpi || instruction->opcode == Opcode::cmpli) &&
+              static_cast<uint8_t>(instruction->D.RT >> 2) == guardCr) {
+            compare = instruction;
+          }
+          break;
+        }
+        if (instruction->is_branch())
+          break;
+      }
+      if (!compare || static_cast<uint8_t>(compare->D.RA) != reg)
+        return std::nullopt;
+
+      std::vector<uint32_t> values;
+      if (conditionBit == 2 && conditionTrue) {
+        const uint32_t value = compare->opcode == Opcode::cmpli
+                                   ? compare->D.UIMM()
+                                   : static_cast<uint32_t>(compare->D.SIMM());
+        values.push_back(value);
+      } else if (compare->opcode == Opcode::cmpli &&
+                 ((conditionBit == 1 && !conditionTrue) || (conditionBit == 0 && conditionTrue))) {
+        const uint32_t upper = compare->D.UIMM();
+        const uint64_t count = conditionBit == 1 ? static_cast<uint64_t>(upper) + 1 : upper;
+        if (count == 0 || count > limits_.maxEntries)
+          return std::nullopt;
+        values.resize(static_cast<size_t>(count));
+        for (uint32_t value = 0; value < values.size(); ++value)
+          values[value] = value;
+      } else {
+        return std::nullopt;
+      }
+      return std::pair{std::move(values), compare};
+    };
+
+    // If one constrained branch edge is itself the unique, dominating route
+    // to the use, the existing local bounded-slice machinery is the stronger
+    // proof.  A path-partition domain is reserved for joins where no one
+    // finite edge covers the use.  Testing the successor's sole predecessor
+    // is essential: node dominance alone would be circular at a join that can
+    // also be entered without traversing the guarded edge.
+    for (uint32_t address : cfg_.addresses()) {
+      const auto* guard = decoded_.get(address);
+      if (!guard || !guard->is_conditional())
+        continue;
+      for (uint32_t successor : cfg_.successors(address)) {
+        if (!finiteConstraintForEdge(*guard, successor))
+          continue;
+        const auto& predecessors = cfg_.predecessors(successor);
+        if (predecessors.size() != 1 || predecessors.front() != address)
+          continue;
+        bool dominanceLimit = false;
+        if (cfg_.Dominates(successor, before, limits_, &dominanceLimit)) {
+          reject("single_guarded_edge_dominates_use");
+          return finishRejected();
+        }
+        if (dominanceLimit) {
+          proof.limitHit = true;
+          reject("single_guard_dominance_limit");
+          return finishRejected();
+        }
+      }
+    }
+
+    std::deque<State> pending;
+    for (uint32_t predecessor : cfg_.predecessors(before))
+      pending.push_back({.address = predecessor,
+                         .successor = before,
+                         .depth = 0,
+                         .hasDomain = false,
+                         .domain = {},
+                         .evidence = {}});
+    if (pending.empty()) {
+      reject("use_has_no_predecessor");
+      return finishRejected();
+    }
+
+    std::set<std::tuple<uint32_t, uint32_t, bool, std::vector<uint32_t>>> visited;
+    std::vector<CompletedPath> completed;
+    bool incomplete = false;
+    while (!pending.empty()) {
+      State state = std::move(pending.front());
+      pending.pop_front();
+      if (!visited.insert({state.address, state.successor, state.hasDomain, state.domain}).second) {
+        continue;
+      }
+      if (visited.size() > limits_.maxStates || state.depth > limits_.maxBackwardInstructions) {
+        proof.limitHit = true;
+        reject(visited.size() > limits_.maxStates ? "max_states" : "max_backward_instructions");
+        return finishRejected();
+      }
+
+      const auto* instruction = decoded_.get(state.address);
+      if (!instruction) {
+        incomplete = true;
+        reject("path_has_no_decoded_instruction");
+        continue;
+      }
+      if (auto constraint = finiteConstraintForEdge(*instruction, state.successor)) {
+        auto& [values, compare] = *constraint;
+        if (state.hasDomain) {
+          std::vector<uint32_t> intersection;
+          std::set_intersection(state.domain.begin(), state.domain.end(), values.begin(),
+                                values.end(), std::back_inserter(intersection));
+          state.domain = std::move(intersection);
+        } else {
+          state.hasDomain = true;
+          state.domain = std::move(values);
+        }
+        state.evidence.push_back(Evidence(*compare, "guarded_path_domain_compare"));
+        state.evidence.push_back(Evidence(*instruction, "guarded_path_domain_guard"));
+        if (state.domain.empty())
+          continue;
+      }
+
+      const bool definesRegister =
+          WritesRegister(*instruction, reg) || (instruction->is_call() && reg < 14);
+      if (definesRegister) {
+        if (!state.hasDomain) {
+          incomplete = true;
+          reject("reaching_definition_has_no_finite_guard:address=" +
+                 std::to_string(state.address));
+          continue;
+        }
+        state.evidence.push_back(Evidence(*instruction, "guarded_path_domain_reaching_definition"));
+        completed.push_back({state.address, std::move(state.domain), std::move(state.evidence)});
+        continue;
+      }
+
+      const auto& predecessors = cfg_.predecessors(state.address);
+      if (predecessors.empty()) {
+        incomplete = true;
+        reject("entry_path_has_no_finite_guarded_definition:address=" +
+               std::to_string(state.address));
+        continue;
+      }
+      if (predecessors.size() > limits_.maxPredecessors) {
+        proof.limitHit = true;
+        reject("max_predecessors");
+        return finishRejected();
+      }
+      for (uint32_t predecessor : predecessors) {
+        State next = state;
+        next.address = predecessor;
+        next.successor = state.address;
+        ++next.depth;
+        pending.push_back(std::move(next));
+      }
+    }
+
+    if (incomplete || completed.empty()) {
+      if (completed.empty())
+        reject("no_complete_guarded_path");
+      return finishRejected();
+    }
+    std::set<uint32_t> finiteValues;
+    std::set<uint32_t> definitions;
+    std::vector<JumpTableReachingDefinitionPathEvidence> pathRecords;
+    for (const auto& path : completed) {
+      finiteValues.insert(path.domain.begin(), path.domain.end());
+      definitions.insert(path.definition);
+      proof.evidence.insert(proof.evidence.end(), path.evidence.begin(), path.evidence.end());
+      pathRecords.push_back({.registerIndex = reg,
+                             .mergeAddress = before,
+                             .predecessor = path.definition,
+                             .loopHeader = before,
+                             .backedge = false,
+                             .limitHit = false,
+                             .expression = "guarded_finite_path_domain",
+                             .normalizedExpression = "finite_phi",
+                             .disposition = "guarded_finite_path_domain"});
+    }
+    if (finiteValues.empty() || finiteValues.size() > limits_.maxEntries) {
+      reject("finite_union_exceeds_entry_limit");
+      return finishRejected();
+    }
+    uint32_t expected = 0;
+    for (uint32_t value : finiteValues) {
+      if (value != expected++) {
+        reject("finite_union_not_dense_zero_based");
+        return finishRejected();
+      }
+    }
+
+    std::sort(proof.evidence.begin(), proof.evidence.end(), [](const auto& lhs, const auto& rhs) {
+      return lhs.address != rhs.address ? lhs.address < rhs.address : lhs.role < rhs.role;
+    });
+    proof.evidence.erase(std::unique(proof.evidence.begin(), proof.evidence.end(),
+                                     [](const auto& lhs, const auto& rhs) {
+                                       return lhs.address == rhs.address &&
+                                              lhs.rawInstruction == rhs.rawInstruction &&
+                                              lhs.role == rhs.role;
+                                     }),
+                         proof.evidence.end());
+    proof.expression = MakeFinitePhi(reg, before, {finiteValues.begin(), finiteValues.end()},
+                                     {definitions.begin(), definitions.end()});
+    if (pathEvidence_)
+      pathEvidence_->insert(pathEvidence_->end(), pathRecords.begin(), pathRecords.end());
+    return proof;
   }
 
   ResolveResult ResolveBefore(uint8_t reg, uint32_t before) {
@@ -1427,13 +1692,65 @@ class Resolver {
         // The common slwi alias: rlwinm rA,rS,SH,0,31-SH.
         if (instruction.M.MB == 0 && instruction.M.SH <= 31 &&
             instruction.M.ME == 31 - instruction.M.SH) {
-          result.expression =
-              MakeUnary(ExprKind::ShiftLeft, operand(static_cast<uint8_t>(instruction.M.RS)),
-                        instruction.M.SH, 0, instruction.address);
+          auto ordinary =
+              ResolveBefore(static_cast<uint8_t>(instruction.M.RS), instruction.address);
+          const bool ordinaryResolved = !ordinary.ambiguous && !ordinary.limitHit &&
+                                        !ordinary.incompleteCaseEntryPath &&
+                                        !IsUnknown(ordinary.expression);
+          ExprPtr source;
+          if (ordinaryResolved) {
+            source = std::move(ordinary.expression);
+            result.evidence.insert(result.evidence.end(), ordinary.evidence.begin(),
+                                   ordinary.evidence.end());
+            result.alternatives.insert(result.alternatives.end(), ordinary.alternatives.begin(),
+                                       ordinary.alternatives.end());
+          } else {
+            // A complete finite guarded-path partition is a conservative
+            // fallback for an otherwise unresolved reaching definition.  It
+            // must not replace a precise ordinary definition (or its local
+            // bound semantics), and it becomes authoritative only when every
+            // incoming path carries the finite-domain proof.
+            auto guardedDomain = ResolveGuardedFinitePathDomain(
+                static_cast<uint8_t>(instruction.M.RS), instruction.address);
+            if (guardedDomain.expression) {
+              source = std::move(guardedDomain.expression);
+              result.evidence.insert(result.evidence.end(), guardedDomain.evidence.begin(),
+                                     guardedDomain.evidence.end());
+            } else {
+              source = std::move(ordinary.expression);
+              result.ambiguous = ordinary.ambiguous;
+              result.limitHit = ordinary.limitHit || guardedDomain.limitHit;
+              result.incompleteCaseEntryPath = ordinary.incompleteCaseEntryPath;
+              result.evidence.insert(result.evidence.end(), ordinary.evidence.begin(),
+                                     ordinary.evidence.end());
+              result.alternatives.insert(result.alternatives.end(), ordinary.alternatives.begin(),
+                                         ordinary.alternatives.end());
+              result.alternatives.insert(result.alternatives.end(),
+                                         guardedDomain.alternatives.begin(),
+                                         guardedDomain.alternatives.end());
+            }
+          }
+          result.expression = MakeUnary(ExprKind::ShiftLeft, std::move(source), instruction.M.SH, 0,
+                                        instruction.address);
         } else if (instruction.M.SH == 0 && instruction.M.ME == 31) {
-          // clrlwi preserves the index lineage. Its range is considered by
-          // bound recovery; it is not itself sufficient authority for a table.
-          result.expression = operand(static_cast<uint8_t>(instruction.M.RS));
+          // clrlwi with a non-zero mask start is an exact finite unsigned
+          // domain even when its source is unrelated or opaque. Materialise
+          // that domain only when it fits the existing table-entry budget;
+          // larger masks retain ordinary source lineage and confer no table
+          // authority. Separate predecessor masks remain distinct definitions
+          // until the CFG merge forms their explicit finite union.
+          const uint32_t retainedBits = 32 - instruction.M.MB;
+          const uint64_t valueCount = retainedBits < 32 ? uint64_t{1} << retainedBits : 0;
+          if (instruction.M.MB != 0 && valueCount != 0 && valueCount <= limits_.maxEntries) {
+            std::vector<uint32_t> values(static_cast<size_t>(valueCount));
+            for (uint32_t value = 0; value < values.size(); ++value)
+              values[value] = value;
+            result.expression =
+                MakeFinitePhi(static_cast<uint8_t>(instruction.M.RA), instruction.address,
+                              std::move(values), {instruction.address});
+          } else {
+            result.expression = operand(static_cast<uint8_t>(instruction.M.RS));
+          }
         } else {
           // Preserve the identity of an exact local transformation without
           // recursively resolving live-ins that its dominating bound makes
@@ -1590,24 +1907,35 @@ bool MayWriteConditionRegister(const Instruction& instruction) {
   }
 }
 
-std::vector<uint32_t> BackwardReachable(const LocalCfg& cfg, uint32_t site,
-                                        const JumpTableRecoveryLimits& limits, bool* limitHit) {
+struct BackwardReachableResult {
+  std::vector<uint32_t> addresses;
+  std::optional<JumpTableBudgetExhaustionEvidence> exhaustion;
+};
+
+BackwardReachableResult BackwardReachable(const LocalCfg& cfg, uint32_t site,
+                                          const JumpTableRecoveryLimits& limits) {
   std::deque<std::pair<uint32_t, uint32_t>> pending{{site, 0}};
   std::set<uint32_t> addresses;
+  std::optional<JumpTableBudgetExhaustionEvidence> exhaustion;
   while (!pending.empty()) {
     auto [address, depth] = pending.front();
     pending.pop_front();
     if (!addresses.insert(address).second)
       continue;
-    if (addresses.size() > limits.maxStates || depth > limits.maxBackwardInstructions) {
-      if (limitHit)
-        *limitHit = true;
+    if (addresses.size() > limits.maxStates) {
+      exhaustion = JumpTableBudgetExhaustionEvidence{"max_states", limits.maxStates,
+                                                     static_cast<uint32_t>(addresses.size())};
+      break;
+    }
+    if (depth > limits.maxBackwardInstructions) {
+      exhaustion = JumpTableBudgetExhaustionEvidence{"max_backward_instructions",
+                                                     limits.maxBackwardInstructions, depth};
       break;
     }
     for (uint32_t predecessor : cfg.predecessors(address))
       pending.emplace_back(predecessor, depth + 1);
   }
-  return {addresses.begin(), addresses.end()};
+  return {{addresses.begin(), addresses.end()}, std::move(exhaustion)};
 }
 
 struct ReachingCtrDefinitions {
@@ -1666,9 +1994,17 @@ ReachingCtrDefinitions FindReachingCtrDefinitions(DecodedBinary& decoded, const 
 
 std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& cfg,
                                        Resolver& resolver, uint32_t site,
-                                       const JumpTableRecoveryLimits& limits, bool* limitHit) {
+                                       const JumpTableRecoveryLimits& limits, bool* limitHit,
+                                       JumpTableBudgetExhaustionEvidence* exhaustion = nullptr) {
   std::vector<BoundCandidate> candidates;
-  for (uint32_t address : BackwardReachable(cfg, site, limits, limitHit)) {
+  auto reachable = BackwardReachable(cfg, site, limits);
+  if (reachable.exhaustion) {
+    if (limitHit)
+      *limitHit = true;
+    if (exhaustion)
+      *exhaustion = *reachable.exhaustion;
+  }
+  for (uint32_t address : reachable.addresses) {
     const auto* compare = decoded.get(address);
     // A signed upper bound alone admits negative indices. CollectBoundEvidence
     // retains cmpi for diagnostics, but production recovery requires an
@@ -1769,9 +2105,17 @@ std::vector<BoundCandidate> FindBounds(DecodedBinary& decoded, const LocalCfg& c
 
 std::vector<JumpTableBoundCandidateEvidence> CollectBoundEvidence(
     DecodedBinary& decoded, const LocalCfg& cfg, uint32_t site,
-    const JumpTableRecoveryLimits& limits, bool* limitHit) {
+    const JumpTableRecoveryLimits& limits, bool* limitHit,
+    JumpTableBudgetExhaustionEvidence* exhaustion = nullptr) {
   std::vector<JumpTableBoundCandidateEvidence> output;
-  for (uint32_t address : BackwardReachable(cfg, site, limits, limitHit)) {
+  auto reachable = BackwardReachable(cfg, site, limits);
+  if (reachable.exhaustion) {
+    if (limitHit)
+      *limitHit = true;
+    if (exhaustion)
+      *exhaustion = *reachable.exhaustion;
+  }
+  for (uint32_t address : reachable.addresses) {
     const auto* compare = decoded.get(address);
     if (!compare || (compare->opcode != Opcode::cmpli && compare->opcode != Opcode::cmpi))
       continue;
@@ -2645,6 +2989,9 @@ std::vector<JumpTableBoundCandidateEvidence> RecoverExactPriorBoundEvidence(
   std::map<uint32_t, uint32_t> exactGuards;
   std::set<uint32_t> directBoundedCompares;
   std::set<uint32_t> directBoundedGuards;
+  const bool priorHasCompleteCfgDomain =
+      prior->boundSemantics == "finite_cfg_domain_zero_based_dense" &&
+      prior->boundValueIsFiniteIndexDomain && prior->defaultTarget == 0 && !prior->defaultIsReturn;
   for (const auto& evidence : prior->evidence) {
     if (evidence.role == "case_bound" || evidence.role == "bounded_index_compare" ||
         evidence.role == "local_bounded_slice_compare" ||
@@ -2671,7 +3018,7 @@ std::vector<JumpTableBoundCandidateEvidence> RecoverExactPriorBoundEvidence(
       }
     }
   }
-  if (exactCompares.empty() || exactGuards.empty() ||
+  if ((!priorHasCompleteCfgDomain && (exactCompares.empty() || exactGuards.empty())) ||
       cfg.addresses().size() > input.limits.maxCfgTopologyNodes) {
     if (cfg.addresses().size() > input.limits.maxCfgTopologyNodes && limitHit)
       *limitHit = true;
@@ -2718,8 +3065,9 @@ std::vector<JumpTableBoundCandidateEvidence> RecoverExactPriorBoundEvidence(
     }
     if (!cfg.contains(casePathStart))
       return std::nullopt;
-    if (exactPrior && (defaultIsReturn != prior->defaultIsReturn ||
-                       (!defaultIsReturn && defaultTarget != prior->defaultTarget))) {
+    if (exactPrior && !priorHasCompleteCfgDomain &&
+        (defaultIsReturn != prior->defaultIsReturn ||
+         (!defaultIsReturn && defaultTarget != prior->defaultTarget))) {
       return std::nullopt;
     }
 
@@ -2747,6 +3095,7 @@ std::vector<JumpTableBoundCandidateEvidence> RecoverExactPriorBoundEvidence(
     evidence.defaultIsReturn = exactPrior ? prior->defaultIsReturn : defaultIsReturn;
     evidence.dominatesDispatch = exactPrior;
     evidence.finiteDenseDomain = exactPrior;
+    evidence.finiteCfgDomain = exactPrior && priorHasCompleteCfgDomain;
     evidence.priorExactRevalidation = exactPrior;
     evidence.priorDirectBoundedIndexRevalidation =
         exactPrior && directBoundedCompares.contains(compare.address) &&
@@ -2755,6 +3104,70 @@ std::vector<JumpTableBoundCandidateEvidence> RecoverExactPriorBoundEvidence(
       evidence.rejection = "equivalent_prior_bound_path";
     return evidence;
   };
+
+  const auto recoverCurrentPathBounds = [&]() {
+    std::vector<JumpTableBoundCandidateEvidence> bounds;
+    for (uint32_t address : cfg.addresses()) {
+      const auto* compare = decoded.get(address);
+      if (!compare || compare->opcode != Opcode::cmpli ||
+          static_cast<uint8_t>(compare->D.RA) != prior->indexRegister ||
+          compare->D.UIMM() != prior->boundValue) {
+        continue;
+      }
+      const Instruction* guard = nullptr;
+      constexpr uint32_t kMaxGuardLookaheadInstructions = 16;
+      for (uint32_t cursor = address + 4;
+           cursor <= address + kMaxGuardLookaheadInstructions * 4 && cfg.contains(cursor);
+           cursor += 4) {
+        const auto* instruction = decoded.get(cursor);
+        if (!instruction || instruction->opcode == Opcode::kUnknown ||
+            MayWriteConditionRegister(*instruction)) {
+          break;
+        }
+        if (instruction->is_branch()) {
+          if (instruction->is_conditional())
+            guard = instruction;
+          break;
+        }
+      }
+      if (guard) {
+        if (auto evidence = recoverPair(*compare, *guard, false))
+          bounds.push_back(std::move(*evidence));
+      }
+    }
+    std::sort(bounds.begin(), bounds.end(), [](const auto& lhs, const auto& rhs) {
+      if (lhs.compareAddress != rhs.compareAddress)
+        return lhs.compareAddress < rhs.compareAddress;
+      return lhs.guardAddress < rhs.guardAddress;
+    });
+    bounds.erase(std::unique(bounds.begin(), bounds.end(),
+                             [](const auto& lhs, const auto& rhs) {
+                               return lhs.compareAddress == rhs.compareAddress &&
+                                      lhs.guardAddress == rhs.guardAddress;
+                             }),
+                 bounds.end());
+    return bounds;
+  };
+
+  if (priorHasCompleteCfgDomain) {
+    // A finite CFG-domain table has no single default edge: its initial proof
+    // is the complete predecessor partition. Revalidate that meaning against
+    // the expanded CFG by collecting every compatible guarded case path, then
+    // let the local reverse slice reject any source component that does not
+    // enter through one of those paths. The lowest-address guard is only the
+    // deterministic canonical representative; it is not claimed to dominate
+    // the dispatch on its own.
+    auto pathBounds = recoverCurrentPathBounds();
+    if (pathBounds.empty())
+      return output;
+    auto& canonical = pathBounds.front();
+    canonical.dominatesDispatch = false;
+    canonical.finiteDenseDomain = true;
+    canonical.finiteCfgDomain = true;
+    canonical.priorExactRevalidation = true;
+    canonical.rejection.clear();
+    return pathBounds;
+  }
 
   // Reconstruct the canonical candidate from the exact evidence addresses and
   // raw instructions retained by the previously validated automatic table.
@@ -2778,32 +3191,11 @@ std::vector<JumpTableBoundCandidateEvidence> RecoverExactPriorBoundEvidence(
     return output;
   output.push_back(canonical.front());
 
-  for (uint32_t address : cfg.addresses()) {
-    const auto* compare = decoded.get(address);
-    if (!compare || compare->opcode != Opcode::cmpli ||
-        static_cast<uint8_t>(compare->D.RA) != prior->indexRegister ||
-        compare->D.UIMM() != prior->boundValue) {
+  for (auto& evidence : recoverCurrentPathBounds()) {
+    const auto* compare = decoded.get(evidence.compareAddress);
+    const auto* guard = decoded.get(evidence.guardAddress);
+    if (!compare || !guard)
       continue;
-    }
-    const Instruction* guard = nullptr;
-    constexpr uint32_t kMaxGuardLookaheadInstructions = 16;
-    for (uint32_t cursor = address + 4;
-         cursor <= address + kMaxGuardLookaheadInstructions * 4 && cfg.contains(cursor);
-         cursor += 4) {
-      const auto* instruction = decoded.get(cursor);
-      if (!instruction || instruction->opcode == Opcode::kUnknown ||
-          MayWriteConditionRegister(*instruction)) {
-        break;
-      }
-      if (instruction->is_branch()) {
-        if (instruction->is_conditional())
-          guard = instruction;
-        break;
-      }
-    }
-    if (!guard)
-      continue;
-
     const auto compareEvidence = exactCompares.find(compare->address);
     const auto guardEvidence = exactGuards.find(guard->address);
     if (compareEvidence != exactCompares.end() && guardEvidence != exactGuards.end() &&
@@ -2811,8 +3203,7 @@ std::vector<JumpTableBoundCandidateEvidence> RecoverExactPriorBoundEvidence(
         guardEvidence->second == static_cast<uint32_t>(guard->code)) {
       continue;
     }
-    if (auto evidence = recoverPair(*compare, *guard, false))
-      output.push_back(std::move(*evidence));
+    output.push_back(std::move(evidence));
   }
   std::sort(output.begin(), output.end(), [](const auto& lhs, const auto& rhs) {
     if (lhs.compareAddress != rhs.compareAddress)
@@ -3676,8 +4067,10 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
     const auto inheritedBound = FindInheritedBoundProof(decoded, input, bound);
     std::vector<JumpTableInstructionEvidence> freshBoundEvidence;
     if (!bound.finiteDenseDomain || bound.signedCompare ||
-        (!bound.dominatesDispatch && !bound.inheritedCaseEdgeProof) || bound.guardAddress == 0 ||
-        bound.caseCount == 0 || bound.caseCount > input.limits.maxEntries) {
+        (!bound.dominatesDispatch && !bound.inheritedCaseEdgeProof &&
+         !bound.priorExactRevalidation) ||
+        bound.guardAddress == 0 || bound.caseCount == 0 ||
+        bound.caseCount > input.limits.maxEntries) {
       continue;
     }
     const auto* postMergeNormalization = FindPostMergeBoundIndexNormalization(decoded, cfg, bound);
@@ -3816,6 +4209,15 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
                                                                       : "unsigned_index < bound");
     table.defaultTarget = denseInheritedCaseIndex ? 0 : bound.defaultTarget;
     table.defaultIsReturn = denseInheritedCaseIndex ? false : bound.defaultIsReturn;
+    if (input.priorAutomaticTable && bound.priorExactRevalidation) {
+      table.boundSemantics = input.priorAutomaticTable->boundSemantics;
+      // Retain the canonical guard's path-specific default in bound evidence
+      // so the reverse slice can identify its case edge. Only after every
+      // expanded source path is proven do we restore the exact previously
+      // validated aggregate table metadata, which has no single default.
+      table.defaultTarget = input.priorAutomaticTable->defaultTarget;
+      table.defaultIsReturn = input.priorAutomaticTable->defaultIsReturn;
+    }
     table.elementWidth = primaryLoad->width;
     table.elementSigned = LoadIsSignExtended(target.expression, primaryLoad->origin);
     table.anchorAddress = ConstantAnchor(target.expression).value_or(0);
@@ -5169,7 +5571,9 @@ void FinalizeJumpTableSiteDisposition(IndirectSiteAnalysis& analysis) {
     if (evidence == "bound_census_limit" || evidence == "scc_diagnostic_limit" ||
         evidence == "equivalent_bound_recomputation_topology_limit" ||
         evidence.starts_with("ambiguous_bound_candidate:") ||
-        evidence.starts_with("local_bounded_slice:") || evidence.starts_with("table_validation:")) {
+        evidence.starts_with("local_bounded_slice:") || evidence.starts_with("table_validation:") ||
+        evidence.starts_with("provisional_inline_case_expansion:") ||
+        evidence.starts_with("provisional_inline_batch_expansion:")) {
       rejectionEvidence.push_back(evidence);
     } else if (evidence.starts_with("self_delimiting_inline_table:")) {
       rejectionEvidence.push_back(evidence);
@@ -5477,8 +5881,9 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       dataflow.caseExpansionEdges.push_back({input.site, target});
   }
   bool diagnosticLimitHit = false;
-  dataflow.boundCandidates =
-      CollectBoundEvidence(decoded, cfg, input.site, input.limits, &diagnosticLimitHit);
+  JumpTableBudgetExhaustionEvidence diagnosticBoundExhaustion;
+  dataflow.boundCandidates = CollectBoundEvidence(decoded, cfg, input.site, input.limits,
+                                                  &diagnosticLimitHit, &diagnosticBoundExhaustion);
   for (auto& inherited : CollectInheritedBoundEvidence(decoded, cfg, input)) {
     const auto duplicate = std::find_if(
         dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
@@ -5531,8 +5936,13 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
                 return lhs.compareAddress < rhs.compareAddress;
               return lhs.guardAddress < rhs.guardAddress;
             });
-  if (diagnosticLimitHit)
+  if (diagnosticLimitHit) {
     dataflow.rejectionEvidence.push_back("bound_census_limit");
+    if (!diagnosticBoundExhaustion.budget.empty()) {
+      diagnosticBoundExhaustion.budget = "bound_census_" + diagnosticBoundExhaustion.budget;
+      dataflow.exhaustedBudgets.push_back(std::move(diagnosticBoundExhaustion));
+    }
+  }
   std::optional<ResolveResult> resolvedTarget;
   std::vector<BoundCandidate> finiteCfgBounds;
 
@@ -5721,11 +6131,17 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       AddFailure(analysis, JumpTableFailure::UnknownTableBase);
       analysis.classification = IndirectSiteClassification::ComputedTailBctr;
     } else {
-      auto bounds = FindBounds(decoded, cfg, resolver, input.site, input.limits, &limitHit);
+      JumpTableBudgetExhaustionEvidence boundRecoveryExhaustion;
+      auto bounds = FindBounds(decoded, cfg, resolver, input.site, input.limits, &limitHit,
+                               &boundRecoveryExhaustion);
+      if (!boundRecoveryExhaustion.budget.empty()) {
+        boundRecoveryExhaustion.budget = "bound_recovery_" + boundRecoveryExhaustion.budget;
+        dataflow.exhaustedBudgets.push_back(std::move(boundRecoveryExhaustion));
+      }
       // A bounded reachability query can encounter an unrelated loop after a
       // complete dominating bound has already been found. Preserve that valid
       // result, but make a truncated, unsuccessful bound search explicit.
-      if (limitHit && bounds.empty()) {
+      if (limitHit && bounds.empty() && finiteCfgBounds.empty() && entryDomainBounds.empty()) {
         AddFailure(analysis, JumpTableFailure::AnalysisLimit);
         if (stats)
           stats->analysisLimitHit = true;
@@ -5997,17 +6413,66 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
         analysis.failures.size() == 1 &&
         (analysis.failures.front() == JumpTableFailure::AmbiguousReachingDefinition ||
          analysis.failures.front() == JumpTableFailure::AnalysisLimit);
-    const bool onlyResolverStateBudgetExhausted =
-        std::all_of(dataflow.exhaustedBudgets.begin(), dataflow.exhaustedBudgets.end(),
+    const bool exactAnalysisLimitFailure =
+        analysis.failures.size() == 1 &&
+        analysis.failures.front() == JumpTableFailure::AnalysisLimit;
+    const bool resolverStateBudgetExhausted =
+        std::any_of(dataflow.exhaustedBudgets.begin(), dataflow.exhaustedBudgets.end(),
                     [](const auto& exhaustion) { return exhaustion.budget == "max_states"; });
+    const bool onlyCompatibleProvisionalCaseLoopBudgets =
+        std::all_of(dataflow.exhaustedBudgets.begin(), dataflow.exhaustedBudgets.end(),
+                    [](const auto& exhaustion) {
+                      return exhaustion.budget == "max_states" ||
+                             exhaustion.budget == "bound_census_max_states" ||
+                             exhaustion.budget == "bound_recovery_max_states" ||
+                             exhaustion.budget == "bound_census_max_backward_instructions";
+                    }) &&
+        exactProvisionalCaseLoopFailure &&
+        (analysis.failures.front() == JumpTableFailure::AmbiguousReachingDefinition ||
+         resolverStateBudgetExhausted);
+    const bool exactPriorStorageExtent =
+        inlineExtent.table && input.allowPriorLocalSliceRecovery && input.priorAutomaticTable &&
+        input.priorAutomaticTable->origin == JumpTableOrigin::Automatic &&
+        !input.priorAutomaticTable->boundValueIsFiniteIndexDomain &&
+        SameRecoveryTableSemantics(*inlineExtent.table, *input.priorAutomaticTable);
+    const bool boundRecoveryBackwardLimit =
+        std::any_of(dataflow.exhaustedBudgets.begin(), dataflow.exhaustedBudgets.end(),
+                    [](const auto& exhaustion) {
+                      return exhaustion.budget == "bound_recovery_max_backward_instructions";
+                    });
+    const bool onlyIrrelevantStorageExtentBoundScans =
+        boundRecoveryBackwardLimit &&
+        std::all_of(dataflow.exhaustedBudgets.begin(), dataflow.exhaustedBudgets.end(),
+                    [](const auto& exhaustion) {
+                      return exhaustion.budget == "bound_recovery_max_backward_instructions" ||
+                             exhaustion.budget == "bound_census_max_backward_instructions";
+                    });
     if (inlineExtent.table && inlineExtent.productionEligible && exactMissingBoundFailure) {
       analysis.automaticTable = std::move(*inlineExtent.table);
       analysis.classification = IndirectSiteClassification::SwitchBctr;
       analysis.failures.clear();
       if (stats)
         ++stats->recoveredTables;
+    } else if (inlineExtent.productionEligible && exactPriorStorageExtent &&
+               exactAnalysisLimitFailure && onlyIrrelevantStorageExtentBoundScans) {
+      // The table's exact static extent, raw entries, targets, and CFG boundary
+      // were already validated before case expansion and have just been
+      // reproduced byte-for-byte. A truncated search for an optional runtime
+      // compare cannot turn its storage-only case count into a finite index
+      // domain, but it also cannot invalidate that independent extent proof.
+      // This path is reachable only during the maxStates retry lifecycle; no
+      // other analysis limit or failure vector is accepted.
+      analysis.automaticTable = std::move(*inlineExtent.table);
+      analysis.automaticTable->confidence =
+          "validated_exact_prior_self_delimiting_inline_table_after_state_retry";
+      analysis.classification = IndirectSiteClassification::SwitchBctr;
+      analysis.failures.clear();
+      dataflow.rejectionEvidence.push_back(
+          "self_delimiting_inline_table:accepted_exact_prior_after_bound_scan_limit");
+      if (stats)
+        ++stats->recoveredTables;
     } else if (inlineExtent.table && inlineExtent.provisionalCaseLoopEligible &&
-               exactProvisionalCaseLoopFailure && onlyResolverStateBudgetExhausted) {
+               exactProvisionalCaseLoopFailure && onlyCompatibleProvisionalCaseLoopBudgets) {
       analysis.automaticTable = std::move(*inlineExtent.table);
       analysis.automaticTable->confidence =
           "validated_self_delimiting_inline_absolute_table_case_loop";
@@ -6158,13 +6623,31 @@ IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(DecodedBinary& decod
       analysis.failures.front() != JumpTableFailure::AnalysisLimit) {
     return analysis;
   }
-  if (analysis.dataflow &&
+  const bool resolverStateBudgetExhausted =
+      analysis.dataflow &&
       std::any_of(analysis.dataflow->exhaustedBudgets.begin(),
                   analysis.dataflow->exhaustedBudgets.end(),
-                  [](const auto& exhaustion) { return exhaustion.budget != "max_states"; })) {
+                  [](const auto& exhaustion) { return exhaustion.budget == "max_states"; });
+  const bool priorIsStorageOnlyInlineExtent =
+      input.priorAutomaticTable->origin == JumpTableOrigin::Automatic &&
+      !input.priorAutomaticTable->boundValueIsFiniteIndexDomain &&
+      input.priorAutomaticTable->boundSemantics == "self_delimiting_inline_absolute_table_extent";
+  const bool onlyStateAndReportOnlyBoundCensusBudgets =
+      analysis.dataflow &&
+      std::all_of(analysis.dataflow->exhaustedBudgets.begin(),
+                  analysis.dataflow->exhaustedBudgets.end(), [&](const auto& exhaustion) {
+                    return exhaustion.budget == "max_states" ||
+                           exhaustion.budget == "bound_census_max_states" ||
+                           exhaustion.budget == "bound_recovery_max_states" ||
+                           exhaustion.budget == "bound_census_max_backward_instructions" ||
+                           (priorIsStorageOnlyInlineExtent &&
+                            exhaustion.budget == "bound_recovery_max_backward_instructions");
+                  });
+  if (!resolverStateBudgetExhausted || !onlyStateAndReportOnlyBoundCensusBudgets) {
     // The bounded retry is specifically for resolver-state growth after case
-    // expansion. A distinct exhausted budget must never be masked by raising
-    // maxStates, because that retry cannot address the recorded limit.
+    // expansion. The separately tagged bound census is report-only and may be
+    // truncated independently, but an authoritative production budget must
+    // never be masked by raising maxStates.
     return analysis;
   }
 
@@ -6181,9 +6664,13 @@ IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(DecodedBinary& decod
   retryEvidence.retryBudgetValue = retryInput.limits.maxStates;
   retryEvidence.initialFailures = analysis.failures;
   retryEvidence.retryFailures = retry.failures;
-  retryEvidence.exhaustedBudget = retry.selectedTable ? "max_states" : "";
+  if (analysis.dataflow)
+    retryEvidence.initialExhaustedBudgets = analysis.dataflow->exhaustedBudgets;
+  if (retry.dataflow)
+    retryEvidence.retryExhaustedBudgets = retry.dataflow->exhaustedBudgets;
+  retryEvidence.exhaustedBudget = "max_states";
   retryEvidence.exactPriorTableMatch =
-      retry.selectedTable && retry.automaticTable &&
+      retry.failures.empty() && retry.selectedTable && retry.automaticTable &&
       retry.selectedTable->origin == JumpTableOrigin::Automatic &&
       SameRecoveryTableSemantics(*retry.selectedTable, *input.priorAutomaticTable) &&
       SameRecoveryTableSemantics(*retry.automaticTable, *input.priorAutomaticTable);

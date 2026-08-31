@@ -358,12 +358,20 @@ struct JumpTable {
   std::vector<std::string> conflicts;
 };
 
+struct JumpTableBudgetExhaustionEvidence {
+  std::string budget;
+  uint32_t limit = 0;
+  uint32_t observed = 0;
+};
+
 struct JumpTableLimitRetryEvidence {
   std::string exhaustedBudget;
   uint32_t initialBudgetValue = 0;
   uint32_t retryBudgetValue = 0;
   std::vector<JumpTableFailure> initialFailures;
   std::vector<JumpTableFailure> retryFailures;
+  std::vector<JumpTableBudgetExhaustionEvidence> initialExhaustedBudgets;
+  std::vector<JumpTableBudgetExhaustionEvidence> retryExhaustedBudgets;
   bool exactPriorTableMatch = false;
   bool accepted = false;
 };
@@ -483,12 +491,6 @@ struct JumpTableBoundCandidateEvidence {
   std::string rejection;
 };
 
-struct JumpTableBudgetExhaustionEvidence {
-  std::string budget;
-  uint32_t limit = 0;
-  uint32_t observed = 0;
-};
-
 struct JumpTableReachingDefinitionPathEvidence {
   uint8_t registerIndex = 0xFF;
   uint32_t mergeAddress = 0;
@@ -583,7 +585,7 @@ struct JumpTableRecoveryLimits {
   uint32_t maxStates = 128;
   uint32_t maxCfgTopologyNodes = 65536;
   uint32_t maxEntries = 4096;
-  uint32_t maxFixpointIterations = 8;
+  uint32_t maxFixpointIterations = 16;
 };
 
 struct JumpTableRecoveryStats {

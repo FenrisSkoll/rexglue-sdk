@@ -1736,6 +1736,12 @@ Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
     Json retryFailures = Json::array();
     for (auto failure : site.limitRetry->retryFailures)
       retryFailures.push_back(JumpTableFailureName(failure));
+    Json initialExhaustedBudgets = Json::array();
+    for (const auto& exhausted : site.limitRetry->initialExhaustedBudgets)
+      initialExhaustedBudgets.push_back(JumpBudgetExhaustionJson(exhausted));
+    Json retryExhaustedBudgets = Json::array();
+    for (const auto& exhausted : site.limitRetry->retryExhaustedBudgets)
+      retryExhaustedBudgets.push_back(JumpBudgetExhaustionJson(exhausted));
     limitRetry = Json{{"exhausted_budget", site.limitRetry->exhaustedBudget.empty()
                                                ? Json(nullptr)
                                                : Json(site.limitRetry->exhaustedBudget)},
@@ -1743,6 +1749,8 @@ Json JumpIndirectSiteJson(const IndirectSiteAnalysis& site) {
                       {"retry_budget_value", site.limitRetry->retryBudgetValue},
                       {"initial_failures", std::move(initialFailures)},
                       {"retry_failures", std::move(retryFailures)},
+                      {"initial_exhausted_budgets", std::move(initialExhaustedBudgets)},
+                      {"retry_exhausted_budgets", std::move(retryExhaustedBudgets)},
                       {"exact_prior_table_match", site.limitRetry->exactPriorTableMatch},
                       {"accepted", site.limitRetry->accepted}};
   }
@@ -2403,7 +2411,33 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
       limitRetry << site.limitRetry->exhaustedBudget << ':' << site.limitRetry->initialBudgetValue
                  << "->" << site.limitRetry->retryBudgetValue
                  << ":exact=" << (site.limitRetry->exactPriorTableMatch ? "true" : "false")
-                 << ":accepted=" << (site.limitRetry->accepted ? "true" : "false");
+                 << ":accepted=" << (site.limitRetry->accepted ? "true" : "false")
+                 << ":initial_failures=";
+      for (size_t index = 0; index < site.limitRetry->initialFailures.size(); ++index) {
+        if (index)
+          limitRetry << '+';
+        limitRetry << JumpTableFailureName(site.limitRetry->initialFailures[index]);
+      }
+      limitRetry << ":retry_failures=";
+      for (size_t index = 0; index < site.limitRetry->retryFailures.size(); ++index) {
+        if (index)
+          limitRetry << '+';
+        limitRetry << JumpTableFailureName(site.limitRetry->retryFailures[index]);
+      }
+      limitRetry << ":initial_exhausted=";
+      for (size_t index = 0; index < site.limitRetry->initialExhaustedBudgets.size(); ++index) {
+        if (index)
+          limitRetry << '+';
+        const auto& budget = site.limitRetry->initialExhaustedBudgets[index];
+        limitRetry << budget.budget << ':' << budget.limit << ':' << budget.observed;
+      }
+      limitRetry << ":retry_exhausted=";
+      for (size_t index = 0; index < site.limitRetry->retryExhaustedBudgets.size(); ++index) {
+        if (index)
+          limitRetry << '+';
+        const auto& budget = site.limitRetry->retryExhaustedBudgets[index];
+        limitRetry << budget.budget << ':' << budget.limit << ':' << budget.observed;
+      }
     }
     const std::string preliminaryBlock =
         dataflow.preliminaryBlockStart

@@ -96,7 +96,7 @@ REXCVAR_DEFINE_UINT32(jump_table_max_cfg_topology_nodes, 65536, "Codegen",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)
     .range(8, 1000000);
 
-REXCVAR_DEFINE_UINT32(jump_table_fixpoint_iterations, 8, "Codegen",
+REXCVAR_DEFINE_UINT32(jump_table_fixpoint_iterations, 16, "Codegen",
                       "Max case-edge expansion iterations per function")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)
     .range(1, 1000);

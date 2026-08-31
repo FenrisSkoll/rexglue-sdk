@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -14,6 +15,7 @@
 #include <rex/codegen/function_scanner.h>
 #include <rex/codegen/phases.h>
 
+#include "codegen/codegen_flags.h"
 #include "codegen/decoded_binary.h"
 
 namespace {
@@ -650,6 +652,74 @@ AbsoluteSwitch FiniteCfgDomainSwitch() {
   return image;
 }
 
+AbsoluteSwitch MaskedMergeDomainSwitch() {
+  AbsoluteSwitch image;
+  for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
+    StoreBe32(image.text, offset, 0x60000000);  // nop
+
+  // Both predecessor paths produce a two-bit unsigned state from unrelated
+  // source registers. The source values are intentionally unknown; the exact
+  // clrlwi masks independently prove that each result is in [0, 3].
+  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x10, 12, 2));
+  StoreBe32(image.text, 0x04, Rlwinm(10, 3, 0, 30, 31));  // clrlwi r10,r3,30
+  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x18));
+  StoreBe32(image.text, 0x10, Rlwinm(10, 4, 0, 30, 31));  // clrlwi r10,r4,30
+  StoreBe32(image.text, 0x14, B(kTextBase + 0x14, kTextBase + 0x18));
+  StoreBe32(image.text, 0x18, Mr(11, 10));
+  StoreBe32(image.text, 0x1C, 0x3D802000);  // lis r12, table@h
+  StoreBe32(image.text, 0x20, Rlwinm(0, 11, 2, 0, 29));
+  StoreBe32(image.text, 0x24, Lwzx(0, 12, 0));
+  StoreBe32(image.text, 0x28, Mtctr(0));
+  StoreBe32(image.text, 0x2C, 0x4E800420);  // bctr
+  StoreBe32(image.text, 0x60, 0x4E800020);
+  StoreBe32(image.text, 0x70, 0x4E800020);
+  StoreBe32(image.text, 0x80, 0x4E800020);
+  StoreBe32(image.text, 0x90, 0x4E800020);
+  StoreBe32(image.table, 0x00, kTextBase + 0x60);
+  StoreBe32(image.table, 0x04, kTextBase + 0x70);
+  StoreBe32(image.table, 0x08, kTextBase + 0x80);
+  StoreBe32(image.table, 0x0C, kTextBase + 0x90);
+  return image;
+}
+
+AbsoluteSwitch GuardedPathPartitionDomainSwitch() {
+  AbsoluteSwitch image;
+  for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
+    StoreBe32(image.text, offset, 0x60000000);  // nop
+
+  // Two unrelated definitions converge before a path partition. One path
+  // reaches the dispatch only when r31 == 3; the other is independently
+  // guarded by an unsigned r31 <= 3 check. Together, and only together, those
+  // complete predecessor paths prove the dense domain [0, 3].
+  StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x10, 12, 2));
+  StoreBe32(image.text, 0x04, Lwz(31, 3, 0));
+  StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x18));
+  StoreBe32(image.text, 0x0C, 0x4E800020);  // unreachable block terminator
+  StoreBe32(image.text, 0x10, Addi(31, 0, -1));
+  StoreBe32(image.text, 0x14, B(kTextBase + 0x14, kTextBase + 0x18));
+  StoreBe32(image.text, 0x18, 0x2C1F0003);                                    // cmpwi r31, 3
+  StoreBe32(image.text, 0x1C, Bc(kTextBase + 0x1C, kTextBase + 0x30, 4, 2));  // bne bounded path
+  StoreBe32(image.text, 0x24, B(kTextBase + 0x24, kTextBase + 0x38));
+  StoreBe32(image.text, 0x2C, 0x4E800020);  // unreachable block terminator
+  StoreBe32(image.text, 0x30, 0x281F0003);  // cmplwi r31, 3
+  StoreBe32(image.text, 0x34, Bc(kTextBase + 0x34, kTextBase + 0xB0, 12, 1));  // bgt default
+  StoreBe32(image.text, 0x38, 0x3D802000);                                     // lis r12, table@h
+  StoreBe32(image.text, 0x3C, Rlwinm(0, 31, 2, 0, 29));
+  StoreBe32(image.text, 0x40, Lwzx(0, 12, 0));
+  StoreBe32(image.text, 0x44, Mtctr(0));
+  StoreBe32(image.text, 0x48, 0x4E800420);  // bctr
+  StoreBe32(image.text, 0x60, 0x4E800020);
+  StoreBe32(image.text, 0x70, 0x4E800020);
+  StoreBe32(image.text, 0x80, 0x4E800020);
+  StoreBe32(image.text, 0x90, 0x4E800020);
+  StoreBe32(image.text, 0xB0, 0x4E800020);
+  StoreBe32(image.table, 0x00, kTextBase + 0x60);
+  StoreBe32(image.table, 0x04, kTextBase + 0x70);
+  StoreBe32(image.table, 0x08, kTextBase + 0x80);
+  StoreBe32(image.table, 0x0C, kTextBase + 0x90);
+  return image;
+}
+
 constexpr uint32_t kEntryDomainSite = kTextBase + 0x10;
 
 AbsoluteSwitch EntryDomainSwitch() {
@@ -859,6 +929,133 @@ TEST_CASE("finite CFG index domains retain conservative rejection controls",
     auto analysis = Analyze(image, kTextBase + 0x44, nullptr, limits, 0xA0);
     CHECK_FALSE(analysis.selectedTable);
     CHECK(HasFailure(analysis, JumpTableFailure::AnalysisLimit));
+  }
+}
+
+TEST_CASE("exact low-bit masks form a finite CFG index domain across unrelated sources",
+          "[codegen][jump-table][finite-domain][mask]") {
+  auto image = MaskedMergeDomainSwitch();
+  auto analysis = Analyze(image, kTextBase + 0x2C, nullptr, {}, 0xA0);
+  REQUIRE(analysis.selectedTable);
+  CHECK(analysis.failures.empty());
+  CHECK(analysis.selectedTable->indexRegister == 10);
+  CHECK(analysis.selectedTable->boundValue == 3);
+  CHECK(analysis.selectedTable->caseCount == 4);
+  CHECK(analysis.selectedTable->boundValueIsFiniteIndexDomain);
+  CHECK(analysis.selectedTable->boundSemantics == "finite_cfg_domain_zero_based_dense");
+  CHECK(analysis.selectedTable->targets == std::vector<uint32_t>{kTextBase + 0x60, kTextBase + 0x70,
+                                                                 kTextBase + 0x80,
+                                                                 kTextBase + 0x90});
+  REQUIRE(analysis.dataflow);
+  const auto domain = std::find_if(analysis.dataflow->boundCandidates.begin(),
+                                   analysis.dataflow->boundCandidates.end(),
+                                   [](const auto& candidate) { return candidate.finiteCfgDomain; });
+  REQUIRE(domain != analysis.dataflow->boundCandidates.end());
+  CHECK(domain->finiteDenseDomain);
+  CHECK(domain->finiteValues == std::vector<uint32_t>{0, 1, 2, 3});
+
+  SECTION("an incompatible unmasked predecessor remains ambiguous") {
+    StoreBe32(image.text, 0x10, Mr(10, 4));
+    auto rejected = Analyze(image, kTextBase + 0x2C, nullptr, {}, 0xA0);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::AmbiguousReachingDefinition));
+  }
+
+  SECTION("different mask widths do not invent a shorter common domain") {
+    StoreBe32(image.text, 0x10, Rlwinm(10, 4, 0, 29, 31));
+    auto rejected = Analyze(image, kTextBase + 0x2C, nullptr, {}, 0xA0);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::MixedValidityTargets));
+  }
+
+  SECTION("a mask domain that exceeds the configured entry budget is not authority") {
+    StoreBe32(image.text, 0x04, Rlwinm(10, 3, 0, 29, 31));
+    StoreBe32(image.text, 0x10, Rlwinm(10, 4, 0, 29, 31));
+    JumpTableRecoveryLimits limits;
+    limits.maxEntries = 4;
+    auto rejected = Analyze(image, kTextBase + 0x2C, nullptr, limits, 0xA0);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::AmbiguousReachingDefinition));
+  }
+
+  SECTION("an unrelated truncated compare census does not invalidate the exact mask domain") {
+    JumpTableRecoveryLimits limits;
+    limits.maxBackwardInstructions = 1;
+    auto recovered = Analyze(image, kTextBase + 0x2C, nullptr, limits, 0xA0);
+    REQUIRE(recovered.selectedTable);
+    CHECK(recovered.failures.empty());
+    REQUIRE(recovered.dataflow);
+    CHECK(std::find(recovered.dataflow->rejectionEvidence.begin(),
+                    recovered.dataflow->rejectionEvidence.end(),
+                    "bound_census_limit") != recovered.dataflow->rejectionEvidence.end());
+  }
+}
+
+TEST_CASE("complete guarded path partitions form a finite CFG index domain",
+          "[codegen][jump-table][finite-domain][path-partition]") {
+  auto image = GuardedPathPartitionDomainSwitch();
+  auto analysis = Analyze(image, kTextBase + 0x48, nullptr, {}, 0xC0);
+  REQUIRE(analysis.selectedTable);
+  CHECK(analysis.failures.empty());
+  CHECK(analysis.selectedTable->indexRegister == 31);
+  CHECK(analysis.selectedTable->caseCount == 4);
+  CHECK(analysis.selectedTable->boundValue == 3);
+  CHECK(analysis.selectedTable->boundValueIsFiniteIndexDomain);
+  CHECK(analysis.selectedTable->boundSemantics == "finite_cfg_domain_zero_based_dense");
+  REQUIRE(analysis.dataflow);
+  const auto domain = std::find_if(analysis.dataflow->boundCandidates.begin(),
+                                   analysis.dataflow->boundCandidates.end(),
+                                   [](const auto& candidate) { return candidate.finiteCfgDomain; });
+  REQUIRE(domain != analysis.dataflow->boundCandidates.end());
+  CHECK(domain->finiteDenseDomain);
+  CHECK(domain->finiteValues == std::vector<uint32_t>{0, 1, 2, 3});
+  CHECK(std::any_of(analysis.dataflow->reachingDefinitionPaths.begin(),
+                    analysis.dataflow->reachingDefinitionPaths.end(), [](const auto& path) {
+                      return path.registerIndex == 31 &&
+                             path.disposition == "guarded_finite_path_domain";
+                    }));
+
+  SECTION("a predecessor without a finite guard keeps the merge ambiguous") {
+    StoreBe32(image.text, 0x30, 0x60000000);  // remove unsigned compare
+    auto rejected = Analyze(image, kTextBase + 0x48, nullptr, {}, 0xC0);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::AmbiguousReachingDefinition));
+  }
+
+  SECTION("a guard for another register is not borrowed") {
+    StoreBe32(image.text, 0x30, 0x281E0003);  // cmplwi r30, 3
+    auto rejected = Analyze(image, kTextBase + 0x48, nullptr, {}, 0xC0);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::AmbiguousReachingDefinition));
+  }
+
+  SECTION("a signed upper bound does not exclude negative values") {
+    StoreBe32(image.text, 0x30, 0x2C1F0003);  // cmpwi r31, 3
+    auto rejected = Analyze(image, kTextBase + 0x48, nullptr, {}, 0xC0);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::AmbiguousReachingDefinition));
+  }
+
+  SECTION("a post-guard write invalidates that path proof") {
+    StoreBe32(image.text, 0x20, Addi(31, 3, 0));
+    auto rejected = Analyze(image, kTextBase + 0x48, nullptr, {}, 0xC0);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::AmbiguousReachingDefinition));
+  }
+
+  SECTION("an unrelated predecessor bypassing every guard remains unproven") {
+    StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x38, 12, 2));
+    auto rejected = Analyze(image, kTextBase + 0x48, nullptr, {}, 0xC0);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::AmbiguousReachingDefinition));
+  }
+
+  SECTION("path-domain traversal respects its hard backward limit") {
+    JumpTableRecoveryLimits limits;
+    limits.maxBackwardInstructions = 2;
+    auto rejected = Analyze(image, kTextBase + 0x48, nullptr, limits, 0xC0);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::AnalysisLimit));
   }
 }
 
@@ -2126,6 +2323,145 @@ TEST_CASE("case-expanded CFG limit retry requires an exact previously validated 
   CHECK(rawRejectedStats.unresolvedSites == 1);
 }
 
+TEST_CASE(
+    "an exact storage-only inline table survives a resolver-state retry without a runtime "
+    "domain",
+    "[codegen][jump-table][inline-table-extent][limit-retry][storage-only]") {
+  InlineAbsoluteSwitch image;
+  const size_t originalSize = image.text.size();
+  image.text.resize(0x800);
+  for (uint32_t offset = static_cast<uint32_t>(originalSize); offset < image.text.size();
+       offset += 4) {
+    StoreBe32(image.text, offset, 0x60000000);  // nop
+  }
+  image.ownerEnd = kTextBase + static_cast<uint32_t>(image.text.size());
+
+  // This block is absent from the initial CFG. Case expansion elsewhere in
+  // the owner can expose it as a new ordinary predecessor of the dispatch
+  // prefix. Its long definition-preserving path exhausts maxStates first and
+  // then leaves only the independently bounded compare census truncated by
+  // maxBackwardInstructions. It does not provide a case-loop proof for this
+  // table and it provides no runtime index-domain evidence.
+  constexpr uint32_t kExpandedBlockStart = kTextBase + 0x200;
+  constexpr uint32_t kExpandedBlockEnd = kTextBase + 0x704;
+  StoreBe32(image.text, 0x700, B(kExpandedBlockEnd - 4, kTextBase));
+
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+
+  const Block preliminaryBlock{kTextBase, 0x30};
+  JumpTableRecoveryInput preliminaryInput{
+      .site = image.site,
+      .ownerAddress = kTextBase,
+      .trustedOwnerEnd = image.ownerEnd,
+      .preliminaryBlocks = std::span<const Block>(&preliminaryBlock, 1),
+      .containingRegion = region,
+      .limits = {},
+  };
+  auto prior = AnalyzeIndirectSite(decoded, preliminaryInput);
+  REQUIRE(prior.selectedTable);
+  REQUIRE(prior.automaticTable);
+  CHECK(prior.failures.empty());
+  CHECK_FALSE(prior.selectedTable->boundValueIsFiniteIndexDomain);
+  CHECK(prior.selectedTable->boundValue == prior.selectedTable->caseCount - 1);
+  CHECK(prior.selectedTable->storageEnd == kTextBase + 0x5C);
+
+  const std::array expandedBlocks{
+      preliminaryBlock,
+      Block{kExpandedBlockStart, kExpandedBlockEnd - kExpandedBlockStart},
+  };
+  JumpTableRecoveryLimits constrainedLimits;
+  constrainedLimits.maxStates = 64;
+  JumpTableRecoveryInput input{
+      .site = image.site,
+      .ownerAddress = kTextBase,
+      .trustedOwnerEnd = image.ownerEnd,
+      .preliminaryBlocks = expandedBlocks,
+      .containingRegion = region,
+      .priorAutomaticTable = &*prior.selectedTable,
+      .limits = constrainedLimits,
+  };
+
+  const auto hasBudget = [](const IndirectSiteAnalysis& analysis, std::string_view name) {
+    return analysis.dataflow &&
+           std::any_of(analysis.dataflow->exhaustedBudgets.begin(),
+                       analysis.dataflow->exhaustedBudgets.end(), [&](const auto& exhausted) {
+                         return exhausted.budget == name && exhausted.observed > exhausted.limit;
+                       });
+  };
+
+  auto initial = AnalyzeIndirectSite(decoded, input);
+  CHECK_FALSE(initial.selectedTable);
+  CHECK_FALSE(initial.automaticTable);
+  CHECK(initial.failures == std::vector{JumpTableFailure::AnalysisLimit});
+  REQUIRE(initial.dataflow);
+  CHECK(hasBudget(initial, "max_states"));
+  CHECK(hasBudget(initial, "bound_census_max_states"));
+  CHECK(hasBudget(initial, "bound_recovery_max_states"));
+  CHECK(std::none_of(initial.dataflow->exhaustedBudgets.begin(),
+                     initial.dataflow->exhaustedBudgets.end(), [](const auto& exhausted) {
+                       return exhausted.budget != "max_states" &&
+                              exhausted.budget != "bound_census_max_states" &&
+                              exhausted.budget != "bound_recovery_max_states";
+                     }));
+
+  JumpTableRecoveryInput directRetryInput = input;
+  directRetryInput.limits.maxStates = constrainedLimits.maxStates * 32;
+  directRetryInput.allowPriorLocalSliceRecovery = true;
+  auto directRetry = AnalyzeIndirectSite(decoded, directRetryInput);
+  REQUIRE(directRetry.selectedTable);
+  REQUIRE(directRetry.automaticTable);
+  CHECK(directRetry.failures.empty());
+  CHECK(SameValidatedTable(*directRetry.selectedTable, *prior.selectedTable));
+  CHECK_FALSE(directRetry.selectedTable->boundValueIsFiniteIndexDomain);
+  CHECK(directRetry.selectedTable->confidence ==
+        "validated_exact_prior_self_delimiting_inline_table_after_state_retry");
+  REQUIRE(directRetry.dataflow);
+  CHECK(hasBudget(directRetry, "bound_census_max_backward_instructions"));
+  CHECK(hasBudget(directRetry, "bound_recovery_max_backward_instructions"));
+  CHECK(std::none_of(directRetry.dataflow->exhaustedBudgets.begin(),
+                     directRetry.dataflow->exhaustedBudgets.end(), [](const auto& exhausted) {
+                       return exhausted.budget != "bound_census_max_backward_instructions" &&
+                              exhausted.budget != "bound_recovery_max_backward_instructions";
+                     }));
+
+  auto accepted = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input);
+  REQUIRE(accepted.selectedTable);
+  REQUIRE(accepted.automaticTable);
+  CHECK(accepted.failures.empty());
+  CHECK(SameValidatedTable(*accepted.selectedTable, *prior.selectedTable));
+  CHECK_FALSE(accepted.selectedTable->boundValueIsFiniteIndexDomain);
+  REQUIRE(accepted.limitRetry);
+  CHECK(accepted.limitRetry->exhaustedBudget == "max_states");
+  CHECK(accepted.limitRetry->initialBudgetValue == 64);
+  CHECK(accepted.limitRetry->retryBudgetValue == 2048);
+  CHECK(accepted.limitRetry->initialFailures == std::vector{JumpTableFailure::AnalysisLimit});
+  CHECK(accepted.limitRetry->retryFailures.empty());
+  CHECK(accepted.limitRetry->exactPriorTableMatch);
+  CHECK(accepted.limitRetry->accepted);
+
+  JumpTable alteredPrior = *prior.selectedTable;
+  alteredPrior.rawEntries.front().rawValue ^= 1;
+  input.priorAutomaticTable = &alteredPrior;
+  auto rejected = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input);
+  CHECK_FALSE(rejected.selectedTable);
+  CHECK_FALSE(rejected.automaticTable);
+  CHECK(rejected.failures == std::vector{JumpTableFailure::AnalysisLimit});
+  REQUIRE(rejected.limitRetry);
+  CHECK(rejected.limitRetry->exhaustedBudget == "max_states");
+  CHECK(rejected.limitRetry->initialFailures == std::vector{JumpTableFailure::AnalysisLimit});
+  CHECK(rejected.limitRetry->retryFailures == std::vector{JumpTableFailure::AnalysisLimit});
+  CHECK_FALSE(rejected.limitRetry->exactPriorTableMatch);
+  CHECK_FALSE(rejected.limitRetry->accepted);
+  REQUIRE(rejected.dataflow);
+  CHECK(rejected.dataflow->switchLikelihood != JumpTableSwitchLikelihood::ResolvedSwitch);
+  REQUIRE(rejected.dataflow->diagnosticProbe.candidateTable);
+  CHECK(rejected.dataflow->diagnosticProbe.reportOnly);
+}
+
 TEST_CASE("an exact prior local slice survives repeated max_states exhaustion",
           "[codegen][jump-table][limit-retry][local-slice]") {
   AbsoluteSwitch image;
@@ -2175,9 +2511,17 @@ TEST_CASE("an exact prior local slice survives repeated max_states exhaustion",
   CHECK_FALSE(initial.selectedTable);
   CHECK(initial.failures == std::vector{JumpTableFailure::AnalysisLimit});
   REQUIRE(initial.dataflow);
-  REQUIRE(initial.dataflow->exhaustedBudgets.size() == 1);
-  CHECK(initial.dataflow->exhaustedBudgets.front().budget == "max_states");
-  CHECK(initial.dataflow->exhaustedBudgets.front().limit == 16);
+  REQUIRE(initial.dataflow->exhaustedBudgets.size() == 2);
+  CHECK(std::any_of(initial.dataflow->exhaustedBudgets.begin(),
+                    initial.dataflow->exhaustedBudgets.end(), [](const auto& exhausted) {
+                      return exhausted.budget == "max_states" && exhausted.limit == 16 &&
+                             exhausted.observed > exhausted.limit;
+                    }));
+  CHECK(std::any_of(initial.dataflow->exhaustedBudgets.begin(),
+                    initial.dataflow->exhaustedBudgets.end(), [](const auto& exhausted) {
+                      return exhausted.budget == "bound_census_max_states" &&
+                             exhausted.limit == 16 && exhausted.observed > exhausted.limit;
+                    }));
 
   auto accepted = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input);
   REQUIRE(accepted.selectedTable);
@@ -2290,10 +2634,13 @@ TEST_CASE("direct bounded table index abstracts only path-dependent pre-bound pr
                       }));
     REQUIRE(limited.dataflow);
     CHECK(limited.dataflow->mergeShape == "bounded_index_after_state_limit");
-    REQUIRE(limited.dataflow->exhaustedBudgets.size() == 1);
-    CHECK(limited.dataflow->exhaustedBudgets.front().budget == "max_states");
-    CHECK(limited.dataflow->exhaustedBudgets.front().limit == 9);
-    CHECK(limited.dataflow->exhaustedBudgets.front().observed > 1);
+    REQUIRE(limited.dataflow->exhaustedBudgets.size() == 2);
+    CHECK(limited.dataflow->exhaustedBudgets[0].budget == "bound_census_max_states");
+    CHECK(limited.dataflow->exhaustedBudgets[0].limit == 9);
+    CHECK(limited.dataflow->exhaustedBudgets[0].observed == 10);
+    CHECK(limited.dataflow->exhaustedBudgets[1].budget == "max_states");
+    CHECK(limited.dataflow->exhaustedBudgets[1].limit == 9);
+    CHECK(limited.dataflow->exhaustedBudgets[1].observed == 11);
   }
 
   SECTION("the state-limit fallback rejects an unrelated index overwrite after the guard") {
@@ -2971,6 +3318,98 @@ TEST_CASE("case expansion exposes and recovers another indirect site at fixpoint
   CHECK(result.labels.contains(kTextBase + 0xA0));
 }
 
+TEST_CASE("serial switch chains expose the exact function-fixpoint budget",
+          "[codegen][jump-table][integration][fixpoint-budget]") {
+  constexpr uint32_t kSwitchCount = 10;
+  constexpr uint32_t kSwitchStride = 0x30;
+  constexpr uint32_t kFinalCase = kTextBase + 0x300;
+  constexpr uint32_t kDefault = kTextBase + 0x3E0;
+  std::vector<uint8_t> text(0x400, 0);
+  std::vector<uint8_t> table(0x100, 0);
+  for (uint32_t offset = 0; offset < text.size(); offset += 4)
+    StoreBe32(text, offset, 0x60000000);  // nop
+
+  for (uint32_t index = 0; index < kSwitchCount; ++index) {
+    const uint32_t offset = index * kSwitchStride;
+    const uint32_t block = kTextBase + offset;
+    const uint32_t tableOffset = index * 8;
+    const uint32_t next =
+        index + 1 < kSwitchCount ? kTextBase + (index + 1) * kSwitchStride : kFinalCase;
+    StoreBe32(text, offset + 0x00, 0x28030001);  // cmplwi r3, 1
+    StoreBe32(text, offset + 0x04, Bc(block + 0x04, kDefault, 12, 1));
+    StoreBe32(text, offset + 0x08, 0x3C802000);  // lis r4, table@h
+    StoreBe32(text, offset + 0x0C, 0x60840000 | tableOffset);
+    StoreBe32(text, offset + 0x10, Rlwinm(6, 3, 2, 0, 29));
+    StoreBe32(text, offset + 0x14, Lwzx(5, 4, 6));
+    StoreBe32(text, offset + 0x18, Mtctr(5));
+    StoreBe32(text, offset + 0x1C, 0x4E800420);  // bctr
+    StoreBe32(table, tableOffset, next);
+    StoreBe32(table, tableOffset + 4, next);
+  }
+  StoreBe32(text, kFinalCase - kTextBase, 0x4E800020);
+  StoreBe32(text, kDefault - kTextBase, 0x4E800020);
+
+  const std::array sections{
+      BinarySectionInput{.name = ".text",
+                         .baseAddress = kTextBase,
+                         .data = text,
+                         .executable = true,
+                         .readable = true},
+      BinarySectionInput{
+          .name = ".rdata", .baseAddress = kTableBase, .data = table, .readable = true},
+  };
+  auto view = BinaryView::fromSections(kTextBase, kTextBase + text.size(), kTextBase, sections);
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+  const std::unordered_set<uint32_t> functions{kTextBase};
+  const auto savedFixpointLimit = REXCVAR_GET(jump_table_fixpoint_iterations);
+  const auto analyze = [&](uint32_t fixpointLimit) {
+    REXCVAR_SET(jump_table_fixpoint_iterations, fixpointLimit);
+    return discoverBlocks(decoded, kTextBase, *region, functions,
+                          static_cast<uint32_t>(text.size()));
+  };
+
+  auto limited = analyze(8);
+  auto complete = analyze(16);
+  REXCVAR_SET(jump_table_fixpoint_iterations, savedFixpointLimit);
+
+  REQUIRE(limited.jumpTableRecovery.fixpointIterations == 8);
+  CHECK(limited.jumpTableRecovery.analysisLimitHit);
+  CHECK(limited.jumpTables.size() < kSwitchCount);
+  const auto limitedFirst =
+      std::find_if(limited.indirectSites.begin(), limited.indirectSites.end(),
+                   [](const auto& site) { return site.site == kTextBase + 0x1C; });
+  REQUIRE(limitedFirst != limited.indirectSites.end());
+  CHECK(HasFailure(*limitedFirst, JumpTableFailure::AnalysisLimit));
+  REQUIRE(limitedFirst->dataflow);
+  const auto functionLimit = std::find_if(
+      limitedFirst->dataflow->exhaustedBudgets.begin(),
+      limitedFirst->dataflow->exhaustedBudgets.end(),
+      [](const auto& exhausted) { return exhausted.budget == "function_fixpoint_iterations"; });
+  REQUIRE(functionLimit != limitedFirst->dataflow->exhaustedBudgets.end());
+  CHECK(functionLimit->limit == 8);
+  CHECK(functionLimit->observed == 9);
+
+  CHECK_FALSE(complete.jumpTableRecovery.analysisLimitHit);
+  CHECK(complete.jumpTableRecovery.fixpointIterations == kSwitchCount + 1);
+  REQUIRE(complete.jumpTables.size() == kSwitchCount);
+  CHECK(std::all_of(
+      complete.indirectSites.begin(), complete.indirectSites.end(), [](const auto& site) {
+        return !site.usesCtr || site.link || (site.selectedTable && site.failures.empty());
+      }));
+  CHECK(complete.jumpTableLimits.maxBackwardInstructions ==
+        limited.jumpTableLimits.maxBackwardInstructions);
+  CHECK(complete.jumpTableLimits.maxPredecessors == limited.jumpTableLimits.maxPredecessors);
+  CHECK(complete.jumpTableLimits.maxStates == limited.jumpTableLimits.maxStates);
+  CHECK(complete.jumpTableLimits.maxCfgTopologyNodes ==
+        limited.jumpTableLimits.maxCfgTopologyNodes);
+  CHECK(complete.jumpTableLimits.maxEntries == limited.jumpTableLimits.maxEntries);
+  CHECK(complete.jumpTableLimits.maxFixpointIterations == 16);
+  CHECK(limited.jumpTableLimits.maxFixpointIterations == 8);
+}
+
 TEST_CASE("case-expanded CFG carries an upstream bounded index to a secondary table",
           "[codegen][jump-table][integration][inherited-bound]") {
   auto makeImage = [] {
@@ -3541,6 +3980,8 @@ TEST_CASE("equivalent repeated guards retain a bounded switch across a loop merg
   REQUIRE(dispatch->selectedTable);
   CHECK(dispatch->selectedTable->confidence ==
         "validated_exact_prior_bound_family_local_bounded_slice");
+  CHECK(dispatch->selectedTable->boundSemantics == "unsigned_index <= bound");
+  CHECK(dispatch->selectedTable->boundValueIsFiniteIndexDomain);
   CHECK(std::any_of(dispatch->selectedTable->evidence.begin(),
                     dispatch->selectedTable->evidence.end(), [](const auto& evidence) {
                       return evidence.address == kTextBase + 0x04 &&
@@ -3927,7 +4368,13 @@ TEST_CASE("loop-carried recovery uses bounded SCC topology beyond the resolver-s
   REQUIRE(expanded.dataflow);
   CHECK(expanded.dataflow->caseExpandedCfg);
   CHECK(expanded.dataflow->sourceInScc);
-  CHECK(expanded.dataflow->exhaustedBudgets.empty());
+  REQUIRE(expanded.dataflow->exhaustedBudgets.size() == 2);
+  CHECK(expanded.dataflow->exhaustedBudgets[0].budget == "bound_census_max_states");
+  CHECK(expanded.dataflow->exhaustedBudgets[0].limit == 64);
+  CHECK(expanded.dataflow->exhaustedBudgets[0].observed == 65);
+  CHECK(expanded.dataflow->exhaustedBudgets[1].budget == "bound_recovery_max_states");
+  CHECK(expanded.dataflow->exhaustedBudgets[1].limit == 64);
+  CHECK(expanded.dataflow->exhaustedBudgets[1].observed == 65);
   REQUIRE(expanded.loopEvidence.size() == 2);
   const auto outer =
       std::find_if(expanded.loopEvidence.begin(), expanded.loopEvidence.end(),
@@ -4402,8 +4849,12 @@ TEST_CASE("a guarded loaded index does not spend CFG states resolving its source
   CHECK(unknownBase.selectedTable->targets == recovered.selectedTable->targets);
   CHECK(unknownBase.selectedTable->rawEntries == recovered.selectedTable->rawEntries);
   REQUIRE(unknownBase.dataflow);
-  REQUIRE(unknownBase.dataflow->exhaustedBudgets.size() == 1);
-  CHECK(unknownBase.dataflow->exhaustedBudgets.front().budget == "max_states");
-  CHECK(unknownBase.dataflow->exhaustedBudgets.front().limit == 512);
-  CHECK(unknownBase.dataflow->exhaustedBudgets.front().observed > 512);
+  REQUIRE(unknownBase.dataflow->exhaustedBudgets.size() == 2);
+  CHECK(unknownBase.dataflow->exhaustedBudgets[0].budget ==
+        "bound_census_max_backward_instructions");
+  CHECK(unknownBase.dataflow->exhaustedBudgets[0].limit == 96);
+  CHECK(unknownBase.dataflow->exhaustedBudgets[0].observed == 97);
+  CHECK(unknownBase.dataflow->exhaustedBudgets[1].budget == "max_states");
+  CHECK(unknownBase.dataflow->exhaustedBudgets[1].limit == 512);
+  CHECK(unknownBase.dataflow->exhaustedBudgets[1].observed == 514);
 }
