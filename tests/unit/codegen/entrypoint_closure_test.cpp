@@ -451,9 +451,23 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
   inlineExtent.selfDelimitedInlineTableExtent = true;
   inlineExtent.tableStorageStart = kTextBase + 0x44;
   inlineExtent.tableStorageEnd = kTextBase + 0x54;
+  inlineExtent.inlineBoundaryCfgVerified = true;
+  inlineExtent.inlineBoundaryBlockStart = kTextBase + 0x54;
+  inlineExtent.inlineBoundaryBlockEnd = kTextBase + 0x60;
+  inlineExtent.inlineBoundaryTerminator = kTextBase + 0x5C;
   dataflow.boundCandidates.push_back(std::move(inlineExtent));
   dataflow.diagnosticProbe.attempted = true;
   dataflow.diagnosticProbe.rejections = {"no_exact_dominating_unsigned_bound"};
+  JumpTable probeTable;
+  probeTable.bctrAddress = kTextBase + 0x30;
+  probeTable.ownerAddress = kTextBase;
+  probeTable.tableAddress = kTextBase + 0x44;
+  probeTable.storageEnd = kTextBase + 0x54;
+  probeTable.boundValue = 3;
+  probeTable.boundValueIsFiniteIndexDomain = false;
+  probeTable.caseCount = 4;
+  probeTable.origin = JumpTableOrigin::Automatic;
+  dataflow.diagnosticProbe.candidateTable = std::move(probeTable);
   JumpTableEntryRegisterDomainEvidence entryDomain;
   entryDomain.entryAddress = kTextBase;
   entryDomain.registerIndex = 7;
@@ -519,6 +533,10 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
     CHECK(site.at("dataflow").at("diagnostic_probe").at("report_only") == true);
     CHECK(site.at("dataflow").at("diagnostic_probe").at("rejections").front() ==
           "no_exact_dominating_unsigned_bound");
+    CHECK(site.at("dataflow")
+              .at("diagnostic_probe")
+              .at("candidate_table")
+              .at("bound_value_is_finite_index_domain") == false);
     const auto& inheritedDomain = site.at("dataflow").at("bound_candidates").front();
     CHECK(inheritedDomain.at("inherited_finite_case_domain") == true);
     CHECK(inheritedDomain.at("finite_values") == nlohmann::json::array({1, 2, 3}));
@@ -534,6 +552,10 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
     CHECK(inlineExtent.at("finite_dense_domain") == false);
     CHECK(inlineExtent.at("table_storage_start") == "0x10000044");
     CHECK(inlineExtent.at("table_storage_end") == "0x10000054");
+    CHECK(inlineExtent.at("inline_boundary_cfg_verified") == true);
+    CHECK(inlineExtent.at("inline_boundary_block_start") == "0x10000054");
+    CHECK(inlineExtent.at("inline_boundary_block_end") == "0x10000060");
+    CHECK(inlineExtent.at("inline_boundary_terminator") == "0x1000005C");
     const auto& entryDomain = site.at("dataflow").at("entry_register_domains").front();
     CHECK(entryDomain.at("all_references_direct_calls") == true);
     CHECK(entryDomain.at("finite_dense_domain") == false);

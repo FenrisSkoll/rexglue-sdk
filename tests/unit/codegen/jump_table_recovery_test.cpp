@@ -209,6 +209,10 @@ struct InlineAbsoluteSwitch {
       StoreBe32(text, 0x30 + index * 4, expectedTargets[index]);
     for (uint32_t target : std::set<uint32_t>(expectedTargets.begin(), expectedTargets.end()))
       StoreBe32(text, target - kTextBase, 0x4E800020);  // case block
+    // Make the first post-table case a genuine two-instruction basic block.
+    // The boundary proof must not succeed on a lone plausible instruction.
+    StoreBe32(text, 0x5C, 0x60000000);  // nop
+    StoreBe32(text, 0x60, 0x4E800020);  // blr
   }
 
   BinaryView view() const {
@@ -351,6 +355,7 @@ bool SameValidatedTable(const JumpTable& lhs, const JumpTable& rhs) {
          lhs.kind == rhs.kind && lhs.origin == rhs.origin &&
          lhs.manualComparison == rhs.manualComparison && lhs.ownerAddress == rhs.ownerAddress &&
          lhs.storageEnd == rhs.storageEnd && lhs.boundValue == rhs.boundValue &&
+         lhs.boundValueIsFiniteIndexDomain == rhs.boundValueIsFiniteIndexDomain &&
          lhs.caseCount == rhs.caseCount && lhs.defaultTarget == rhs.defaultTarget &&
          lhs.anchorAddress == rhs.anchorAddress && lhs.targetScale == rhs.targetScale &&
          lhs.elementWidth == rhs.elementWidth && lhs.elementSigned == rhs.elementSigned &&
@@ -963,16 +968,15 @@ TEST_CASE("self-delimiting inline absolute tables require an exact static extent
     CHECK(analysis.selectedTable->kind == JumpTableKind::AbsolutePointer);
     CHECK(analysis.selectedTable->elementWidth == 4);
     CHECK_FALSE(analysis.selectedTable->elementSigned);
-    CHECK(analysis.selectedTable->boundSemantics ==
-          "self_delimiting_inline_absolute_table_extent");
+    CHECK_FALSE(analysis.selectedTable->boundValueIsFiniteIndexDomain);
+    CHECK(analysis.selectedTable->boundSemantics == "self_delimiting_inline_absolute_table_extent");
     CHECK(analysis.selectedTable->confidence ==
           "validated_self_delimiting_inline_absolute_table_all_targets");
     CHECK(analysis.selectedTable->targets == image.expectedTargets);
     REQUIRE(analysis.selectedTable->rawEntries.size() == image.expectedTargets.size());
     for (uint32_t index = 0; index < image.expectedTargets.size(); ++index) {
-      const JumpTableRawEntry expectedEntry{image.tableBase + index * 4,
-                                            image.expectedTargets[index],
-                                            image.expectedTargets[index]};
+      const JumpTableRawEntry expectedEntry{
+          image.tableBase + index * 4, image.expectedTargets[index], image.expectedTargets[index]};
       CHECK(analysis.selectedTable->rawEntries[index] == expectedEntry);
     }
     REQUIRE(analysis.dataflow);
@@ -984,6 +988,10 @@ TEST_CASE("self-delimiting inline absolute tables require an exact static extent
     CHECK(extent->tableStorageStart == image.tableBase);
     CHECK(extent->tableStorageEnd == kTextBase + 0x5C);
     CHECK(extent->caseCount == 11);
+    CHECK(extent->inlineBoundaryCfgVerified);
+    CHECK(extent->inlineBoundaryBlockStart == kTextBase + 0x5C);
+    CHECK(extent->inlineBoundaryBlockEnd == kTextBase + 0x64);
+    CHECK(extent->inlineBoundaryTerminator == kTextBase + 0x60);
 
     auto view = image.view();
     DecodedBinary decoded(view);
@@ -991,8 +999,8 @@ TEST_CASE("self-delimiting inline absolute tables require an exact static extent
     const auto* region = decoded.regionContaining(kTextBase);
     REQUIRE(region != nullptr);
     const std::unordered_set<uint32_t> functions{kTextBase, image.ownerEnd};
-    auto discovered = discoverBlocks(decoded, kTextBase, *region, functions,
-                                     image.ownerEnd - kTextBase);
+    auto discovered =
+        discoverBlocks(decoded, kTextBase, *region, functions, image.ownerEnd - kTextBase);
     REQUIRE(discovered.jumpTables.size() == 1);
     CHECK(discovered.jumpTables.front().bctrAddress == image.site);
     CHECK(discovered.jumpTables.front().targets == image.expectedTargets);
@@ -1016,9 +1024,10 @@ TEST_CASE("self-delimiting inline absolute tables require an exact static extent
     CHECK_FALSE(analysis.selectedTable);
     CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
     REQUIRE(analysis.dataflow);
-    CHECK(std::find(analysis.dataflow->rejectionEvidence.begin(),
-                    analysis.dataflow->rejectionEvidence.end(),
-                    "self_delimiting_inline_table:inline_table_target_outside_exact_owner:index=11") !=
+    CHECK(std::find(
+              analysis.dataflow->rejectionEvidence.begin(),
+              analysis.dataflow->rejectionEvidence.end(),
+              "self_delimiting_inline_table:inline_table_target_outside_exact_owner:index=11") !=
           analysis.dataflow->rejectionEvidence.end());
   }
 
@@ -1032,6 +1041,57 @@ TEST_CASE("self-delimiting inline absolute tables require an exact static extent
     CHECK(std::find(analysis.dataflow->rejectionEvidence.begin(),
                     analysis.dataflow->rejectionEvidence.end(),
                     "self_delimiting_inline_table:inline_table_target_unaligned:index=1") !=
+          analysis.dataflow->rejectionEvidence.end());
+  }
+
+  SECTION("an early storage-end coincidence cannot truncate a longer valid table") {
+    InlineAbsoluteSwitch image;
+    // After three entries the running storage end is 0x1000003C. Entry zero
+    // points there, while the word stored there is both a valid fourth table
+    // entry and a decodable in-owner PPC instruction. Accepting the first
+    // storageEnd == minimumTarget equality would incorrectly emit a 3-entry
+    // prefix of the actual 11-entry table.
+    StoreBe32(image.text, 0x30, kTextBase + 0x3C);
+
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const auto boundaryWord = decoded.read<uint32_t>(kTextBase + 0x3C);
+    REQUIRE(boundaryWord);
+    CHECK(*boundaryWord == kTextBase + 0xA0);
+    const auto* plausibleInstruction = decoded.get(kTextBase + 0x3C);
+    REQUIRE(plausibleInstruction != nullptr);
+    CHECK_FALSE(isInvalid(*plausibleInstruction));
+    const auto* continuationTarget = decoded.get(*boundaryWord);
+    REQUIRE(continuationTarget != nullptr);
+    CHECK_FALSE(isInvalid(*continuationTarget));
+
+    auto analysis = analyze(image);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK_FALSE(analysis.automaticTable);
+    CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
+    REQUIRE(analysis.dataflow);
+    CHECK(std::find(analysis.dataflow->rejectionEvidence.begin(),
+                    analysis.dataflow->rejectionEvidence.end(),
+                    "self_delimiting_inline_table:inline_table_boundary_word_is_valid_continuation_"
+                    "entry") != analysis.dataflow->rejectionEvidence.end());
+    CHECK(std::none_of(analysis.dataflow->boundCandidates.begin(),
+                       analysis.dataflow->boundCandidates.end(),
+                       [](const auto& bound) { return bound.selfDelimitedInlineTableExtent; }));
+  }
+
+  SECTION("a lone plausible instruction is not a case-block boundary proof") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x5C, 0x4E800020);  // blr immediately at the claimed boundary
+
+    auto analysis = analyze(image);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK_FALSE(analysis.automaticTable);
+    CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
+    REQUIRE(analysis.dataflow);
+    CHECK(std::find(analysis.dataflow->rejectionEvidence.begin(),
+                    analysis.dataflow->rejectionEvidence.end(),
+                    "self_delimiting_inline_table:inline_table_boundary_cfg_not_proven") !=
           analysis.dataflow->rejectionEvidence.end());
   }
 
@@ -2894,7 +2954,8 @@ TEST_CASE("validated case domains recover only finite downstream switch tables",
     IndirectSiteAnalysis expandedInner;
   };
 
-  const auto analyze = [](AbsoluteSwitch& image, uint32_t innerSite) {
+  const auto analyze = [](AbsoluteSwitch& image, uint32_t innerSite,
+                          bool sourceBoundIsFiniteIndexDomain = true) {
     auto view = image.view();
     DecodedBinary decoded(view);
     decoded.decode();
@@ -2912,6 +2973,9 @@ TEST_CASE("validated case domains recover only finite downstream switch tables",
     auto outer = AnalyzeIndirectSite(decoded, outerInput);
     REQUIRE(outer.selectedTable);
     REQUIRE(outer.selectedTable->caseCount == 5);
+    outer.selectedTable->boundValueIsFiniteIndexDomain = sourceBoundIsFiniteIndexDomain;
+    REQUIRE(outer.automaticTable);
+    outer.automaticTable->boundValueIsFiniteIndexDomain = sourceBoundIsFiniteIndexDomain;
 
     JumpTableRecoveryInput innerInput{
         .site = innerSite,
@@ -3090,6 +3154,24 @@ TEST_CASE("validated case domains recover only finite downstream switch tables",
           std::vector<JumpTableCfgEdgeEvidence>{{kTextBase + 0x20, kTextBase + 0x40}});
     CHECK(transformedDomain->stackSpillAddress == 0);
     CHECK(transformedDomain->stackReloadAddress == 0);
+  }
+
+  SECTION("a storage-only case count is not inherited as a runtime index domain") {
+    auto image = makeTransformedImage();
+    auto result = analyze(image, kTextBase + 0x58, false);
+
+    REQUIRE(result.outer.selectedTable);
+    CHECK_FALSE(result.outer.selectedTable->boundValueIsFiniteIndexDomain);
+    CHECK(result.outer.selectedTable->boundValue == result.outer.selectedTable->caseCount - 1);
+    CHECK_FALSE(result.expandedInner.selectedTable);
+    CHECK_FALSE(result.expandedInner.automaticTable);
+    CHECK(HasFailure(result.expandedInner, JumpTableFailure::MissingBound));
+    REQUIRE(result.expandedInner.dataflow);
+    CHECK(std::none_of(result.expandedInner.dataflow->boundCandidates.begin(),
+                       result.expandedInner.dataflow->boundCandidates.end(), [](const auto& bound) {
+                         return bound.finiteDenseDomain || bound.inheritedCaseEdgeProof ||
+                                bound.inheritedFiniteCaseDomain;
+                       }));
   }
 
   SECTION("a non-dense transformed case domain remains unresolved") {

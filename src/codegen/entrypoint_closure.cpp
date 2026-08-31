@@ -1161,9 +1161,9 @@ static EntrypointClosureReport AnalyzeEntrypointClosureDecoded(const BinaryView&
         !matchingFiniteBound &&
         std::any_of(dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
                     [](const auto& bound) { return bound.finiteDenseDomain; });
-    const bool selfDelimitedInlineExtent = std::any_of(
-        dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
-        [](const auto& bound) { return bound.selfDelimitedInlineTableExtent; });
+    const bool selfDelimitedInlineExtent =
+        std::any_of(dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
+                    [](const auto& bound) { return bound.selfDelimitedInlineTableExtent; });
     if (matchingFiniteBound)
       addEvidence("finite_dominating_bound_for_table_index");
     if (unmatchedFiniteBound)
@@ -1470,6 +1470,7 @@ Json JumpTableJson(const JumpTable& table) {
       {"table_in_executable_section", table.tableInExecutableSection},
       {"index_register", table.indexRegister},
       {"bound_value", table.boundValue},
+      {"bound_value_is_finite_index_domain", table.boundValueIsFiniteIndexDomain},
       {"bound_inclusive", table.boundInclusive},
       {"bound_semantics", table.boundSemantics},
       {"case_count", table.caseCount},
@@ -1559,6 +1560,13 @@ Json JumpBoundCandidateJson(const JumpTableBoundCandidateEvidence& bound) {
        bound.tableStorageStart ? Json(Hex(bound.tableStorageStart)) : Json(nullptr)},
       {"table_storage_end",
        bound.tableStorageEnd ? Json(Hex(bound.tableStorageEnd)) : Json(nullptr)},
+      {"inline_boundary_cfg_verified", bound.inlineBoundaryCfgVerified},
+      {"inline_boundary_block_start",
+       bound.inlineBoundaryBlockStart ? Json(Hex(bound.inlineBoundaryBlockStart)) : Json(nullptr)},
+      {"inline_boundary_block_end",
+       bound.inlineBoundaryBlockEnd ? Json(Hex(bound.inlineBoundaryBlockEnd)) : Json(nullptr)},
+      {"inline_boundary_terminator",
+       bound.inlineBoundaryTerminator ? Json(Hex(bound.inlineBoundaryTerminator)) : Json(nullptr)},
       {"finite_values", std::move(finiteValues)},
       {"normalized_finite_values", std::move(normalizedFiniteValues)},
       {"inherited_case_edges", std::move(inheritedCaseEdges)},
@@ -2315,10 +2323,9 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
         proofKind = "finite_cfg_domain";
       else if (bound.interproceduralEntryDomain)
         proofKind = "interprocedural_entry_domain";
-      const char* domainDisposition = bound.selfDelimitedInlineTableExtent
-                                          ? "finite_table_extent"
-                                      : bound.finiteDenseDomain ? "finite"
-                                                                : "rejected";
+      const char* domainDisposition = bound.selfDelimitedInlineTableExtent ? "finite_table_extent"
+                                      : bound.finiteDenseDomain            ? "finite"
+                                                                           : "rejected";
       bounds << (bound.compareAddress ? Hex(bound.compareAddress) : Hex(bound.domainOriginAddress))
              << ':' << bound.caseCount << ':'
              << (bound.dominatesDispatch ? "dominates" : "not_dominating") << ':'

@@ -339,6 +339,9 @@ struct JumpTable {
   uint32_t ownerAddress = 0;
   uint32_t storageEnd = 0;
   uint32_t boundValue = 0;
+  // False when boundValue describes only a finite storage extent. Consumers
+  // must not turn that value into a runtime index-domain proof.
+  bool boundValueIsFiniteIndexDomain = true;
   uint32_t caseCount = 0;
   uint32_t defaultTarget = 0;
   uint32_t anchorAddress = 0;
@@ -458,6 +461,10 @@ struct JumpTableBoundCandidateEvidence {
   bool selfDelimitedInlineTableExtent = false;
   uint32_t tableStorageStart = 0;
   uint32_t tableStorageEnd = 0;
+  bool inlineBoundaryCfgVerified = false;
+  uint32_t inlineBoundaryBlockStart = 0;
+  uint32_t inlineBoundaryBlockEnd = 0;
+  uint32_t inlineBoundaryTerminator = 0;
   std::vector<uint32_t> finiteValues;
   std::vector<uint32_t> normalizedFiniteValues;
   std::vector<JumpTableCfgEdgeEvidence> inheritedCaseEdges;

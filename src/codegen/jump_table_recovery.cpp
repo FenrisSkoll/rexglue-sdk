@@ -2275,6 +2275,7 @@ bool SameRecoveryTableSemantics(const JumpTable& lhs, const JumpTable& rhs) {
          lhs.kind == rhs.kind && lhs.origin == rhs.origin &&
          lhs.manualComparison == rhs.manualComparison && lhs.ownerAddress == rhs.ownerAddress &&
          lhs.storageEnd == rhs.storageEnd && lhs.boundValue == rhs.boundValue &&
+         lhs.boundValueIsFiniteIndexDomain == rhs.boundValueIsFiniteIndexDomain &&
          lhs.caseCount == rhs.caseCount && lhs.defaultTarget == rhs.defaultTarget &&
          lhs.anchorAddress == rhs.anchorAddress && lhs.targetScale == rhs.targetScale &&
          lhs.elementWidth == rhs.elementWidth && lhs.elementSigned == rhs.elementSigned &&
@@ -2635,8 +2636,8 @@ std::vector<JumpTableBoundCandidateEvidence> RecoverExactPriorBoundEvidence(
   const auto* prior = input.priorAutomaticTable;
   if (!prior || prior->origin != JumpTableOrigin::Automatic || prior->bctrAddress != input.site ||
       prior->ownerAddress != input.ownerAddress || prior->indexRegister == 0xFF ||
-      prior->caseCount == 0 || prior->rawEntries.size() != prior->caseCount ||
-      prior->targets.size() != prior->caseCount) {
+      !prior->boundValueIsFiniteIndexDomain || prior->caseCount == 0 ||
+      prior->rawEntries.size() != prior->caseCount || prior->targets.size() != prior->caseCount) {
     return output;
   }
 
@@ -3468,8 +3469,8 @@ std::vector<JumpTableBoundCandidateEvidence> CollectInheritedBoundEvidence(
     return output;
   for (const auto& [site, table] : *input.validatedOwnerTables) {
     if (site == input.site || table.origin != JumpTableOrigin::Automatic ||
-        table.ownerAddress != input.ownerAddress || !cfg.contains(site) ||
-        table.indexRegister == 0xFF || table.caseCount == 0 ||
+        table.ownerAddress != input.ownerAddress || !table.boundValueIsFiniteIndexDomain ||
+        !cfg.contains(site) || table.indexRegister == 0xFF || table.caseCount == 0 ||
         table.targets.size() != table.caseCount || table.rawEntries.size() != table.caseCount ||
         !std::all_of(table.targets.begin(), table.targets.end(),
                      [&](uint32_t target) { return cfg.contains(target); })) {
@@ -3581,9 +3582,10 @@ InheritedBoundProof FindInheritedBoundProof(DecodedBinary& decoded,
 
   for (const auto& [site, table] : *input.validatedOwnerTables) {
     if (site == input.site || table.origin != JumpTableOrigin::Automatic ||
-        table.ownerAddress != input.ownerAddress || table.indexRegister != bound.indexRegister ||
-        table.boundValue != bound.value || table.caseCount != bound.caseCount ||
-        table.boundInclusive != bound.inclusive || table.defaultIsReturn != bound.defaultIsReturn ||
+        table.ownerAddress != input.ownerAddress || !table.boundValueIsFiniteIndexDomain ||
+        table.indexRegister != bound.indexRegister || table.boundValue != bound.value ||
+        table.caseCount != bound.caseCount || table.boundInclusive != bound.inclusive ||
+        table.defaultIsReturn != bound.defaultIsReturn ||
         (!bound.defaultIsReturn && table.defaultTarget != bound.defaultTarget) ||
         table.targets.size() != table.caseCount || table.rawEntries.size() != table.caseCount) {
       continue;
@@ -4089,10 +4091,63 @@ struct InlineAbsoluteTableExtentRecovery {
   bool structurallyEligible = false;
   bool productionEligible = false;
   bool entryLimitHit = false;
+  bool boundaryInstructionLimitHit = false;
   std::optional<JumpTable> table;
   std::optional<JumpTableBoundCandidateEvidence> extentEvidence;
   std::vector<std::string> rejections;
 };
+
+struct InlineCaseBoundaryCfgProof {
+  uint32_t blockStart = 0;
+  uint32_t blockEnd = 0;
+  const Instruction* terminator = nullptr;
+};
+
+std::optional<InlineCaseBoundaryCfgProof> ProveInlineCaseBoundaryCfg(
+    DecodedBinary& decoded, const JumpTableRecoveryInput& input, uint32_t tableBase,
+    uint32_t boundary, bool* instructionLimitHit) {
+  if (instructionLimitHit)
+    *instructionLimitHit = false;
+  if (!input.containingRegion || boundary < input.ownerAddress ||
+      boundary >= input.trustedOwnerEnd || !input.containingRegion->contains(boundary)) {
+    return std::nullopt;
+  }
+
+  uint32_t decodedCount = 0;
+  for (uint32_t address = boundary;
+       address < input.trustedOwnerEnd && decodedCount < input.limits.maxBackwardInstructions;
+       address += 4) {
+    const auto* instruction = decoded.get(address);
+    if (!instruction || isInvalid(*instruction))
+      return std::nullopt;
+    ++decodedCount;
+    if (!instruction->is_branch() || instruction->is_call())
+      continue;
+    if (decodedCount < 2 || (instruction->is_indirect_branch() && !instruction->is_return()))
+      return std::nullopt;
+    if (!instruction->is_return()) {
+      if (!instruction->branch_target)
+        return std::nullopt;
+      const uint32_t target = *instruction->branch_target;
+      if (target >= tableBase && target < boundary)
+        return std::nullopt;
+      if (target >= input.ownerAddress && target < input.trustedOwnerEnd) {
+        const auto* targetInstruction = decoded.get(target);
+        if (!targetInstruction || isInvalid(*targetInstruction))
+          return std::nullopt;
+      }
+    }
+    return InlineCaseBoundaryCfgProof{
+        .blockStart = boundary,
+        .blockEnd = address + 4,
+        .terminator = instruction,
+    };
+  }
+
+  if (decodedCount == input.limits.maxBackwardInstructions && instructionLimitHit)
+    *instructionLimitHit = true;
+  return std::nullopt;
+}
 
 bool CollectInlineAddressTerms(const ExprPtr& expression, uint32_t& constant,
                                std::vector<ExprPtr>& dynamicTerms, uint32_t depth = 0) {
@@ -4201,8 +4256,7 @@ InlineAbsoluteTableExtentRecovery RecoverSelfDelimitedInlineAbsoluteTable(
   table.boundSemantics = "self_delimiting_inline_absolute_table_extent";
   table.confidence = "validated_self_delimiting_inline_absolute_table_all_targets";
   table.evidence = instructionEvidence;
-  table.evidence.push_back(
-      Evidence(*scaleInstruction, "self_delimiting_inline_table_index_scale"));
+  table.evidence.push_back(Evidence(*scaleInstruction, "self_delimiting_inline_table_index_scale"));
   table.evidence.push_back(Evidence(*loadInstruction, "self_delimiting_inline_table_load"));
 
   constexpr uint32_t kMinimumInlineTableEntries = 3;
@@ -4237,8 +4291,8 @@ InlineAbsoluteTableExtentRecovery RecoverSelfDelimitedInlineAbsoluteTable(
       return recovery;
     }
     const auto* targetInstruction = decoded.get(caseTarget);
-    if (!targetInstruction || isInvalid(*targetInstruction) ||
-        caseTarget < input.ownerAddress || caseTarget >= input.trustedOwnerEnd) {
+    if (!targetInstruction || isInvalid(*targetInstruction) || caseTarget < input.ownerAddress ||
+        caseTarget >= input.trustedOwnerEnd) {
       reject("inline_table_target_outside_exact_owner:index=" + std::to_string(index));
       return recovery;
     }
@@ -4262,13 +4316,46 @@ InlineAbsoluteTableExtentRecovery RecoverSelfDelimitedInlineAbsoluteTable(
       return recovery;
     }
 
+    // The first equality alone is circular: a table entry can point at an
+    // intermediate storage end, whose next table word may also decode as PPC.
+    // Reject the candidate if that boundary word is still a valid entry under
+    // the exact same absolute-table rules.
+    const auto boundaryWord = decoded.read<uint32_t>(storageEnd);
+    if (!boundaryWord) {
+      reject("inline_table_boundary_word_unreadable");
+      return recovery;
+    }
+    const auto* continuationTargetInstruction = decoded.get(*boundaryWord);
+    const bool continuationCallable = input.independentlyCallableEntries &&
+                                      *boundaryWord != input.ownerAddress &&
+                                      input.independentlyCallableEntries->contains(*boundaryWord);
+    if ((*boundaryWord & 3) == 0 && *boundaryWord >= input.ownerAddress &&
+        *boundaryWord < input.trustedOwnerEnd && continuationTargetInstruction &&
+        !isInvalid(*continuationTargetInstruction) && !continuationCallable) {
+      reject("inline_table_boundary_word_is_valid_continuation_entry");
+      return recovery;
+    }
+
+    bool boundaryInstructionLimitHit = false;
+    auto boundaryProof = ProveInlineCaseBoundaryCfg(decoded, input, tableBase, storageEnd,
+                                                    &boundaryInstructionLimitHit);
+    if (!boundaryProof) {
+      recovery.boundaryInstructionLimitHit = boundaryInstructionLimitHit;
+      reject(boundaryInstructionLimitHit ? "inline_table_boundary_cfg_instruction_limit"
+                                         : "inline_table_boundary_cfg_not_proven");
+      return recovery;
+    }
+
     table.storageEnd = storageEnd;
     table.caseCount = static_cast<uint32_t>(table.targets.size());
     table.boundValue = table.caseCount - 1;
+    table.boundValueIsFiniteIndexDomain = false;
     table.manualComparison = input.manualTable ? CompareManual(table, *input.manualTable)
                                                : JumpTableManualComparison::NewAutomaticTable;
     table.evidence.push_back(
         Evidence(*targetInstruction, "self_delimiting_inline_table_storage_boundary_case"));
+    table.evidence.push_back(Evidence(*boundaryProof->terminator,
+                                      "self_delimiting_inline_table_boundary_cfg_terminator"));
 
     JumpTableBoundCandidateEvidence extent;
     extent.domainOriginAddress = tableBase;
@@ -4279,6 +4366,10 @@ InlineAbsoluteTableExtentRecovery RecoverSelfDelimitedInlineAbsoluteTable(
     extent.selfDelimitedInlineTableExtent = true;
     extent.tableStorageStart = tableBase;
     extent.tableStorageEnd = storageEnd;
+    extent.inlineBoundaryCfgVerified = true;
+    extent.inlineBoundaryBlockStart = boundaryProof->blockStart;
+    extent.inlineBoundaryBlockEnd = boundaryProof->blockEnd;
+    extent.inlineBoundaryTerminator = boundaryProof->terminator->address;
     recovery.extentEvidence = std::move(extent);
     recovery.table = std::move(table);
     return recovery;
@@ -5792,14 +5883,19 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
   // accept it only for the exact missing_bound lifecycle. Ambiguity, limits,
   // and any prior target-validation failure remain authoritative.
   if (!analysis.automaticTable && mtctr && resolvedTarget) {
-    auto inlineExtent = RecoverSelfDelimitedInlineAbsoluteTable(
-        decoded, input, *mtctr, *resolvedTarget, analysis.evidence);
+    auto inlineExtent = RecoverSelfDelimitedInlineAbsoluteTable(decoded, input, *mtctr,
+                                                                *resolvedTarget, analysis.evidence);
     for (const auto& rejection : inlineExtent.rejections) {
       dataflow.rejectionEvidence.push_back("self_delimiting_inline_table:" + rejection);
     }
     if (inlineExtent.entryLimitHit) {
       dataflow.exhaustedBudgets.push_back(
           {"max_entries", input.limits.maxEntries, input.limits.maxEntries});
+    }
+    if (inlineExtent.boundaryInstructionLimitHit) {
+      dataflow.exhaustedBudgets.push_back({"max_backward_instructions",
+                                           input.limits.maxBackwardInstructions,
+                                           input.limits.maxBackwardInstructions});
     }
     if (inlineExtent.extentEvidence) {
       dataflow.boundCandidates.push_back(*inlineExtent.extentEvidence);
