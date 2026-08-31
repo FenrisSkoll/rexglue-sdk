@@ -57,6 +57,16 @@ uint32_t Addi(uint8_t rt, uint8_t ra, int16_t immediate) {
          static_cast<uint16_t>(immediate);
 }
 
+uint32_t Lwz(uint8_t rt, uint8_t ra, int16_t displacement) {
+  return 0x80000000u | (static_cast<uint32_t>(rt) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         static_cast<uint16_t>(displacement);
+}
+
+uint32_t Stw(uint8_t rs, uint8_t ra, int16_t displacement) {
+  return 0x90000000u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         static_cast<uint16_t>(displacement);
+}
+
 uint32_t Rlwinm(uint8_t ra, uint8_t rs, uint8_t sh, uint8_t mb, uint8_t me) {
   return 0x54000000u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16) |
          (static_cast<uint32_t>(sh) << 11) | (static_cast<uint32_t>(mb) << 6) |
@@ -2607,6 +2617,27 @@ TEST_CASE("case-expanded CFG carries an upstream bounded index to a secondary ta
                              !bound.dominatesDispatch && bound.finiteDenseDomain;
                     }));
 
+  SECTION("a current local bound outranks a matching inherited domain") {
+    auto localBound = makeImage();
+    StoreBe32(localBound.text, 0xA0, 0x2B1C0002);  // cmplwi cr6, r28, 2
+    StoreBe32(localBound.text, 0xA4, Bc(kTextBase + 0xA4, kTextBase + 0xF0, 12, 25));
+    StoreBe32(localBound.text, 0xA8, 0x3C802000);  // lis r4, table@h
+    StoreBe32(localBound.text, 0xAC, Mr(8, 28));
+    StoreBe32(localBound.text, 0xB0, Rlwinm(8, 8, 2, 0, 29));
+    StoreBe32(localBound.text, 0xB4, Lwzx(5, 4, 8));
+    StoreBe32(localBound.text, 0xB8, Mtctr(5));
+    StoreBe32(localBound.text, 0xBC, 0x4E800420);  // locally guarded second bctr
+
+    auto locallyGuarded = analyze(localBound);
+    const auto table = std::find_if(
+        locallyGuarded.jumpTables.begin(), locallyGuarded.jumpTables.end(),
+        [](const auto& candidate) { return candidate.bctrAddress == kTextBase + 0xBC; });
+    REQUIRE(table != locallyGuarded.jumpTables.end());
+    CHECK(table->boundSemantics == "unsigned_index <= bound");
+    CHECK(table->defaultTarget == kTextBase + 0xF0);
+    CHECK(table->defaultIsReturn == false);
+  }
+
   SECTION("a case-path write invalidates the inherited domain") {
     auto modified = makeImage();
     StoreBe32(modified.text, 0x60, Addi(28, 0, 7));
@@ -2627,6 +2658,364 @@ TEST_CASE("case-expanded CFG carries an upstream bounded index to a secondary ta
     CHECK(std::none_of(rejected.jumpTables.begin(), rejected.jumpTables.end(),
                        [](const auto& table) { return table.bctrAddress == kTextBase + 0xB8; }));
   }
+}
+
+TEST_CASE("validated case domains recover only finite downstream switch tables",
+          "[codegen][jump-table][integration][inherited-case-domain]") {
+  struct AnalysisSet {
+    IndirectSiteAnalysis outer;
+    IndirectSiteAnalysis initialInner;
+    IndirectSiteAnalysis expandedInner;
+  };
+
+  const auto analyze = [](AbsoluteSwitch& image, uint32_t innerSite) {
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const Block block{kTextBase, 0xF0};
+    const auto* region = decoded.regionContaining(kTextBase);
+    REQUIRE(region != nullptr);
+
+    JumpTableRecoveryInput outerInput{
+        .site = kTextBase + 0x20,
+        .ownerAddress = kTextBase,
+        .preliminaryBlocks = std::span<const Block>(&block, 1),
+        .containingRegion = region,
+        .limits = {},
+    };
+    auto outer = AnalyzeIndirectSite(decoded, outerInput);
+    REQUIRE(outer.selectedTable);
+    REQUIRE(outer.selectedTable->caseCount == 5);
+
+    JumpTableRecoveryInput innerInput{
+        .site = innerSite,
+        .ownerAddress = kTextBase,
+        .preliminaryBlocks = std::span<const Block>(&block, 1),
+        .containingRegion = region,
+        .limits = {},
+    };
+    auto initialInner = AnalyzeIndirectSite(decoded, innerInput);
+
+    const std::unordered_map<uint32_t, JumpTable> validatedTables{
+        {outer.selectedTable->bctrAddress, *outer.selectedTable},
+    };
+    innerInput.validatedOwnerTables = &validatedTables;
+    auto expandedInner = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, innerInput);
+    return AnalysisSet{std::move(outer), std::move(initialInner), std::move(expandedInner)};
+  };
+
+  const auto makeSpillReloadImage = [] {
+    AbsoluteSwitch image;
+    for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
+      StoreBe32(image.text, offset, 0x60000000);  // nop
+
+    // The first validated switch independently proves the finite r5 domain
+    // 0..4. Values 0, 1, and 4 enter the downstream state; observing any one
+    // runtime target would not prove this table length.
+    StoreBe32(image.text, 0x00, Stw(5, 1, 0x20));
+    StoreBe32(image.text, 0x04, 0x28050004);  // cmplwi r5, 4
+    StoreBe32(image.text, 0x08, Bc(kTextBase + 0x08, kTextBase + 0x90, 12, 1));
+    StoreBe32(image.text, 0x0C, 0x3C802000);  // lis r4, table@h
+    StoreBe32(image.text, 0x10, 0x60840000);  // ori r4, r4, table@l
+    StoreBe32(image.text, 0x14, Rlwinm(6, 5, 2, 0, 29));
+    StoreBe32(image.text, 0x18, Lwzx(7, 4, 6));
+    StoreBe32(image.text, 0x1C, Mtctr(7));
+    StoreBe32(image.text, 0x20, 0x4E800420);  // outer bctr
+    StoreBe32(image.text, 0x3C, 0x4E800020);  // no accidental fallthrough
+
+    // A disjoint stack store must not obscure the exact r5 spill/reload.
+    StoreBe32(image.text, 0x40, Stw(9, 1, 0x24));
+    StoreBe32(image.text, 0x44, Lwz(10, 1, 0x20));
+    StoreBe32(image.text, 0x48, 0x3C802000);  // lis r4, table@h
+    StoreBe32(image.text, 0x4C, 0x60840020);  // ori r4, r4, table2@l
+    StoreBe32(image.text, 0x50, Rlwinm(10, 10, 2, 0, 29));
+    StoreBe32(image.text, 0x54, Lwzx(11, 4, 10));
+    StoreBe32(image.text, 0x58, Mtctr(11));
+    StoreBe32(image.text, 0x5C, 0x4E800420);  // inner bctr
+
+    StoreBe32(image.text, 0x8C, 0x4E800020);
+    for (uint32_t target : {0x90u, 0xA0u, 0xB0u, 0xC0u, 0xD0u, 0xE0u})
+      StoreBe32(image.text, target, 0x4E800020);
+
+    for (uint32_t index = 0; index < 5; ++index) {
+      const uint32_t target =
+          index == 0 || index == 1 || index == 4 ? kTextBase + 0x40 : kTextBase + 0x90;
+      StoreBe32(image.table, index * 4, target);
+      StoreBe32(image.table, 0x20 + index * 4, kTextBase + 0xA0 + index * 0x10);
+    }
+    return image;
+  };
+
+  SECTION("an exact stack spill/reload retains the upstream finite bound") {
+    auto image = makeSpillReloadImage();
+    auto result = analyze(image, kTextBase + 0x5C);
+
+    REQUIRE(result.initialInner.failures.size() == 1);
+    CHECK(result.initialInner.failures.front() == JumpTableFailure::MissingBound);
+    REQUIRE(result.expandedInner.selectedTable);
+    CHECK(result.expandedInner.selectedTable->indexRegister == 5);
+    CHECK(result.expandedInner.selectedTable->boundValue == 4);
+    CHECK(result.expandedInner.selectedTable->caseCount == 5);
+    CHECK(result.expandedInner.selectedTable->targets ==
+          std::vector<uint32_t>{kTextBase + 0xA0, kTextBase + 0xB0, kTextBase + 0xC0,
+                                kTextBase + 0xD0, kTextBase + 0xE0});
+    CHECK(result.expandedInner.selectedTable->confidence ==
+          "validated_inherited_case_domain_all_targets");
+    REQUIRE(result.expandedInner.dataflow);
+    const auto spillDomain =
+        std::find_if(result.expandedInner.dataflow->boundCandidates.begin(),
+                     result.expandedInner.dataflow->boundCandidates.end(),
+                     [](const auto& bound) { return bound.inheritedFiniteCaseDomain; });
+    REQUIRE(spillDomain != result.expandedInner.dataflow->boundCandidates.end());
+    CHECK(spillDomain->finiteValues == std::vector<uint32_t>{0, 1, 4});
+    CHECK(spillDomain->normalizedFiniteValues == std::vector<uint32_t>{0, 1, 2, 3, 4});
+    CHECK(spillDomain->stackSpillAddress == kTextBase);
+    CHECK(spillDomain->stackReloadAddress == kTextBase + 0x44);
+    CHECK(spillDomain->stackSlotOffset == 0x20);
+    CHECK(spillDomain->stackSlotWidth == 4);
+  }
+
+  SECTION("an overlapping stack write rejects the spill lineage") {
+    auto image = makeSpillReloadImage();
+    StoreBe32(image.text, 0x40, Stw(9, 1, 0x20));
+    auto result = analyze(image, kTextBase + 0x5C);
+    CHECK_FALSE(result.expandedInner.selectedTable);
+    CHECK(HasFailure(result.expandedInner, JumpTableFailure::MissingBound));
+  }
+
+  SECTION("a source-register change rejects the conservative spill lineage") {
+    auto image = makeSpillReloadImage();
+    StoreBe32(image.text, 0x40, Addi(5, 0, 2));
+    auto result = analyze(image, kTextBase + 0x5C);
+    CHECK_FALSE(result.expandedInner.selectedTable);
+    CHECK(HasFailure(result.expandedInner, JumpTableFailure::MissingBound));
+  }
+
+  SECTION("an unproved direct predecessor rejects the inherited case domain") {
+    auto image = makeSpillReloadImage();
+    StoreBe32(image.text, 0x3C, B(kTextBase + 0x3C, kTextBase + 0x40));
+    auto result = analyze(image, kTextBase + 0x5C);
+    CHECK_FALSE(result.expandedInner.selectedTable);
+    CHECK(HasFailure(result.expandedInner, JumpTableFailure::MissingBound));
+  }
+
+  const auto makeTransformedImage = [] {
+    AbsoluteSwitch image;
+    for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
+      StoreBe32(image.text, offset, 0x60000000);  // nop
+
+    StoreBe32(image.text, 0x00, 0x28050004);  // cmplwi r5, 4
+    StoreBe32(image.text, 0x04, Bc(kTextBase + 0x04, kTextBase + 0x90, 12, 1));
+    StoreBe32(image.text, 0x08, 0x3C802000);  // lis r4, table@h
+    StoreBe32(image.text, 0x0C, 0x60840000);  // ori r4, r4, table@l
+    StoreBe32(image.text, 0x10, Rlwinm(6, 5, 2, 0, 29));
+    StoreBe32(image.text, 0x14, Lwzx(7, 4, 6));
+    StoreBe32(image.text, 0x18, Mtctr(7));
+    StoreBe32(image.text, 0x1C, 0x60000000);
+    StoreBe32(image.text, 0x20, 0x4E800420);  // outer bctr
+    StoreBe32(image.text, 0x3C, 0x4E800020);  // no accidental fallthrough
+
+    // Only exact outer cases 1..3 reach this block, so r10 = r5 - 1 has the
+    // independently proven dense domain 0..2.
+    StoreBe32(image.text, 0x40, Addi(10, 5, -1));
+    StoreBe32(image.text, 0x44, 0x3C802000);  // lis r4, table@h
+    StoreBe32(image.text, 0x48, 0x60840020);  // ori r4, r4, table2@l
+    StoreBe32(image.text, 0x4C, Rlwinm(6, 10, 2, 0, 29));
+    StoreBe32(image.text, 0x50, Lwzx(11, 4, 6));
+    StoreBe32(image.text, 0x54, Mtctr(11));
+    StoreBe32(image.text, 0x58, 0x4E800420);  // inner bctr
+
+    StoreBe32(image.text, 0x8C, 0x4E800020);
+    for (uint32_t target : {0x90u, 0xA0u, 0xB0u, 0xC0u})
+      StoreBe32(image.text, target, 0x4E800020);
+
+    for (uint32_t index = 0; index < 5; ++index) {
+      const uint32_t target = index >= 1 && index <= 3 ? kTextBase + 0x40 : kTextBase + 0x90;
+      StoreBe32(image.table, index * 4, target);
+    }
+    for (uint32_t index = 0; index < 3; ++index)
+      StoreBe32(image.table, 0x20 + index * 4, kTextBase + 0xA0 + index * 0x10);
+    return image;
+  };
+
+  SECTION("a transformed exact case domain becomes a dense zero-based table index") {
+    auto image = makeTransformedImage();
+    auto result = analyze(image, kTextBase + 0x58);
+
+    REQUIRE(result.initialInner.failures.size() == 1);
+    CHECK(result.initialInner.failures.front() == JumpTableFailure::MissingBound);
+    REQUIRE(result.expandedInner.selectedTable);
+    CHECK(result.expandedInner.selectedTable->indexRegister == 10);
+    CHECK(result.expandedInner.selectedTable->boundValue == 2);
+    CHECK(result.expandedInner.selectedTable->caseCount == 3);
+    CHECK(result.expandedInner.selectedTable->targets ==
+          std::vector<uint32_t>{kTextBase + 0xA0, kTextBase + 0xB0, kTextBase + 0xC0});
+    CHECK(result.expandedInner.selectedTable->boundSemantics ==
+          "inherited_case_domain_zero_based_dense");
+    REQUIRE(result.expandedInner.dataflow);
+    const auto transformedDomain =
+        std::find_if(result.expandedInner.dataflow->boundCandidates.begin(),
+                     result.expandedInner.dataflow->boundCandidates.end(),
+                     [](const auto& bound) { return bound.inheritedFiniteCaseDomain; });
+    REQUIRE(transformedDomain != result.expandedInner.dataflow->boundCandidates.end());
+    CHECK(transformedDomain->finiteValues == std::vector<uint32_t>{1, 2, 3});
+    CHECK(transformedDomain->normalizedFiniteValues == std::vector<uint32_t>{0, 1, 2});
+    CHECK(transformedDomain->inheritedCaseEdges ==
+          std::vector<JumpTableCfgEdgeEvidence>{{kTextBase + 0x20, kTextBase + 0x40}});
+    CHECK(transformedDomain->stackSpillAddress == 0);
+    CHECK(transformedDomain->stackReloadAddress == 0);
+  }
+
+  SECTION("a non-dense transformed case domain remains unresolved") {
+    auto image = makeTransformedImage();
+    StoreBe32(image.table, 0x08, kTextBase + 0x90);  // outer case 2 no longer reaches inner
+    auto result = analyze(image, kTextBase + 0x58);
+    CHECK_FALSE(result.expandedInner.selectedTable);
+    CHECK(HasFailure(result.expandedInner, JumpTableFailure::MissingBound));
+  }
+
+  SECTION("mixed-validity transformed targets are rejected") {
+    auto image = makeTransformedImage();
+    StoreBe32(image.table, 0x24, kTextBase + 0xB2);
+    auto result = analyze(image, kTextBase + 0x58);
+    CHECK_FALSE(result.expandedInner.selectedTable);
+    CHECK(HasFailure(result.expandedInner, JumpTableFailure::MissingBound));
+    REQUIRE(result.expandedInner.dataflow);
+    CHECK(std::find(result.expandedInner.dataflow->rejectionEvidence.begin(),
+                    result.expandedInner.dataflow->rejectionEvidence.end(),
+                    "validated_owner_table_edge_retry:mixed_validity_targets") !=
+          result.expandedInner.dataflow->rejectionEvidence.end());
+  }
+}
+
+TEST_CASE("case expansion removes a transient table when a new predecessor lacks domain proof",
+          "[codegen][jump-table][integration][inherited-case-domain][fixpoint-retention]") {
+  AbsoluteSwitch image;
+  image.text.resize(0x180);
+  image.table.resize(0x80);
+  for (uint32_t offset = 0; offset < image.text.size(); offset += 4)
+    StoreBe32(image.text, offset, 0x60000000);  // nop
+
+  constexpr uint32_t kOuterSite = kTextBase + 0x1C;
+  constexpr uint32_t kDownstreamBlock = kTextBase + 0x40;
+  constexpr uint32_t kDownstreamSite = kTextBase + 0x58;
+  constexpr uint32_t kLateSwitchBlock = kTextBase + 0x80;
+  constexpr uint32_t kLateSwitchSite = kTextBase + 0xA0;
+  constexpr uint32_t kDefault = kTextBase + 0xD0;
+
+  // The first switch independently proves r5 in 0..4. Its cases 1..3 are the
+  // initially complete predecessor set for the downstream r10 = r5 - 1 table.
+  StoreBe32(image.text, 0x00, 0x28050004);  // cmplwi r5, 4
+  StoreBe32(image.text, 0x04, Bc(kTextBase + 0x04, kDefault, 12, 1));
+  StoreBe32(image.text, 0x08, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x0C, 0x60840000);  // ori r4, r4, table@l
+  StoreBe32(image.text, 0x10, Rlwinm(6, 5, 2, 0, 29));
+  StoreBe32(image.text, 0x14, Lwzx(7, 4, 6));
+  StoreBe32(image.text, 0x18, Mtctr(7));
+  StoreBe32(image.text, 0x1C, 0x4E800420);  // outer bctr
+
+  StoreBe32(image.text, 0x40, Addi(10, 5, -1));
+  StoreBe32(image.text, 0x44, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x48, 0x60840020);  // ori r4, r4, table2@l
+  StoreBe32(image.text, 0x4C, Rlwinm(6, 10, 2, 0, 29));
+  StoreBe32(image.text, 0x50, Lwzx(11, 4, 6));
+  StoreBe32(image.text, 0x54, Mtctr(11));
+  StoreBe32(image.text, 0x58, 0x4E800420);  // downstream bctr
+
+  // This separately bounded switch is discovered in the same iteration as
+  // the downstream table. Its recovered case edge reaches the downstream
+  // block only on the next CFG expansion, after r5 has been overwritten. That
+  // new predecessor therefore cannot inherit the outer r5 domain.
+  StoreBe32(image.text, 0x80, Addi(5, 0, 9));
+  StoreBe32(image.text, 0x84, 0x298C0000);  // cmplwi cr3, r12, 0
+  StoreBe32(image.text, 0x88, Bc(kTextBase + 0x88, kDefault, 12, 13));
+  StoreBe32(image.text, 0x8C, 0x3C802000);  // lis r4, table@h
+  StoreBe32(image.text, 0x90, 0x60840030);  // ori r4, r4, table3@l
+  StoreBe32(image.text, 0x94, Rlwinm(13, 12, 2, 0, 29));
+  StoreBe32(image.text, 0x98, Lwzx(14, 4, 13));
+  StoreBe32(image.text, 0x9C, Mtctr(14));
+  StoreBe32(image.text, 0xA0, 0x4E800420);  // late bctr
+
+  StoreBe32(image.text, 0xD0, 0x4E800020);
+  for (uint32_t target : {0x110u, 0x120u, 0x130u})
+    StoreBe32(image.text, target, 0x4E800020);
+
+  for (uint32_t index = 0; index < 5; ++index) {
+    const uint32_t target = index >= 1 && index <= 3 ? kDownstreamBlock : kLateSwitchBlock;
+    StoreBe32(image.table, index * 4, target);
+  }
+  for (uint32_t index = 0; index < 3; ++index)
+    StoreBe32(image.table, 0x20 + index * 4, kTextBase + 0x110 + index * 0x10);
+  StoreBe32(image.table, 0x30, kDownstreamBlock);
+
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+  const std::array ownerBlocks{
+      Block{kTextBase, 0x20},         Block{kDownstreamBlock, 0x1C},
+      Block{kLateSwitchBlock, 0x24},  Block{kDefault, 0x04},
+      Block{kTextBase + 0x110, 0x04}, Block{kTextBase + 0x120, 0x04},
+      Block{kTextBase + 0x130, 0x04},
+  };
+
+  const auto analyzeSite = [&](uint32_t site,
+                               const std::unordered_map<uint32_t, JumpTable>* validatedTables,
+                               const JumpTable* prior = nullptr) {
+    JumpTableRecoveryInput input{
+        .site = site,
+        .ownerAddress = kTextBase,
+        .trustedOwnerEnd = kTextBase + 0x140,
+        .preliminaryBlocks = ownerBlocks,
+        .containingRegion = region,
+        .validatedOwnerTables = validatedTables,
+        .priorAutomaticTable = prior,
+        .limits = {},
+    };
+    return AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input);
+  };
+
+  auto outer = analyzeSite(kOuterSite, nullptr);
+  REQUIRE(outer.selectedTable);
+  auto late = analyzeSite(kLateSwitchSite, nullptr);
+  REQUIRE(late.selectedTable);
+
+  const std::unordered_map<uint32_t, JumpTable> initialValidatedTables{
+      {kOuterSite, *outer.selectedTable},
+  };
+  auto transient = analyzeSite(kDownstreamSite, &initialValidatedTables);
+  REQUIRE(transient.selectedTable);
+  CHECK(transient.selectedTable->targets ==
+        std::vector<uint32_t>{kTextBase + 0x110, kTextBase + 0x120, kTextBase + 0x130});
+  CHECK(transient.selectedTable->confidence == "validated_inherited_case_domain_all_targets");
+
+  const std::unordered_map<uint32_t, JumpTable> expandedValidatedTables{
+      {kOuterSite, *outer.selectedTable},
+      {kDownstreamSite, *transient.selectedTable},
+      {kLateSwitchSite, *late.selectedTable},
+  };
+  auto invalidated =
+      analyzeSite(kDownstreamSite, &expandedValidatedTables, &*transient.selectedTable);
+  CHECK_FALSE(invalidated.selectedTable);
+  CHECK_FALSE(invalidated.automaticTable);
+  CHECK((HasFailure(invalidated, JumpTableFailure::MissingBound) ||
+         HasFailure(invalidated, JumpTableFailure::UnknownIndex)));
+
+  const std::unordered_set<uint32_t> functions{kTextBase};
+  auto result = discoverBlocks(decoded, kTextBase, *region, functions, 0x140);
+  CHECK(result.jumpTableRecovery.fixpointIterations == 4);
+  const auto finalSite =
+      std::find_if(result.indirectSites.begin(), result.indirectSites.end(),
+                   [](const auto& site) { return site.site == kDownstreamSite; });
+  REQUIRE(finalSite != result.indirectSites.end());
+  CHECK_FALSE(finalSite->selectedTable);
+  CHECK_FALSE(finalSite->automaticTable);
+  CHECK(std::none_of(result.jumpTables.begin(), result.jumpTables.end(),
+                     [](const auto& table) { return table.bctrAddress == kDownstreamSite; }));
+  CHECK_FALSE(result.labels.contains(kTextBase + 0x110));
+  CHECK_FALSE(result.labels.contains(kTextBase + 0x120));
+  CHECK_FALSE(result.labels.contains(kTextBase + 0x130));
 }
 
 TEST_CASE("case expansion preserves a switch with an equivalent guarded loop",

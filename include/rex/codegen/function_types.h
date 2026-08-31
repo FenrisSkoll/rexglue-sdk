@@ -444,9 +444,19 @@ struct JumpTableBoundCandidateEvidence {
   bool priorExactRevalidation = false;
   bool priorDirectBoundedIndexRevalidation = false;
   bool inheritedCaseEdgeProof = false;
+  // Exact finite values carried by validated upstream switch edges into this
+  // downstream dispatch. This is control-flow evidence, not runtime-derived
+  // table-length evidence and never makes a case target callable.
+  bool inheritedFiniteCaseDomain = false;
   bool finiteCfgDomain = false;
   bool interproceduralEntryDomain = false;
   std::vector<uint32_t> finiteValues;
+  std::vector<uint32_t> normalizedFiniteValues;
+  std::vector<JumpTableCfgEdgeEvidence> inheritedCaseEdges;
+  uint32_t stackSpillAddress = 0;
+  uint32_t stackReloadAddress = 0;
+  int32_t stackSlotOffset = 0;
+  uint8_t stackSlotWidth = 0;
   std::string rejection;
 };
 

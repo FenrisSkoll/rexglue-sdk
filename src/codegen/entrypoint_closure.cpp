@@ -1523,6 +1523,12 @@ Json JumpBoundCandidateJson(const JumpTableBoundCandidateEvidence& bound) {
   Json finiteValues = Json::array();
   for (uint32_t value : bound.finiteValues)
     finiteValues.push_back(value);
+  Json normalizedFiniteValues = Json::array();
+  for (uint32_t value : bound.normalizedFiniteValues)
+    normalizedFiniteValues.push_back(value);
+  Json inheritedCaseEdges = Json::array();
+  for (const auto& edge : bound.inheritedCaseEdges)
+    inheritedCaseEdges.push_back(JumpCfgEdgeJson(edge));
   return Json{
       {"compare_address", bound.compareAddress ? Json(Hex(bound.compareAddress)) : Json(nullptr)},
       {"guard_address", bound.guardAddress ? Json(Hex(bound.guardAddress)) : Json(nullptr)},
@@ -1540,9 +1546,18 @@ Json JumpBoundCandidateJson(const JumpTableBoundCandidateEvidence& bound) {
       {"prior_exact_revalidation", bound.priorExactRevalidation},
       {"prior_direct_bounded_index_revalidation", bound.priorDirectBoundedIndexRevalidation},
       {"inherited_case_edge_proof", bound.inheritedCaseEdgeProof},
+      {"inherited_finite_case_domain", bound.inheritedFiniteCaseDomain},
       {"finite_cfg_domain", bound.finiteCfgDomain},
       {"interprocedural_entry_domain", bound.interproceduralEntryDomain},
       {"finite_values", std::move(finiteValues)},
+      {"normalized_finite_values", std::move(normalizedFiniteValues)},
+      {"inherited_case_edges", std::move(inheritedCaseEdges)},
+      {"stack_spill_address",
+       bound.stackSpillAddress ? Json(Hex(bound.stackSpillAddress)) : Json(nullptr)},
+      {"stack_reload_address",
+       bound.stackReloadAddress ? Json(Hex(bound.stackReloadAddress)) : Json(nullptr)},
+      {"stack_slot_offset", bound.stackSlotOffset},
+      {"stack_slot_width", bound.stackSlotWidth},
       {"rejection", bound.rejection.empty() ? Json(nullptr) : Json(bound.rejection)}};
 }
 
@@ -2283,12 +2298,15 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
                      ? "direct_bounded_prior"
                      : (bound.priorExactRevalidation
                             ? "exact_prior"
-                            : (bound.inheritedCaseEdgeProof
-                                   ? "inherited_case_edge"
-                                   : (bound.finiteCfgDomain ? "finite_cfg_domain"
-                                                            : (bound.interproceduralEntryDomain
-                                                                   ? "interprocedural_entry_domain"
-                                                                   : "current_guard")))));
+                            : (bound.inheritedFiniteCaseDomain
+                                   ? "inherited_finite_case_domain"
+                                   : (bound.inheritedCaseEdgeProof
+                                          ? "inherited_case_edge"
+                                          : (bound.finiteCfgDomain
+                                                 ? "finite_cfg_domain"
+                                                 : (bound.interproceduralEntryDomain
+                                                        ? "interprocedural_entry_domain"
+                                                        : "current_guard"))))));
       if (!bound.rejection.empty())
         bounds << ':' << bound.rejection;
     }

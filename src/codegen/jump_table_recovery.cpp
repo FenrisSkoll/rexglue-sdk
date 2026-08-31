@@ -2827,13 +2827,59 @@ std::vector<JumpTableBoundCandidateEvidence> RecoverExactPriorBoundEvidence(
   return output;
 }
 
+struct StackSlotStore {
+  int32_t offset = 0;
+  uint8_t width = 0;
+  uint8_t sourceRegister = 0xFF;
+};
+
+std::optional<StackSlotStore> DecodeStackSlotStore(const Instruction& instruction) {
+  uint8_t width = 0;
+  switch (instruction.opcode) {
+    case Opcode::stw:
+      width = 4;
+      break;
+    case Opcode::sth:
+      width = 2;
+      break;
+    case Opcode::stb:
+      width = 1;
+      break;
+    default:
+      return std::nullopt;
+  }
+  if (instruction.D.RA != 1)
+    return std::nullopt;
+  return StackSlotStore{.offset = instruction.D.SIMM(),
+                        .width = width,
+                        .sourceRegister = static_cast<uint8_t>(instruction.D.RS())};
+}
+
+bool StackSlotsOverlap(int32_t lhsOffset, uint8_t lhsWidth, int32_t rhsOffset, uint8_t rhsWidth) {
+  const int64_t lhsEnd = static_cast<int64_t>(lhsOffset) + lhsWidth;
+  const int64_t rhsEnd = static_cast<int64_t>(rhsOffset) + rhsWidth;
+  return static_cast<int64_t>(lhsOffset) < rhsEnd && static_cast<int64_t>(rhsOffset) < lhsEnd;
+}
+
+bool WritesStackPointer(const Instruction& instruction) {
+  if (WritesRegister(instruction, 1))
+    return true;
+  return (instruction.opcode == Opcode::stwu || instruction.opcode == Opcode::stdu) &&
+         instruction.D.RA == 1 && instruction.D.RT == 1;
+}
+
+struct InheritedCaseDomain {
+  JumpTableCfgEdgeEvidence edge;
+  std::vector<uint32_t> values;
+};
+
 class LocalBoundedSliceTracer {
  public:
   LocalBoundedSliceTracer(DecodedBinary& decoded, const LocalCfg& cfg,
                           const JumpTableRecoveryLimits& limits,
                           const JumpTableBoundCandidateEvidence& bound,
                           std::span<const JumpTableBoundCandidateEvidence> bounds,
-                          std::span<const JumpTableCfgEdgeEvidence> inheritedBoundEdges = {})
+                          std::span<const InheritedCaseDomain> inheritedCaseDomains = {})
       : decoded_(decoded), cfg_(cfg), limits_(limits), bound_(bound) {
     casePathStart_ = BoundCasePathStart(decoded_, bound_).value_or(0);
     equivalentIndexRecomputation_ =
@@ -2842,20 +2888,46 @@ class LocalBoundedSliceTracer {
       if (auto start = EquivalentBoundCasePathStart(decoded_, bound_, candidate))
         boundCaseEdges_.insert({candidate.guardAddress, *start});
     }
-    for (const auto& edge : inheritedBoundEdges)
-      boundCaseEdges_.insert({edge.source, edge.target});
+    for (const auto& domain : inheritedCaseDomains) {
+      const auto edge = std::pair{domain.edge.source, domain.edge.target};
+      boundCaseEdges_.insert(edge);
+      inheritedCaseDomains_[edge] = domain.values;
+    }
   }
 
   bool valid() const { return casePathStart_ != 0 && !boundCaseEdges_.empty(); }
 
   LocalSliceTrace Trace(uint8_t reg, uint32_t before) {
     active_.clear();
+    usedInheritedCaseEdges_.clear();
+    usedInheritedCaseValues_.clear();
     return TraceRegister(reg, before, 0);
   }
 
+  std::vector<uint32_t> inheritedCaseValues() const {
+    return {usedInheritedCaseValues_.begin(), usedInheritedCaseValues_.end()};
+  }
+
+  std::vector<JumpTableCfgEdgeEvidence> inheritedCaseEdges() const {
+    std::vector<JumpTableCfgEdgeEvidence> edges;
+    edges.reserve(usedInheritedCaseEdges_.size());
+    for (const auto& [source, target] : usedInheritedCaseEdges_)
+      edges.push_back({source, target});
+    return edges;
+  }
+
  private:
+  void RecordInheritedCaseEdge(uint32_t source, uint32_t target) {
+    const auto edge = std::pair{source, target};
+    const auto domain = inheritedCaseDomains_.find(edge);
+    if (domain == inheritedCaseDomains_.end())
+      return;
+    usedInheritedCaseEdges_.insert(edge);
+    usedInheritedCaseValues_.insert(domain->second.begin(), domain->second.end());
+  }
+
   bool BoundRegisterReaches(uint8_t reg, uint32_t before, bool* limitHit, std::string* rejection,
-                            std::vector<JumpTableInstructionEvidence>* evidence) const {
+                            std::vector<JumpTableInstructionEvidence>* evidence) {
     if (reg != bound_.indexRegister || casePathStart_ == 0 || !cfg_.contains(before) ||
         !cfg_.contains(casePathStart_)) {
       return false;
@@ -2889,6 +2961,7 @@ class LocalBoundedSliceTracer {
       }
       for (uint32_t predecessor : predecessors) {
         if (boundCaseEdges_.contains({predecessor, cursor})) {
+          RecordInheritedCaseEdge(predecessor, cursor);
           boundarySeeds.insert(cursor);
           continue;
         }
@@ -2984,6 +3057,97 @@ class LocalBoundedSliceTracer {
       cursor = predecessor;
     }
     return nullptr;
+  }
+
+  LocalSliceTrace TraceInheritedStackReload(const Instruction& load, uint8_t width) {
+    LocalSliceTrace result;
+    if (load.D.RA != 1 || inheritedCaseDomains_.empty()) {
+      result.rejection = "stack_reload_has_no_inherited_case_domain";
+      return result;
+    }
+
+    const int32_t offset = load.D.SIMM();
+    struct State {
+      uint32_t address = 0;
+      bool crossedInheritedCaseEdge = false;
+    };
+    std::deque<State> pending{{load.address, false}};
+    std::set<std::pair<uint32_t, bool>> visited;
+    std::optional<uint32_t> matchingStore;
+    while (!pending.empty()) {
+      const State state = pending.front();
+      pending.pop_front();
+      if (!visited.insert({state.address, state.crossedInheritedCaseEdge}).second)
+        continue;
+      if (visited.size() > limits_.maxStates) {
+        result.limitHit = true;
+        result.rejection = "stack_reload_max_states";
+        return result;
+      }
+
+      const auto& predecessors = cfg_.predecessors(state.address);
+      if (predecessors.empty()) {
+        result.rejection = "stack_reload_reaches_unproved_entry";
+        return result;
+      }
+      for (uint32_t predecessor : predecessors) {
+        const auto edge = std::pair{predecessor, state.address};
+        const bool inheritedEdge = inheritedCaseDomains_.contains(edge);
+        const bool crossedInheritedCaseEdge = state.crossedInheritedCaseEdge || inheritedEdge;
+        if (inheritedEdge)
+          RecordInheritedCaseEdge(predecessor, state.address);
+
+        const auto* instruction = decoded_.get(predecessor);
+        if (!instruction) {
+          result.rejection = "stack_reload_path_instruction_not_decoded";
+          return result;
+        }
+        if (const auto store = DecodeStackSlotStore(*instruction)) {
+          if (StackSlotsOverlap(offset, width, store->offset, store->width)) {
+            if (store->offset != offset || store->width != width ||
+                store->sourceRegister != bound_.indexRegister) {
+              result.rejection = "stack_reload_overlapping_store";
+              return result;
+            }
+            if (!crossedInheritedCaseEdge) {
+              result.rejection = "stack_reload_store_path_has_no_inherited_case_edge";
+              return result;
+            }
+            if (matchingStore && *matchingStore != instruction->address) {
+              result.rejection = "stack_reload_multiple_reaching_stores";
+              return result;
+            }
+            matchingStore = instruction->address;
+            continue;
+          }
+        }
+        if (WritesStackPointer(*instruction)) {
+          result.rejection = "stack_pointer_modified_after_spill";
+          return result;
+        }
+        if (WritesRegister(*instruction, bound_.indexRegister)) {
+          result.rejection = "spilled_index_register_modified_before_reload_at_" +
+                             std::to_string(instruction->address);
+          return result;
+        }
+        if (instruction->is_call() && bound_.indexRegister < 14) {
+          result.rejection = "spilled_volatile_index_crosses_call";
+          return result;
+        }
+        pending.push_back({predecessor, crossedInheritedCaseEdge});
+      }
+    }
+
+    if (!matchingStore || usedInheritedCaseValues_.empty()) {
+      result.rejection = !matchingStore ? "stack_reload_has_no_unique_reaching_store"
+                                        : "stack_reload_has_no_exact_case_values";
+      return result;
+    }
+    if (const auto* store = decoded_.get(*matchingStore))
+      result.evidence.push_back(Evidence(*store, "inherited_case_domain_stack_spill"));
+    result.evidence.push_back(Evidence(load, "inherited_case_domain_stack_reload"));
+    result.expression = MakeSymbolicDefinition(bound_.compareAddress);
+    return result;
   }
 
   LocalSliceTrace TraceRegister(uint8_t reg, uint32_t before, uint32_t depth) {
@@ -3095,6 +3259,20 @@ class LocalBoundedSliceTracer {
           result.expression = operand(static_cast<uint8_t>(instruction->M.RS));
         }
         break;
+      case Opcode::lwz:
+      case Opcode::lhz:
+      case Opcode::lbz: {
+        const uint8_t width =
+            instruction->opcode == Opcode::lwz ? 4 : (instruction->opcode == Opcode::lhz ? 2 : 1);
+        auto reload = TraceInheritedStackReload(*instruction, width);
+        result.limitHit = result.limitHit || reload.limitHit;
+        if (!reload.rejection.empty())
+          result.rejection = reload.rejection;
+        result.evidence.insert(result.evidence.end(), reload.evidence.begin(),
+                               reload.evidence.end());
+        result.expression = reload.expression;
+        break;
+      }
       case Opcode::lwzx:
       case Opcode::lhzx:
       case Opcode::lbzx: {
@@ -3136,8 +3314,118 @@ class LocalBoundedSliceTracer {
   uint32_t casePathStart_ = 0;
   std::optional<EquivalentBoundIndexRecomputation> equivalentIndexRecomputation_;
   std::set<std::pair<uint32_t, uint32_t>> boundCaseEdges_;
+  std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> inheritedCaseDomains_;
+  std::set<std::pair<uint32_t, uint32_t>> usedInheritedCaseEdges_;
+  std::set<uint32_t> usedInheritedCaseValues_;
   std::unordered_set<uint64_t> active_;
 };
+
+struct DenseInheritedCaseIndex {
+  ExprPtr expression;
+  uint8_t registerIndex = 0xFF;
+  std::vector<uint32_t> sourceValues;
+};
+
+ExprPtr FindUnscaledTableIndexExpression(const ExprPtr& addressExpression,
+                                         const std::string& inheritedIndexKey) {
+  if (!addressExpression || !ContainsExpression(addressExpression, inheritedIndexKey))
+    return nullptr;
+
+  std::vector<ExprPtr> scaledIndices;
+  const auto collectScaledIndices = [&](const auto& self, const ExprPtr& expression) -> void {
+    if (!expression || !ContainsExpression(expression, inheritedIndexKey))
+      return;
+    if (expression->kind == ExprKind::ShiftLeft) {
+      scaledIndices.push_back(expression->lhs);
+      return;
+    }
+    self(self, expression->lhs);
+    self(self, expression->rhs);
+  };
+  collectScaledIndices(collectScaledIndices, addressExpression);
+  if (scaledIndices.size() == 1)
+    return scaledIndices.front();
+  if (scaledIndices.size() > 1)
+    return nullptr;
+
+  // Byte tables need no scaling. Strip only the outer constant table-base
+  // addition; an inner add/subtract is part of the index transformation and
+  // must remain in the candidate expression.
+  if (addressExpression->kind == ExprKind::Add) {
+    const bool lhsContains = ContainsExpression(addressExpression->lhs, inheritedIndexKey);
+    const bool rhsContains = ContainsExpression(addressExpression->rhs, inheritedIndexKey);
+    if (lhsContains != rhsContains)
+      return lhsContains ? addressExpression->lhs : addressExpression->rhs;
+  }
+  return addressExpression;
+}
+
+std::optional<uint8_t> ExpressionResultRegister(DecodedBinary& decoded, const ExprPtr& expression,
+                                                const std::string& inheritedIndexKey,
+                                                uint8_t inheritedIndexRegister) {
+  if (!expression)
+    return std::nullopt;
+  if (ExprKey(expression) == inheritedIndexKey)
+    return inheritedIndexRegister;
+  const auto* instruction = decoded.get(expression->origin);
+  if (!instruction)
+    return std::nullopt;
+  switch (instruction->opcode) {
+    case Opcode::addi:
+    case Opcode::addis:
+      return static_cast<uint8_t>(instruction->D.RT);
+    case Opcode::add:
+      return static_cast<uint8_t>(instruction->XO.RT);
+    case Opcode::rlwinm:
+      return static_cast<uint8_t>(instruction->M.RA);
+    case Opcode::extsb:
+    case Opcode::extsh:
+      return static_cast<uint8_t>(instruction->X.RA);
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<DenseInheritedCaseIndex> FindDenseInheritedCaseIndex(
+    DecodedBinary& decoded, const LocalCfg& cfg, const JumpTableRecoveryInput& input,
+    const Expr& primaryLoad, const std::string& inheritedIndexKey, uint8_t inheritedIndexRegister,
+    std::vector<uint32_t> sourceValues, bool* limitHit) {
+  std::sort(sourceValues.begin(), sourceValues.end());
+  sourceValues.erase(std::unique(sourceValues.begin(), sourceValues.end()), sourceValues.end());
+  if (sourceValues.empty() || sourceValues.size() > input.limits.maxEntries)
+    return std::nullopt;
+
+  const ExprPtr indexExpression =
+      FindUnscaledTableIndexExpression(primaryLoad.lhs, inheritedIndexKey);
+  if (!indexExpression || ContainsLoad(indexExpression))
+    return std::nullopt;
+  auto registerIndex =
+      ExpressionResultRegister(decoded, indexExpression, inheritedIndexKey, inheritedIndexRegister);
+  if (!registerIndex)
+    return std::nullopt;
+
+  for (uint32_t denseIndex = 0; denseIndex < sourceValues.size(); ++denseIndex) {
+    const auto evaluated =
+        Evaluate(indexExpression, inheritedIndexKey, sourceValues[denseIndex], decoded);
+    if (!evaluated.ok || evaluated.value != denseIndex || !evaluated.loads.empty())
+      return std::nullopt;
+  }
+
+  const uint32_t definition =
+      ExprKey(indexExpression) == inheritedIndexKey ? primaryLoad.origin : indexExpression->origin;
+  bool stabilityLimit = false;
+  if (definition != 0 &&
+      !cfg.RegisterUnmodifiedOnEveryPath(definition + 4, input.site, *registerIndex, input.limits,
+                                         &stabilityLimit)) {
+    if (stabilityLimit && limitHit)
+      *limitHit = true;
+    return std::nullopt;
+  }
+
+  return DenseInheritedCaseIndex{.expression = indexExpression,
+                                 .registerIndex = *registerIndex,
+                                 .sourceValues = std::move(sourceValues)};
+}
 
 struct LocalBoundedSliceRecovery {
   bool applicable = false;
@@ -3145,11 +3433,13 @@ struct LocalBoundedSliceRecovery {
   bool priorMismatch = false;
   JumpTableFailure failure = JumpTableFailure::None;
   std::optional<JumpTable> table;
+  std::optional<JumpTableBoundCandidateEvidence> inheritedCaseDomainEvidence;
   std::vector<std::string> rejections;
 };
 
 struct InheritedBoundProof {
   std::vector<JumpTableCfgEdgeEvidence> edges;
+  std::vector<InheritedCaseDomain> caseDomains;
   std::vector<uint32_t> sourceDispatches;
 };
 
@@ -3250,8 +3540,16 @@ std::vector<JumpTableBoundCandidateEvidence> CollectInheritedBoundEvidence(
             .priorExactRevalidation = false,
             .priorDirectBoundedIndexRevalidation = false,
             .inheritedCaseEdgeProof = true,
+            .inheritedFiniteCaseDomain = false,
             .finiteCfgDomain = false,
+            .interproceduralEntryDomain = false,
             .finiteValues = {},
+            .normalizedFiniteValues = {},
+            .inheritedCaseEdges = {},
+            .stackSpillAddress = 0,
+            .stackReloadAddress = 0,
+            .stackSlotOffset = 0,
+            .stackSlotWidth = 0,
             .rejection = {},
         });
       }
@@ -3305,8 +3603,15 @@ InheritedBoundProof FindInheritedBoundProof(DecodedBinary& decoded,
     if (!exactCompare || !exactGuard)
       continue;
     proof.sourceDispatches.push_back(site);
-    for (uint32_t target : table.targets)
+    std::map<uint32_t, std::vector<uint32_t>> valuesByTarget;
+    for (uint32_t index = 0; index < table.targets.size(); ++index) {
+      const uint32_t target = table.targets[index];
       proof.edges.push_back({site, target});
+      valuesByTarget[target].push_back(index);
+    }
+    for (auto& [target, values] : valuesByTarget) {
+      proof.caseDomains.push_back({.edge = {site, target}, .values = std::move(values)});
+    }
   }
   std::sort(proof.sourceDispatches.begin(), proof.sourceDispatches.end());
   proof.sourceDispatches.erase(
@@ -3316,6 +3621,16 @@ InheritedBoundProof FindInheritedBoundProof(DecodedBinary& decoded,
     return lhs.source != rhs.source ? lhs.source < rhs.source : lhs.target < rhs.target;
   });
   proof.edges.erase(std::unique(proof.edges.begin(), proof.edges.end()), proof.edges.end());
+  std::sort(proof.caseDomains.begin(), proof.caseDomains.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return lhs.edge.source != rhs.edge.source ? lhs.edge.source < rhs.edge.source
+                                                        : lhs.edge.target < rhs.edge.target;
+            });
+  proof.caseDomains.erase(std::unique(proof.caseDomains.begin(), proof.caseDomains.end(),
+                                      [](const auto& lhs, const auto& rhs) {
+                                        return lhs.edge == rhs.edge && lhs.values == rhs.values;
+                                      }),
+                          proof.caseDomains.end());
   return proof;
 }
 
@@ -3354,6 +3669,7 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
     }
   };
   std::vector<JumpTable> candidates;
+  std::vector<std::optional<JumpTableBoundCandidateEvidence>> candidateDomainEvidence;
   for (const auto& bound : boundEvidence) {
     const auto inheritedBound = FindInheritedBoundProof(decoded, input, bound);
     std::vector<JumpTableInstructionEvidence> freshBoundEvidence;
@@ -3416,7 +3732,7 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
     }
 
     LocalBoundedSliceTracer tracer(decoded, cfg, input.limits, bound, boundEvidence,
-                                   inheritedBound.edges);
+                                   inheritedBound.caseDomains);
     if (!tracer.valid()) {
       reject("guard_has_no_unique_case_path");
       continue;
@@ -3444,18 +3760,60 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
       reject("primary_load_opcode_unsupported");
       continue;
     }
+
+    std::vector<uint32_t> evaluationValues;
+    std::optional<DenseInheritedCaseIndex> denseInheritedCaseIndex;
+    const auto exactInheritedCaseValues = tracer.inheritedCaseValues();
+    bool completeInheritedBoundDomain = exactInheritedCaseValues.size() == bound.caseCount;
+    for (uint32_t value = 0; completeInheritedBoundDomain && value < bound.caseCount; ++value)
+      completeInheritedBoundDomain = exactInheritedCaseValues[value] == value;
+    if (bound.inheritedCaseEdgeProof && !exactInheritedCaseValues.empty() &&
+        !completeInheritedBoundDomain) {
+      bool denseDomainLimit = false;
+      denseInheritedCaseIndex = FindDenseInheritedCaseIndex(
+          decoded, cfg, input, *primaryLoad, indexKey, bound.indexRegister,
+          exactInheritedCaseValues, &denseDomainLimit);
+      if (!denseInheritedCaseIndex) {
+        const ExprPtr unscaledIndex = FindUnscaledTableIndexExpression(primaryLoad->lhs, indexKey);
+        if (unscaledIndex && ExprKey(unscaledIndex) == indexKey) {
+          std::vector<uint32_t> fullBoundValues(bound.caseCount);
+          for (uint32_t index = 0; index < bound.caseCount; ++index)
+            fullBoundValues[index] = index;
+          denseInheritedCaseIndex = FindDenseInheritedCaseIndex(
+              decoded, cfg, input, *primaryLoad, indexKey, bound.indexRegister,
+              std::move(fullBoundValues), &denseDomainLimit);
+        }
+      }
+      if (denseDomainLimit) {
+        recovery.limitHit = true;
+        reject("inherited_case_domain_stability_limit");
+        continue;
+      }
+      if (!denseInheritedCaseIndex) {
+        reject("inherited_case_domain_not_zero_based_dense");
+        continue;
+      }
+      evaluationValues = denseInheritedCaseIndex->sourceValues;
+    }
     recovery.applicable = true;
 
     JumpTable table;
     table.bctrAddress = input.site;
     table.ownerAddress = input.ownerAddress;
-    table.indexRegister = bound.indexRegister;
-    table.boundValue = bound.value;
-    table.caseCount = bound.caseCount;
-    table.boundInclusive = bound.inclusive;
-    table.boundSemantics = bound.inclusive ? "unsigned_index <= bound" : "unsigned_index < bound";
-    table.defaultTarget = bound.defaultTarget;
-    table.defaultIsReturn = bound.defaultIsReturn;
+    table.indexRegister =
+        denseInheritedCaseIndex ? denseInheritedCaseIndex->registerIndex : bound.indexRegister;
+    table.boundValue = denseInheritedCaseIndex
+                           ? static_cast<uint32_t>(denseInheritedCaseIndex->sourceValues.size() - 1)
+                           : bound.value;
+    table.caseCount = denseInheritedCaseIndex
+                          ? static_cast<uint32_t>(denseInheritedCaseIndex->sourceValues.size())
+                          : bound.caseCount;
+    table.boundInclusive = denseInheritedCaseIndex ? true : bound.inclusive;
+    table.boundSemantics = denseInheritedCaseIndex ? "inherited_case_domain_zero_based_dense"
+                                                   : (bound.inclusive ? "unsigned_index <= bound"
+                                                                      : "unsigned_index < bound");
+    table.defaultTarget = denseInheritedCaseIndex ? 0 : bound.defaultTarget;
+    table.defaultIsReturn = denseInheritedCaseIndex ? false : bound.defaultIsReturn;
     table.elementWidth = primaryLoad->width;
     table.elementSigned = LoadIsSignExtended(target.expression, primaryLoad->origin);
     table.anchorAddress = ConstantAnchor(target.expression).value_or(0);
@@ -3466,7 +3824,8 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
                      ? JumpTableKind::AbsolutePointer
                      : JumpTableKind::RelativeOffset;
     table.confidence =
-        !inheritedBound.edges.empty()       ? "validated_inherited_bound_from_upstream_switch"
+        denseInheritedCaseIndex             ? "validated_inherited_case_domain_all_targets"
+        : !inheritedBound.edges.empty()     ? "validated_inherited_bound_from_upstream_switch"
         : equivalentBoundIndexRecomputation ? "validated_equivalent_bound_index_recomputation"
         : input.priorAutomaticTable
             ? (bound.priorExactRevalidation
@@ -3483,6 +3842,12 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
     for (uint32_t source : inheritedBound.sourceDispatches) {
       if (const auto* dispatch = decoded.get(source)) {
         table.evidence.push_back(Evidence(*dispatch, "inherited_bound_source_dispatch"));
+      }
+    }
+    if (denseInheritedCaseIndex) {
+      for (const auto& edge : tracer.inheritedCaseEdges()) {
+        if (const auto* target = decoded.get(edge.target))
+          table.evidence.push_back(Evidence(*target, "inherited_case_domain_entry"));
       }
     }
     if (const auto* compare = decoded.get(bound.compareAddress)) {
@@ -3541,8 +3906,9 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
     bool failureTargetDecoded = false;
     bool failureTargetInvalid = false;
     bool failureTargetInOwner = false;
-    for (uint32_t index = 0; index < bound.caseCount; ++index) {
-      auto evaluated = Evaluate(target.expression, indexKey, index, decoded);
+    for (uint32_t index = 0; index < table.caseCount; ++index) {
+      const uint32_t sourceValue = evaluationValues.empty() ? index : evaluationValues[index];
+      auto evaluated = Evaluate(target.expression, indexKey, sourceValue, decoded);
       auto loadIt = evaluated.loads.find(primaryLoad->origin);
       if (!evaluated.ok || loadIt == evaluated.loads.end()) {
         targetFailure = JumpTableFailure::TargetOutOfRange;
@@ -3609,10 +3975,10 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
              ":in_owner=" + std::to_string(failureTargetInOwner));
       continue;
     }
-    const uint32_t stride = bound.caseCount > 1 ? table.rawEntries[1].storageAddress -
+    const uint32_t stride = table.caseCount > 1 ? table.rawEntries[1].storageAddress -
                                                       table.rawEntries[0].storageAddress
                                                 : primaryLoad->width;
-    table.storageEnd = table.tableAddress + (bound.caseCount - 1) * stride + primaryLoad->width;
+    table.storageEnd = table.tableAddress + (table.caseCount - 1) * stride + primaryLoad->width;
     table.tableInExecutableSection = decoded.get(table.tableAddress) != nullptr;
     table.manualComparison = input.manualTable ? CompareManual(table, *input.manualTable)
                                                : JumpTableManualComparison::NewAutomaticTable;
@@ -3622,7 +3988,43 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
       reject("prior_table_semantics_mismatch");
       continue;
     }
+    std::optional<JumpTableBoundCandidateEvidence> inheritedDomainEvidence;
+    if (denseInheritedCaseIndex) {
+      JumpTableBoundCandidateEvidence evidence = bound;
+      evidence.domainOriginAddress =
+          tracer.inheritedCaseEdges().empty() ? 0 : tracer.inheritedCaseEdges().front().target;
+      evidence.value = table.boundValue;
+      evidence.caseCount = table.caseCount;
+      evidence.defaultTarget = 0;
+      evidence.indexRegister = table.indexRegister;
+      evidence.inclusive = true;
+      evidence.defaultIsReturn = false;
+      evidence.dominatesDispatch = false;
+      evidence.finiteDenseDomain = true;
+      evidence.inheritedFiniteCaseDomain = true;
+      evidence.finiteValues = exactInheritedCaseValues;
+      evidence.normalizedFiniteValues.resize(table.caseCount);
+      for (uint32_t index = 0; index < table.caseCount; ++index)
+        evidence.normalizedFiniteValues[index] = index;
+      evidence.inheritedCaseEdges = tracer.inheritedCaseEdges();
+      evidence.rejection.clear();
+      for (const auto& instructionEvidence : target.evidence) {
+        if (instructionEvidence.role == "inherited_case_domain_stack_spill") {
+          evidence.stackSpillAddress = instructionEvidence.address;
+          if (const auto* spill = decoded.get(instructionEvidence.address)) {
+            if (const auto slot = DecodeStackSlotStore(*spill)) {
+              evidence.stackSlotOffset = slot->offset;
+              evidence.stackSlotWidth = slot->width;
+            }
+          }
+        } else if (instructionEvidence.role == "inherited_case_domain_stack_reload") {
+          evidence.stackReloadAddress = instructionEvidence.address;
+        }
+      }
+      inheritedDomainEvidence = std::move(evidence);
+    }
     candidates.push_back(std::move(table));
+    candidateDomainEvidence.push_back(std::move(inheritedDomainEvidence));
   }
 
   if (candidates.empty())
@@ -3637,6 +4039,8 @@ LocalBoundedSliceRecovery RecoverLocalBoundedSlice(
   }
   recovery.failure = JumpTableFailure::None;
   recovery.table = std::move(candidates.front());
+  if (!candidateDomainEvidence.empty())
+    recovery.inheritedCaseDomainEvidence = std::move(candidateDomainEvidence.front());
   return recovery;
 }
 
@@ -4849,12 +5253,16 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       if (stats)
         stats->analysisLimitHit = true;
     }
+    const bool inheritedCaseDomainCandidate = std::any_of(
+        dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
+        [](const auto& bound) { return bound.finiteDenseDomain && bound.inheritedCaseEdgeProof; });
     const bool allowLocalSlice =
         (target.limitHit && (!input.priorAutomaticTable || input.allowPriorLocalSliceRecovery)) ||
         (target.ambiguous &&
          (input.priorAutomaticTable ||
           (input.validatedOwnerTables && !input.validatedOwnerTables->empty()))) ||
-        freshTransformedBoundedIndex || equivalentBoundIndexRecomputation;
+        freshTransformedBoundedIndex || equivalentBoundIndexRecomputation ||
+        inheritedCaseDomainCandidate;
     if (allowLocalSlice) {
       bool localSliceTopologyLimit = false;
       cfg.IsInCycle(input.site, input.limits, &localSliceTopologyLimit);
@@ -4872,6 +5280,19 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       }
       for (const auto& rejection : localSlice.rejections) {
         dataflow.rejectionEvidence.push_back("local_bounded_slice:" + rejection);
+      }
+      if (localSlice.inheritedCaseDomainEvidence) {
+        dataflow.boundCandidates.push_back(*localSlice.inheritedCaseDomainEvidence);
+        std::sort(dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                    if (lhs.compareAddress != rhs.compareAddress)
+                      return lhs.compareAddress < rhs.compareAddress;
+                    if (lhs.guardAddress != rhs.guardAddress)
+                      return lhs.guardAddress < rhs.guardAddress;
+                    if (lhs.domainOriginAddress != rhs.domainOriginAddress)
+                      return lhs.domainOriginAddress < rhs.domainOriginAddress;
+                    return lhs.inheritedFiniteCaseDomain < rhs.inheritedFiniteCaseDomain;
+                  });
       }
     }
     if (localSlice.table) {
