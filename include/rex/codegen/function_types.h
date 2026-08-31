@@ -408,6 +408,13 @@ struct JumpTableEntryCallsiteDomainEvidence {
   uint8_t registerIndex = 0xFF;
   std::vector<uint32_t> definitionAddresses;
   std::vector<uint32_t> finiteValues;
+  // The caller CFG supplied to the proof may include only ordinary entry
+  // reachability or additional edges from independently validated local jump
+  // tables. This provenance never makes a target callable and never replaces
+  // the complete inbound-reference/domain checks below.
+  std::string callerCfgKind;
+  std::vector<uint32_t> callerCfgJumpTableSites;
+  bool reachableOnlyAfterCaseExpansion = false;
   std::string proofKind;
   std::vector<std::string> rejections;
   std::string exhaustedBudget;

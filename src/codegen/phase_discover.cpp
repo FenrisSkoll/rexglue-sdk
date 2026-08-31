@@ -49,6 +49,17 @@ struct EntryReferenceSet {
   std::vector<std::string> referenceRejections;
 };
 
+struct CallerCfgEvidence {
+  std::vector<Block> blocks;
+  std::vector<Block> preliminaryBlocks;
+  std::vector<uint32_t> jumpTableSites;
+};
+
+bool BlocksContain(std::span<const Block> blocks, uint32_t address) {
+  return std::any_of(blocks.begin(), blocks.end(),
+                     [address](const Block& block) { return block.contains(address); });
+}
+
 bool SupportsEntryRegisterDomain(FunctionAuthority authority) {
   return authority == FunctionAuthority::PDATA || authority == FunctionAuthority::CONFIG ||
          authority == FunctionAuthority::DISCOVERED;
@@ -128,15 +139,27 @@ class EntryRegisterDomainAnalyzer {
         continue;
       }
       callsite.callerAddress = caller->base();
-      const auto* blocks = CallerBlocks(*caller);
-      if (!blocks) {
-        callsite.rejections.push_back("caller_preliminary_cfg_unavailable");
+      const auto* callerCfg = CallerCfg(*caller);
+      if (!callerCfg) {
+        callsite.rejections.push_back("caller_cfg_unavailable");
         output.callsites.push_back(std::move(callsite));
         allCallsitesComplete = false;
         continue;
       }
-      callsite = AnalyzeDirectCallArgumentDomain(ctx_.decoded(), *blocks, caller->base(),
+      callsite = AnalyzeDirectCallArgumentDomain(ctx_.decoded(), callerCfg->blocks, caller->base(),
                                                  callAddress, entryAddress, registerIndex, limits);
+      callsite.callerCfgKind =
+          callerCfg->jumpTableSites.empty() ? "preliminary" : "validated_case_expanded";
+      callsite.callerCfgJumpTableSites = callerCfg->jumpTableSites;
+      callsite.reachableOnlyAfterCaseExpansion =
+          !BlocksContain(callerCfg->preliminaryBlocks, callAddress) &&
+          BlocksContain(callerCfg->blocks, callAddress);
+      if (!callsite.complete && !callerCfg->jumpTableSites.empty()) {
+        for (auto& rejection : callsite.rejections) {
+          if (rejection == "callsite_not_reachable_in_preliminary_cfg")
+            rejection = "callsite_not_reachable_in_validated_case_expanded_cfg";
+        }
+      }
       if (!callsite.complete) {
         allCallsitesComplete = false;
       } else {
@@ -258,14 +281,12 @@ class EntryRegisterDomainAnalyzer {
     }
   }
 
-  const std::vector<Block>* CallerBlocks(const FunctionNode& caller) {
+  const CallerCfgEvidence* CallerCfg(const FunctionNode& caller) {
     auto existing = callerBlocks_.find(caller.base());
     if (existing != callerBlocks_.end())
       return &existing->second;
-    if (!caller.jumpTablePreliminaryBlocks().empty()) {
-      return &callerBlocks_.emplace(caller.base(), caller.jumpTablePreliminaryBlocks())
-                  .first->second;
-    }
+
+    CallerCfgEvidence evidence;
     const auto size = ctx_.scan.pdataSizes.find(caller.base());
     if (size == ctx_.scan.pdataSizes.end())
       return nullptr;
@@ -278,17 +299,30 @@ class EntryRegisterDomainAnalyzer {
     }
     if (!region)
       return nullptr;
-    auto preliminary = discoverPreliminaryBlocks(ctx_.decoded(), caller.base(), *region,
-                                                 knownFunctions_, size->second);
-    if (preliminary.blocks.empty())
+
+    // Analyze the caller locally through the ordinary jump-table fixpoint so a
+    // direct call reached only from an independently validated case edge is
+    // not mistaken for unreachable code. Do this even when the graph already
+    // contains a final caller CFG: that CFG could itself include a table whose
+    // proof consumed an interprocedural entry domain. No entry domains are
+    // supplied here, so caller expansion stands entirely on local/manual table
+    // evidence and cannot form a circular domain proof.
+    auto expanded = discoverBlocks(ctx_.decoded(), caller.base(), *region, knownFunctions_,
+                                   size->second, &ctx_.Config().switchTables);
+    if (expanded.blocks.empty())
       return nullptr;
-    return &callerBlocks_.emplace(caller.base(), std::move(preliminary.blocks)).first->second;
+    evidence.blocks = std::move(expanded.blocks);
+    evidence.preliminaryBlocks = std::move(expanded.preliminaryBlocks);
+    for (const auto& table : expanded.jumpTables)
+      evidence.jumpTableSites.push_back(table.bctrAddress);
+    std::sort(evidence.jumpTableSites.begin(), evidence.jumpTableSites.end());
+    return &callerBlocks_.emplace(caller.base(), std::move(evidence)).first->second;
   }
 
   CodegenContext& ctx_;
   std::unordered_set<uint32_t> knownFunctions_;
   std::unordered_map<uint32_t, EntryReferenceSet> references_;
-  std::unordered_map<uint32_t, std::vector<Block>> callerBlocks_;
+  std::unordered_map<uint32_t, CallerCfgEvidence> callerBlocks_;
 };
 
 //=============================================================================

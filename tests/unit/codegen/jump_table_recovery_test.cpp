@@ -776,6 +776,36 @@ AbsoluteSwitch EntryDomainSwitch() {
   return image;
 }
 
+constexpr uint32_t kCaseExpandedDomainCaller = kTextBase + 0x120;
+constexpr uint32_t kCaseExpandedDomainCallerSize = 0x44;
+constexpr uint32_t kCaseExpandedDomainDispatch = kTextBase + 0x13C;
+constexpr uint32_t kCaseExpandedDomainTable = kTextBase + 0x140;
+constexpr uint32_t kCaseExpandedDomainCase = kTextBase + 0x144;
+constexpr uint32_t kCaseExpandedDomainCall = kTextBase + 0x150;
+
+void AddCaseExpandedEntryDomainCaller(AbsoluteSwitch& image, bool validUpstreamTable) {
+  // The direct call supplying r7 is reachable only through this independently
+  // bounded local switch. Preliminary discovery stops at the bctr; production
+  // case expansion must validate the one-entry table before the downstream
+  // entry-domain proof may consume the callsite.
+  StoreBe32(image.text, 0x120, 0x28050000);                                       // cmplwi r5,0
+  StoreBe32(image.text, 0x124, Bc(kTextBase + 0x124, kTextBase + 0x160, 12, 1));  // bgt default
+  StoreBe32(image.text, 0x128, 0x3D801000);                                       // lis r12,text@h
+  StoreBe32(image.text, 0x12C, Addi(12, 12, 0x140));
+  StoreBe32(image.text, 0x130, Rlwinm(0, 5, 2, 0, 29));
+  StoreBe32(image.text, 0x134, Lwzx(0, 12, 0));
+  StoreBe32(image.text, 0x138, Mtctr(0));
+  StoreBe32(image.text, 0x13C, 0x4E800420);  // bctr
+  StoreBe32(image.text, 0x140, validUpstreamTable ? kCaseExpandedDomainCase : kTextBase + 0x300);
+  StoreBe32(image.text, 0x144, Lwzx(7, 3, 4));
+  StoreBe32(image.text, 0x148, 0x28070007);                                       // cmplwi r7,7
+  StoreBe32(image.text, 0x14C, Bc(kTextBase + 0x14C, kTextBase + 0x15C, 12, 1));  // bgt default
+  StoreBe32(image.text, 0x150, Bl(kTextBase + 0x150, kTextBase));
+  StoreBe32(image.text, 0x154, 0x4E800020);  // blr
+  StoreBe32(image.text, 0x15C, 0x4E800020);  // callsite default
+  StoreBe32(image.text, 0x160, 0x4E800020);  // upstream-switch default
+}
+
 struct BoundedInlineEntrySwitch {
   static constexpr uint32_t kSite = kTextBase + 0x14;
   static constexpr uint32_t kInlineTable = kTextBase + 0x18;
@@ -2227,6 +2257,107 @@ TEST_CASE("discover phase requires a complete static inbound-reference census fo
     CHECK(domain.rejectedReferenceSites == std::vector<uint32_t>{kTableBase + 0x30});
     CHECK(domain.referenceRejections ==
           std::vector<std::string>{"aligned_static_code_pointer_reference"});
+  }
+}
+
+TEST_CASE("entry-domain recovery consumes only independently validated case-expanded caller CFGs",
+          "[codegen][jump-table][entry-domain][case-expanded-caller]") {
+  SECTION("a locally bounded caller switch exposes the final finite-domain callsite") {
+    auto image = EntryDomainSwitch();
+    AddCaseExpandedEntryDomainCaller(image, true);
+    auto ctx = MakeEntryDomainContext(image);
+    ctx.graph.addFunction(kCaseExpandedDomainCaller, kCaseExpandedDomainCallerSize,
+                          FunctionAuthority::PDATA, true);
+    ctx.scan.pdataSizes.emplace(kCaseExpandedDomainCaller, kCaseExpandedDomainCallerSize);
+
+    const auto* region = ctx.decoded().regionContaining(kCaseExpandedDomainCaller);
+    REQUIRE(region != nullptr);
+    const std::unordered_set<uint32_t> knownFunctions{kTextBase,        kTextBase + 0xC0,
+                                                      kTextBase + 0xD0, kTextBase + 0xE0,
+                                                      kTextBase + 0xF0, kCaseExpandedDomainCaller};
+    const auto preliminary =
+        discoverPreliminaryBlocks(ctx.decoded(), kCaseExpandedDomainCaller, *region, knownFunctions,
+                                  kCaseExpandedDomainCallerSize);
+    REQUIRE_FALSE(preliminary.blocks.empty());
+    const auto beforeExpansion = AnalyzeDirectCallArgumentDomain(
+        ctx.decoded(), preliminary.blocks, kCaseExpandedDomainCaller, kCaseExpandedDomainCall,
+        kTextBase, 7);
+    CHECK_FALSE(beforeExpansion.complete);
+    CHECK(beforeExpansion.finiteValues.empty());
+    CHECK(beforeExpansion.rejections ==
+          std::vector<std::string>{"callsite_not_reachable_in_preliminary_cfg"});
+
+    REQUIRE(phases::Discover(ctx));
+    const auto* owner = ctx.graph.getFunction(kTextBase);
+    REQUIRE(owner != nullptr);
+    REQUIRE(owner->jumpTables().size() == 1);
+    CHECK(owner->jumpTables().front().caseCount == 8);
+
+    const auto site =
+        std::find_if(owner->indirectSites().begin(), owner->indirectSites().end(),
+                     [](const auto& analysis) { return analysis.site == kEntryDomainSite; });
+    REQUIRE(site != owner->indirectSites().end());
+    REQUIRE(site->selectedTable);
+    REQUIRE(site->dataflow);
+    REQUIRE(site->dataflow->entryRegisterDomains.size() == 1);
+    const auto& domain = site->dataflow->entryRegisterDomains.front();
+    CHECK(domain.finiteDenseDomain);
+    const auto callsite = std::find_if(
+        domain.callsites.begin(), domain.callsites.end(),
+        [](const auto& candidate) { return candidate.callAddress == kCaseExpandedDomainCall; });
+    REQUIRE(callsite != domain.callsites.end());
+    CHECK(callsite->complete);
+    CHECK(callsite->proofKind == "unsigned_adjacent_callsite_guard");
+    CHECK(callsite->callerCfgKind == "validated_case_expanded");
+    CHECK(callsite->callerCfgJumpTableSites == std::vector<uint32_t>{kCaseExpandedDomainDispatch});
+    CHECK(callsite->reachableOnlyAfterCaseExpansion);
+
+    const auto* caller = ctx.graph.getFunction(kCaseExpandedDomainCaller);
+    REQUIRE(caller != nullptr);
+    REQUIRE(caller->jumpTables().size() == 1);
+    CHECK(caller->jumpTables().front().tableAddress == kCaseExpandedDomainTable);
+    CHECK(std::any_of(caller->blocks().begin(), caller->blocks().end(),
+                      [](const Block& block) { return block.contains(kCaseExpandedDomainCall); }));
+  }
+
+  SECTION("an invalid upstream table cannot expose the otherwise plausible callsite") {
+    auto image = EntryDomainSwitch();
+    AddCaseExpandedEntryDomainCaller(image, false);
+    auto ctx = MakeEntryDomainContext(image);
+    ctx.graph.addFunction(kCaseExpandedDomainCaller, kCaseExpandedDomainCallerSize,
+                          FunctionAuthority::PDATA, true);
+    ctx.scan.pdataSizes.emplace(kCaseExpandedDomainCaller, kCaseExpandedDomainCallerSize);
+
+    REQUIRE(phases::Discover(ctx));
+    const auto* caller = ctx.graph.getFunction(kCaseExpandedDomainCaller);
+    REQUIRE(caller != nullptr);
+    CHECK(caller->jumpTables().empty());
+    CHECK_FALSE(
+        std::any_of(caller->blocks().begin(), caller->blocks().end(),
+                    [](const Block& block) { return block.contains(kCaseExpandedDomainCall); }));
+
+    const auto* owner = ctx.graph.getFunction(kTextBase);
+    REQUIRE(owner != nullptr);
+    CHECK(owner->jumpTables().empty());
+    const auto site =
+        std::find_if(owner->indirectSites().begin(), owner->indirectSites().end(),
+                     [](const auto& analysis) { return analysis.site == kEntryDomainSite; });
+    REQUIRE(site != owner->indirectSites().end());
+    CHECK_FALSE(site->selectedTable);
+    REQUIRE(site->dataflow);
+    REQUIRE(site->dataflow->entryRegisterDomains.size() == 1);
+    const auto& domain = site->dataflow->entryRegisterDomains.front();
+    CHECK_FALSE(domain.finiteDenseDomain);
+    CHECK(domain.rejection == "one_or_more_callsite_domains_incomplete");
+    const auto callsite = std::find_if(
+        domain.callsites.begin(), domain.callsites.end(),
+        [](const auto& candidate) { return candidate.callAddress == kCaseExpandedDomainCall; });
+    REQUIRE(callsite != domain.callsites.end());
+    CHECK_FALSE(callsite->complete);
+    CHECK(callsite->callerCfgKind == "preliminary");
+    CHECK_FALSE(callsite->reachableOnlyAfterCaseExpansion);
+    CHECK(callsite->rejections ==
+          std::vector<std::string>{"callsite_not_reachable_in_preliminary_cfg"});
   }
 }
 
