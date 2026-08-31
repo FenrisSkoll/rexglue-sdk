@@ -771,6 +771,69 @@ AbsoluteSwitch EntryDomainSwitch() {
   return image;
 }
 
+struct BoundedInlineEntrySwitch {
+  static constexpr uint32_t kSite = kTextBase + 0x14;
+  static constexpr uint32_t kInlineTable = kTextBase + 0x18;
+  static constexpr uint32_t kTrueCase = kTextBase + 0x108;
+  static constexpr uint32_t kFalseCase = kTextBase + 0x110;
+  static constexpr uint32_t kCaller = kTextBase + 0x200;
+  static constexpr uint32_t kCompare = kTextBase + 0x3E0;
+  static constexpr uint32_t kGuard = kTextBase + 0x3E4;
+  static constexpr uint32_t kCall = kTextBase + 0x3E8;
+  static constexpr uint32_t kCaseCount = 60;
+
+  std::vector<uint8_t> text = std::vector<uint8_t>(0x400, 0);
+  std::vector<uint32_t> expectedTargets;
+
+  BoundedInlineEntrySwitch() {
+    for (uint32_t offset = 0; offset < text.size(); offset += 4)
+      StoreBe32(text, offset, 0x60000000);  // nop
+
+    // A tiny entry thunk indexes a word table stored immediately after its
+    // non-fallthrough bctr, matching the compiler family used by TU1. The
+    // table extent comes only from the independently proven caller domain.
+    StoreBe32(text, 0x00, 0x3D801000);              // lis r12, text@h
+    StoreBe32(text, 0x04, Addi(12, 12, 0x18));      // addi r12,r12,table@l
+    StoreBe32(text, 0x08, Rlwinm(0, 3, 2, 0, 29));  // slwi r0,r3,2
+    StoreBe32(text, 0x0C, Lwzx(0, 12, 0));
+    StoreBe32(text, 0x10, Mtctr(0));
+    StoreBe32(text, 0x14, 0x4E800420);  // bctr
+
+    expectedTargets.reserve(kCaseCount);
+    for (uint32_t index = 0; index < kCaseCount; ++index) {
+      const uint32_t target = index < 48 ? kTrueCase : kFalseCase;
+      expectedTargets.push_back(target);
+      StoreBe32(text, 0x18 + index * 4, target);
+    }
+    REQUIRE(kInlineTable + kCaseCount * 4 == kTrueCase);
+    StoreBe32(text, kTrueCase - kTextBase, Addi(3, 0, 1));
+    StoreBe32(text, kTrueCase + 4 - kTextBase, 0x4E800020);  // blr
+    StoreBe32(text, kFalseCase - kTextBase, Addi(3, 0, 0));
+    StoreBe32(text, kFalseCase + 4 - kTextBase, 0x4E800020);  // blr
+
+    // The incoming r3 definition is deliberately beyond a small resolver
+    // state budget. Its immediately adjacent unsigned guard still proves the
+    // exact [0,59] value domain that reaches the call.
+    StoreBe32(text, kCompare - kTextBase, 0x2803003B);  // cmplwi r3,59
+    StoreBe32(text, kGuard - kTextBase, Bc(kGuard, kTextBase + 0x3F0, 12, 1));
+    StoreBe32(text, kCall - kTextBase, Bl(kCall, kTextBase));
+    StoreBe32(text, kCall + 4 - kTextBase, 0x4E800020);        // blr
+    StoreBe32(text, 0x3F0, Addi(3, 0, 0));                    // default
+    StoreBe32(text, 0x3F4, 0x4E800020);                       // blr
+  }
+
+  BinaryView view() const {
+    const std::array sections{BinarySectionInput{
+        .name = ".text",
+        .baseAddress = kTextBase,
+        .data = text,
+        .executable = true,
+        .readable = true,
+    }};
+    return BinaryView::fromSections(kTextBase, kTextBase + text.size(), kTextBase, sections);
+  }
+};
+
 JumpTableEntryRegisterDomainEvidence ProveEntryDomain(DecodedBinary& decoded) {
   JumpTableEntryRegisterDomainEvidence domain;
   domain.entryAddress = kTextBase;
@@ -1648,7 +1711,7 @@ TEST_CASE("whole-image direct-call domains recover an otherwise unbounded entry 
   CHECK(domain.callsites[0].finiteValues == std::vector<uint32_t>{6});
   CHECK(domain.callsites[1].finiteValues == std::vector<uint32_t>{3});
   CHECK(domain.callsites[2].finiteValues == std::vector<uint32_t>{4});
-  CHECK(domain.callsites[3].proofKind == "unsigned_dominating_callsite_guard");
+  CHECK(domain.callsites[3].proofKind == "unsigned_adjacent_callsite_guard");
   CHECK(domain.callsites[3].compareAddress == kTextBase + 0xF4);
   CHECK(domain.callsites[3].guardAddress == kTextBase + 0xF8);
   CHECK(domain.callsites[3].finiteValues == std::vector<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7});
@@ -1739,6 +1802,106 @@ TEST_CASE("exact local call arguments survive unrelated caller-wide bound exhaus
     CHECK_FALSE(callsite.complete);
     CHECK(callsite.finiteValues.empty());
     CHECK(callsite.proofKind.empty());
+  }
+}
+
+TEST_CASE("an adjacent caller guard recovers a bounded inline entry switch without widening limits",
+          "[codegen][jump-table][entry-domain][inline-table]") {
+  BoundedInlineEntrySwitch image;
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const Block caller{BoundedInlineEntrySwitch::kCaller, 0x1F8};
+  JumpTableRecoveryLimits limits;
+  limits.maxStates = 64;
+
+  const auto callsite = AnalyzeDirectCallArgumentDomain(
+      decoded, std::span<const Block>(&caller, 1), caller.base,
+      BoundedInlineEntrySwitch::kCall, kTextBase, 3, limits);
+  REQUIRE(callsite.complete);
+  CHECK_FALSE(callsite.limitHit);
+  CHECK(callsite.exhaustedBudget.empty());
+  CHECK(callsite.rejections.empty());
+  CHECK(callsite.proofKind == "unsigned_adjacent_callsite_guard");
+  CHECK(callsite.compareAddress == BoundedInlineEntrySwitch::kCompare);
+  CHECK(callsite.guardAddress == BoundedInlineEntrySwitch::kGuard);
+  REQUIRE(callsite.finiteValues.size() == BoundedInlineEntrySwitch::kCaseCount);
+  CHECK(callsite.finiteValues.front() == 0);
+  CHECK(callsite.finiteValues.back() == BoundedInlineEntrySwitch::kCaseCount - 1);
+
+  JumpTableEntryRegisterDomainEvidence domain;
+  domain.entryAddress = kTextBase;
+  domain.registerIndex = 3;
+  domain.finiteValues = callsite.finiteValues;
+  domain.directCallSites = {BoundedInlineEntrySwitch::kCall};
+  domain.callsites = {callsite};
+  domain.allReferencesDirectCalls = true;
+  domain.finiteDenseDomain = true;
+  JumpTableEntryRegisterDomainMap domains;
+  domains.emplace(3, domain);
+
+  const Block owner{kTextBase, 0x18};
+  JumpTableRecoveryInput input;
+  input.site = BoundedInlineEntrySwitch::kSite;
+  input.ownerAddress = kTextBase;
+  input.trustedOwnerEnd = BoundedInlineEntrySwitch::kFalseCase + 8;
+  input.preliminaryBlocks = std::span<const Block>(&owner, 1);
+  input.containingRegion = decoded.regionContaining(kTextBase);
+  input.entryRegisterDomains = &domains;
+  input.limits = limits;
+  auto recovered = AnalyzeIndirectSite(decoded, input);
+  REQUIRE(recovered.selectedTable);
+  CHECK(recovered.failures.empty());
+  CHECK(recovered.selectedTable->tableAddress == BoundedInlineEntrySwitch::kInlineTable);
+  CHECK(recovered.selectedTable->storageEnd == BoundedInlineEntrySwitch::kTrueCase);
+  CHECK(recovered.selectedTable->caseCount == BoundedInlineEntrySwitch::kCaseCount);
+  CHECK(recovered.selectedTable->boundValue == BoundedInlineEntrySwitch::kCaseCount - 1);
+  CHECK(recovered.selectedTable->boundValueIsFiniteIndexDomain);
+  CHECK(recovered.selectedTable->boundSemantics ==
+        "interprocedural_entry_domain_zero_based_dense");
+  CHECK(recovered.selectedTable->targets == image.expectedTargets);
+
+  const std::unordered_set<uint32_t> functions{kTextBase};
+  JumpTableEntryRegisterDomainsBySite domainsBySite;
+  domainsBySite.emplace(BoundedInlineEntrySwitch::kSite, domains);
+  const auto* region = decoded.regionContaining(kTextBase);
+  REQUIRE(region != nullptr);
+  auto integrated = discoverBlocks(decoded, kTextBase, *region, functions,
+                                   BoundedInlineEntrySwitch::kFalseCase + 8 - kTextBase,
+                                   nullptr, &domainsBySite);
+  REQUIRE(integrated.jumpTables.size() == 1);
+  CHECK(integrated.labels.contains(BoundedInlineEntrySwitch::kTrueCase));
+  CHECK(integrated.labels.contains(BoundedInlineEntrySwitch::kFalseCase));
+  CHECK(functions.size() == 1);
+  CHECK_FALSE(functions.contains(BoundedInlineEntrySwitch::kTrueCase));
+  CHECK_FALSE(functions.contains(BoundedInlineEntrySwitch::kFalseCase));
+
+  SECTION("a predecessor that bypasses the guard invalidates the domain") {
+    StoreBe32(image.text, BoundedInlineEntrySwitch::kCaller - kTextBase,
+              Bc(BoundedInlineEntrySwitch::kCaller, BoundedInlineEntrySwitch::kCall, 12, 2));
+    auto alteredView = image.view();
+    DecodedBinary alteredDecoded(alteredView);
+    alteredDecoded.decode();
+    auto rejected = AnalyzeDirectCallArgumentDomain(
+        alteredDecoded, std::span<const Block>(&caller, 1), caller.base,
+        BoundedInlineEntrySwitch::kCall, kTextBase, 3, limits);
+    CHECK_FALSE(rejected.complete);
+    CHECK(rejected.finiteValues.empty());
+    CHECK(rejected.proofKind.empty());
+  }
+
+  SECTION("a signed adjacent guard remains insufficient") {
+    StoreBe32(image.text, BoundedInlineEntrySwitch::kCompare - kTextBase,
+              0x2C03003B);  // cmpwi r3,59
+    auto alteredView = image.view();
+    DecodedBinary alteredDecoded(alteredView);
+    alteredDecoded.decode();
+    auto rejected = AnalyzeDirectCallArgumentDomain(
+        alteredDecoded, std::span<const Block>(&caller, 1), caller.base,
+        BoundedInlineEntrySwitch::kCall, kTextBase, 3, limits);
+    CHECK_FALSE(rejected.complete);
+    CHECK(rejected.finiteValues.empty());
+    CHECK(rejected.proofKind.empty());
   }
 }
 
@@ -1993,6 +2156,8 @@ TEST_CASE("entry-domain recovery rejects incomplete or altered evidence",
 
   SECTION("the exhausted callsite budget is reported without widening another limit") {
     auto image = EntryDomainSwitch();
+    StoreBe32(image.text, 0xF4, 0x60000000);  // no adjacent compare proof
+    StoreBe32(image.text, 0xF8, 0x60000000);  // no adjacent guard proof
     auto view = image.view();
     DecodedBinary decoded(view);
     decoded.decode();

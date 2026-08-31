@@ -5673,6 +5673,66 @@ void FinalizeJumpTableSiteDisposition(IndirectSiteAnalysis& analysis) {
                        "|stage=" + dataflow.failureStage + "|reason=" + failureShape;
 }
 
+bool ProveAdjacentUnsignedCallsiteGuard(
+    DecodedBinary& decoded, const LocalCfg& cfg, uint32_t callAddress, uint8_t registerIndex,
+    const JumpTableRecoveryLimits& limits, JumpTableEntryCallsiteDomainEvidence& output) {
+  if (callAddress < 8)
+    return false;
+
+  const uint32_t compareAddress = callAddress - 8;
+  const uint32_t guardAddress = callAddress - 4;
+  const auto* compare = decoded.get(compareAddress);
+  const auto* guard = decoded.get(guardAddress);
+  if (!compare || compare->opcode != Opcode::cmpli || compare->D.RA != registerIndex || !guard ||
+      !guard->is_branch() || !guard->is_conditional() || guard->is_call() ||
+      !guard->branch_target || *guard->branch_target == callAddress ||
+      guard->address + 4 != callAddress) {
+    return false;
+  }
+
+  // This proof deliberately avoids resolving the incoming register through a
+  // potentially large caller. The compare bounds the value that reaches the
+  // immediately following call directly. Requiring exact local predecessor
+  // chains prevents another CFG edge from bypassing either the compare or its
+  // guard without spending an unrelated whole-caller state budget.
+  const auto& callPredecessors = cfg.predecessors(callAddress);
+  const auto& guardPredecessors = cfg.predecessors(guardAddress);
+  if (callPredecessors.size() != 1 || callPredecessors.front() != guardAddress ||
+      guardPredecessors.size() != 1 || guardPredecessors.front() != compareAddress) {
+    return false;
+  }
+
+  const uint8_t compareCr = static_cast<uint8_t>(compare->D.RT >> 2);
+  const uint8_t guardBi = guard->format == ppc::InstrFormat::kB ? guard->B.BI : guard->XL.BI;
+  if (guardBi / 4 != compareCr)
+    return false;
+  const auto branchTrue = BranchWhenCrBitTrue(*guard);
+  if (!branchTrue)
+    return false;
+
+  const uint8_t bit = BranchConditionBit(*guard);  // 0=LT, 1=GT, 2=EQ
+  const uint32_t value = compare->D.UIMM();
+  uint32_t caseCount = 0;
+  if (bit == 1 && *branchTrue) {  // taken default when index > value
+    caseCount = value + 1;
+  } else if (bit == 0 && !*branchTrue) {  // taken default when !(index < value)
+    caseCount = value;
+  } else {
+    return false;
+  }
+  if (caseCount == 0 || caseCount > limits.maxEntries)
+    return false;
+
+  output.compareAddress = compareAddress;
+  output.guardAddress = guardAddress;
+  output.proofKind = "unsigned_adjacent_callsite_guard";
+  output.finiteValues.resize(caseCount);
+  for (uint32_t index = 0; index < caseCount; ++index)
+    output.finiteValues[index] = index;
+  output.complete = true;
+  return true;
+}
+
 JumpTableEntryCallsiteDomainEvidence AnalyzeDirectCallArgumentDomain(
     DecodedBinary& decoded, std::span<const Block> callerBlocks, uint32_t callerAddress,
     uint32_t callAddress, uint32_t expectedTarget, uint8_t registerIndex,
@@ -5705,6 +5765,9 @@ JumpTableEntryCallsiteDomainEvidence AnalyzeDirectCallArgumentDomain(
     reject("callsite_not_reachable_in_preliminary_cfg");
     return output;
   }
+
+  if (ProveAdjacentUnsignedCallsiteGuard(decoded, cfg, callAddress, registerIndex, limits, output))
+    return output;
 
   std::vector<JumpTableReachingDefinitionPathEvidence> paths;
   Resolver resolver(decoded, cfg, limits, nullptr, nullptr, &paths);
