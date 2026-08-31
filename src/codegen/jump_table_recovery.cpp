@@ -5828,9 +5828,20 @@ JumpTableEntryCallsiteDomainEvidence AnalyzeDirectCallArgumentDomain(
     return output;
   }
   std::vector<BoundCandidate> matchingBounds;
+  const std::string callValueKey = ExprKey(value.expression);
   for (auto& bound : bounds) {
-    if (bound.indexRegister == registerIndex &&
-        ContainsExpression(value.expression, ExprKey(bound.indexExpression))) {
+    const std::string boundIndexKey = ExprKey(bound.indexExpression);
+    const bool sameRegisterMatch =
+        bound.indexRegister == registerIndex &&
+        ContainsExpression(value.expression, boundIndexKey);
+    // A compiler may guard a nonvolatile source register, schedule unrelated
+    // work, and copy that source into the ABI argument register only after the
+    // default edge. Cross-register reuse is safe only when the complete value
+    // reaching the call is exactly the guarded expression. A transformed
+    // value that merely contains the source remains ineligible.
+    const bool exactCopiedRegisterMatch =
+        bound.indexRegister != registerIndex && callValueKey == boundIndexKey;
+    if (sameRegisterMatch || exactCopiedRegisterMatch) {
       matchingBounds.push_back(std::move(bound));
     }
   }
@@ -5848,17 +5859,37 @@ JumpTableEntryCallsiteDomainEvidence AnalyzeDirectCallArgumentDomain(
     const auto selected = std::max_element(
         matchingBounds.begin(), matchingBounds.end(),
         [](const auto& lhs, const auto& rhs) { return lhs.compareAddress < rhs.compareAddress; });
+    const bool exactCopiedRegister = selected->indexRegister != registerIndex;
+    const uint8_t stabilityRegister =
+        exactCopiedRegister ? selected->indexRegister : registerIndex;
     bool stabilityLimit = false;
     if (!cfg.RegisterValueAvailableOnEveryPath(selected->compareAddress + 4, callAddress,
-                                               registerIndex, limits, &stabilityLimit)) {
+                                               stabilityRegister, limits, &stabilityLimit)) {
       output.limitHit = stabilityLimit;
       reject(stabilityLimit ? "callsite_guard_stability_limit"
                             : "callsite_register_modified_after_guard");
       return output;
     }
+    if (exactCopiedRegister) {
+      for (const auto& evidence : value.evidence) {
+        const auto* instruction = decoded.get(evidence.address);
+        if (instruction && WritesRegister(*instruction, registerIndex))
+          output.definitionAddresses.push_back(evidence.address);
+      }
+      std::sort(output.definitionAddresses.begin(), output.definitionAddresses.end());
+      output.definitionAddresses.erase(
+          std::unique(output.definitionAddresses.begin(), output.definitionAddresses.end()),
+          output.definitionAddresses.end());
+      if (output.definitionAddresses.empty()) {
+        reject("callsite_exact_copy_definition_not_identified");
+        return output;
+      }
+    }
     output.compareAddress = selected->compareAddress;
     output.guardAddress = selected->guardAddress;
-    output.proofKind = "unsigned_dominating_callsite_guard";
+    output.proofKind = exactCopiedRegister
+                           ? "unsigned_dominating_callsite_guard_exact_copy"
+                           : "unsigned_dominating_callsite_guard";
     output.finiteValues.resize(selected->caseCount);
     for (uint32_t index = 0; index < selected->caseCount; ++index)
       output.finiteValues[index] = index;

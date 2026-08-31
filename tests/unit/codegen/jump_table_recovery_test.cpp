@@ -91,6 +91,11 @@ uint32_t Lwzx(uint8_t rt, uint8_t ra, uint8_t rb) {
          (static_cast<uint32_t>(rb) << 11);
 }
 
+uint32_t Stwx(uint8_t rs, uint8_t ra, uint8_t rb) {
+  return 0x7C00012Eu | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint32_t>(rb) << 11);
+}
+
 uint32_t Lbzx(uint8_t rt, uint8_t ra, uint8_t rb) {
   return 0x7C0000AEu | (static_cast<uint32_t>(rt) << 21) | (static_cast<uint32_t>(ra) << 16) |
          (static_cast<uint32_t>(rb) << 11);
@@ -831,6 +836,84 @@ struct BoundedInlineEntrySwitch {
         .readable = true,
     }};
     return BinaryView::fromSections(kTextBase, kTextBase + text.size(), kTextBase, sections);
+  }
+};
+
+struct CopiedBoundInlineEntrySwitch {
+  static constexpr uint32_t kBase = 0x82000000;
+  static constexpr uint32_t kSite = kBase + 0x14;
+  static constexpr uint32_t kInlineTable = kBase + 0x18;
+  static constexpr uint32_t kCaseCount = 123;
+  static constexpr uint32_t kStorageEnd = kInlineTable + kCaseCount * 4;
+  static constexpr uint32_t kFirstCase = kStorageEnd;
+  static constexpr uint32_t kSecondCase = kStorageEnd + 8;
+  static constexpr uint32_t kPlausibleContinuationTarget = kSecondCase;
+  static constexpr uint32_t kCaller = kBase + 0x300;
+  static constexpr uint32_t kCompare = kCaller + 4;
+  static constexpr uint32_t kGuard = kCaller + 16;
+  static constexpr uint32_t kPostGuard = kCaller + 20;
+  static constexpr uint32_t kCopy = kCaller + 24;
+  static constexpr uint32_t kCall = kCaller + 28;
+  static constexpr uint32_t kDefault = kCaller + 40;
+
+  std::vector<uint8_t> text = std::vector<uint8_t>(0x400, 0);
+  std::vector<uint32_t> expectedTargets;
+
+  CopiedBoundInlineEntrySwitch() {
+    for (uint32_t offset = 0; offset < text.size(); offset += 4)
+      StoreBe32(text, offset, 0x60000000);  // nop
+
+    StoreBe32(text, 0x00, 0x3D808200);              // lis r12, text@h
+    StoreBe32(text, 0x04, Addi(12, 12, 0x18));      // addi r12,r12,table@l
+    StoreBe32(text, 0x08, Rlwinm(0, 3, 2, 0, 29));  // slwi r0,r3,2
+    StoreBe32(text, 0x0C, Lwzx(0, 12, 0));
+    StoreBe32(text, 0x10, Mtctr(0));
+    StoreBe32(text, 0x14, 0x4E800420);  // bctr
+
+    expectedTargets.reserve(kCaseCount);
+    for (uint32_t index = 0; index < kCaseCount; ++index) {
+      const uint32_t target = index % 3 == 0 ? kFirstCase : kSecondCase;
+      expectedTargets.push_back(target);
+      StoreBe32(text, 0x18 + index * 4, target);
+    }
+    REQUIRE(kInlineTable + kCaseCount * 4 == kStorageEnd);
+    REQUIRE(expectedTargets.front() == kStorageEnd);
+    // The first case begins with a real PPC load whose raw instruction word is
+    // also an aligned in-image address. A storage scanner therefore cannot
+    // use this position as a circular end marker: it is a plausible 124th
+    // table entry until independent CFG/domain evidence proves otherwise.
+    StoreBe32(text, kFirstCase - kBase, Lwz(16, 0, 0x20C));
+    REQUIRE(Lwz(16, 0, 0x20C) == kPlausibleContinuationTarget);
+    StoreBe32(text, kFirstCase + 4 - kBase, 0x4E800020);  // blr
+    StoreBe32(text, kSecondCase - kBase, Addi(3, 0, 2));
+    StoreBe32(text, kSecondCase + 4 - kBase, 0x4E800020);  // blr
+
+    // Match the TU1 caller family: an unsigned source-register guard, two
+    // scheduled non-CR instructions, the default edge, and only then an exact
+    // copy into the ABI argument register. The table extent is proven by this
+    // [0,122] caller domain, never by entry zero equalling the storage end.
+    StoreBe32(text, kCaller - kBase, Addi(11, 31, 87));
+    StoreBe32(text, kCompare - kBase, 0x2B1F007A);  // cmplwi cr6,r31,122
+    StoreBe32(text, kCaller + 8 - kBase, Rlwinm(10, 11, 2, 0, 29));
+    StoreBe32(text, kCaller + 12 - kBase, Stwx(29, 10, 30));
+    StoreBe32(text, kGuard - kBase, Bc(kGuard, kDefault, 12, 25));  // bgt cr6,default
+    StoreBe32(text, kPostGuard - kBase, 0x60000000);               // scheduled nop
+    StoreBe32(text, kCopy - kBase, Mr(3, 31));
+    StoreBe32(text, kCall - kBase, Bl(kCall, kBase));
+    StoreBe32(text, kCall + 4 - kBase, 0x4E800020);  // blr
+    StoreBe32(text, kDefault - kBase, Addi(3, 0, 0));
+    StoreBe32(text, kDefault + 4 - kBase, 0x4E800020);  // blr
+  }
+
+  BinaryView view() const {
+    const std::array sections{BinarySectionInput{
+        .name = ".text",
+        .baseAddress = kBase,
+        .data = text,
+        .executable = true,
+        .readable = true,
+    }};
+    return BinaryView::fromSections(kBase, kBase + text.size(), kBase, sections);
   }
 };
 
@@ -1902,6 +1985,156 @@ TEST_CASE("an adjacent caller guard recovers a bounded inline entry switch witho
     CHECK_FALSE(rejected.complete);
     CHECK(rejected.finiteValues.empty());
     CHECK(rejected.proofKind.empty());
+  }
+}
+
+TEST_CASE("an exact copied caller guard proves a 123-entry inline switch independently of its "
+          "storage boundary",
+          "[codegen][jump-table][entry-domain][inline-table][exact-copy]") {
+  CopiedBoundInlineEntrySwitch image;
+  auto view = image.view();
+  DecodedBinary decoded(view);
+  decoded.decode();
+  const Block caller{CopiedBoundInlineEntrySwitch::kCaller, 0x30};
+  const Block owner{CopiedBoundInlineEntrySwitch::kBase, 0x18};
+  JumpTableRecoveryLimits limits;
+  limits.maxStates = 128;
+
+  const auto analyzeCallsite = [&](DecodedBinary& candidateDecoded) {
+    return AnalyzeDirectCallArgumentDomain(
+        candidateDecoded, std::span<const Block>(&caller, 1), caller.base,
+        CopiedBoundInlineEntrySwitch::kCall, CopiedBoundInlineEntrySwitch::kBase, 3, limits);
+  };
+  const auto analyzeOwner = [&](DecodedBinary& candidateDecoded,
+                                const JumpTableEntryRegisterDomainMap* domains) {
+    JumpTableRecoveryInput input;
+    input.site = CopiedBoundInlineEntrySwitch::kSite;
+    input.ownerAddress = CopiedBoundInlineEntrySwitch::kBase;
+    input.trustedOwnerEnd = CopiedBoundInlineEntrySwitch::kSecondCase + 8;
+    input.preliminaryBlocks = std::span<const Block>(&owner, 1);
+    input.containingRegion = candidateDecoded.regionContaining(CopiedBoundInlineEntrySwitch::kBase);
+    input.entryRegisterDomains = domains;
+    input.limits = limits;
+    return AnalyzeIndirectSite(candidateDecoded, input);
+  };
+
+  // Entry zero equals the table's eventual storage end, but neither that raw
+  // value nor its plausible PPC decoding is independent extent evidence.
+  auto withoutDomain = analyzeOwner(decoded, nullptr);
+  CHECK_FALSE(withoutDomain.selectedTable);
+  CHECK(HasFailure(withoutDomain, JumpTableFailure::MissingBound));
+
+  const auto callsite = analyzeCallsite(decoded);
+  REQUIRE(callsite.complete);
+  CHECK_FALSE(callsite.limitHit);
+  CHECK(callsite.exhaustedBudget.empty());
+  CHECK(callsite.rejections.empty());
+  CHECK(callsite.proofKind == "unsigned_dominating_callsite_guard_exact_copy");
+  CHECK(callsite.compareAddress == CopiedBoundInlineEntrySwitch::kCompare);
+  CHECK(callsite.guardAddress == CopiedBoundInlineEntrySwitch::kGuard);
+  CHECK(callsite.definitionAddresses ==
+        std::vector<uint32_t>{CopiedBoundInlineEntrySwitch::kCopy});
+  REQUIRE(callsite.finiteValues.size() == CopiedBoundInlineEntrySwitch::kCaseCount);
+  CHECK(callsite.finiteValues.front() == 0);
+  CHECK(callsite.finiteValues.back() == CopiedBoundInlineEntrySwitch::kCaseCount - 1);
+
+  JumpTableEntryRegisterDomainEvidence domain;
+  domain.entryAddress = CopiedBoundInlineEntrySwitch::kBase;
+  domain.registerIndex = 3;
+  domain.finiteValues = callsite.finiteValues;
+  domain.directCallSites = {CopiedBoundInlineEntrySwitch::kCall};
+  domain.callsites = {callsite};
+  domain.allReferencesDirectCalls = true;
+  domain.finiteDenseDomain = true;
+  JumpTableEntryRegisterDomainMap domains;
+  domains.emplace(3, domain);
+
+  auto recovered = analyzeOwner(decoded, &domains);
+  REQUIRE(recovered.selectedTable);
+  CHECK(recovered.failures.empty());
+  CHECK(recovered.selectedTable->tableAddress == CopiedBoundInlineEntrySwitch::kInlineTable);
+  CHECK(recovered.selectedTable->storageEnd == CopiedBoundInlineEntrySwitch::kStorageEnd);
+  CHECK(recovered.selectedTable->caseCount == CopiedBoundInlineEntrySwitch::kCaseCount);
+  CHECK(recovered.selectedTable->boundValue == CopiedBoundInlineEntrySwitch::kCaseCount - 1);
+  CHECK(recovered.selectedTable->boundValueIsFiniteIndexDomain);
+  CHECK(recovered.selectedTable->boundSemantics ==
+        "interprocedural_entry_domain_zero_based_dense");
+  CHECK(recovered.selectedTable->confidence ==
+        "validated_interprocedural_entry_domain_all_targets");
+  CHECK(recovered.selectedTable->targets == image.expectedTargets);
+  CHECK(recovered.selectedTable->targets.front() == recovered.selectedTable->storageEnd);
+
+  const std::unordered_set<uint32_t> functions{CopiedBoundInlineEntrySwitch::kBase};
+  JumpTableEntryRegisterDomainsBySite domainsBySite;
+  domainsBySite.emplace(CopiedBoundInlineEntrySwitch::kSite, domains);
+  const auto* region = decoded.regionContaining(CopiedBoundInlineEntrySwitch::kBase);
+  REQUIRE(region != nullptr);
+  auto integrated = discoverBlocks(
+      decoded, CopiedBoundInlineEntrySwitch::kBase, *region, functions,
+      CopiedBoundInlineEntrySwitch::kSecondCase + 8 - CopiedBoundInlineEntrySwitch::kBase,
+      nullptr, &domainsBySite);
+  REQUIRE(integrated.jumpTables.size() == 1);
+  CHECK(integrated.labels.contains(CopiedBoundInlineEntrySwitch::kFirstCase));
+  CHECK(integrated.labels.contains(CopiedBoundInlineEntrySwitch::kSecondCase));
+  CHECK(functions.size() == 1);
+  CHECK_FALSE(functions.contains(CopiedBoundInlineEntrySwitch::kFirstCase));
+  CHECK_FALSE(functions.contains(CopiedBoundInlineEntrySwitch::kSecondCase));
+
+  SECTION("modifying the guarded source before the exact copy invalidates the proof") {
+    StoreBe32(image.text, CopiedBoundInlineEntrySwitch::kPostGuard -
+                                  CopiedBoundInlineEntrySwitch::kBase,
+              Addi(31, 31, 1));
+    auto alteredView = image.view();
+    DecodedBinary alteredDecoded(alteredView);
+    alteredDecoded.decode();
+    const auto rejected = analyzeCallsite(alteredDecoded);
+    CHECK_FALSE(rejected.complete);
+    CHECK(rejected.finiteValues.empty());
+    CHECK(rejected.proofKind.empty());
+  }
+
+  SECTION("a transformed copy cannot borrow the source-register bound") {
+    StoreBe32(image.text,
+              CopiedBoundInlineEntrySwitch::kCopy - CopiedBoundInlineEntrySwitch::kBase,
+              Addi(3, 31, 1));
+    auto alteredView = image.view();
+    DecodedBinary alteredDecoded(alteredView);
+    alteredDecoded.decode();
+    const auto rejected = analyzeCallsite(alteredDecoded);
+    CHECK_FALSE(rejected.complete);
+    CHECK(rejected.finiteValues.empty());
+    CHECK(rejected.proofKind.empty());
+  }
+
+  SECTION("a predecessor that bypasses the source guard invalidates the proof") {
+    StoreBe32(image.text,
+              CopiedBoundInlineEntrySwitch::kCaller - CopiedBoundInlineEntrySwitch::kBase,
+              Bc(CopiedBoundInlineEntrySwitch::kCaller, CopiedBoundInlineEntrySwitch::kCopy, 12,
+                 2));
+    auto alteredView = image.view();
+    DecodedBinary alteredDecoded(alteredView);
+    alteredDecoded.decode();
+    const auto rejected = analyzeCallsite(alteredDecoded);
+    CHECK_FALSE(rejected.complete);
+    CHECK(rejected.finiteValues.empty());
+    CHECK(rejected.proofKind.empty());
+  }
+
+  SECTION("one observed edge cannot stand in for the complete inbound domain") {
+    JumpTableEntryRegisterDomainEvidence incomplete;
+    incomplete.entryAddress = CopiedBoundInlineEntrySwitch::kBase;
+    incomplete.registerIndex = 3;
+    incomplete.finiteValues = {0};
+    incomplete.directCallSites = {CopiedBoundInlineEntrySwitch::kCall};
+    incomplete.callsites = {callsite};
+    incomplete.allReferencesDirectCalls = true;
+    incomplete.finiteDenseDomain = false;
+    incomplete.rejection = "one_or_more_callsite_domains_incomplete";
+    JumpTableEntryRegisterDomainMap incompleteDomains;
+    incompleteDomains.emplace(3, std::move(incomplete));
+    const auto rejected = analyzeOwner(decoded, &incompleteDomains);
+    CHECK_FALSE(rejected.selectedTable);
+    CHECK(HasFailure(rejected, JumpTableFailure::MissingBound));
   }
 }
 
