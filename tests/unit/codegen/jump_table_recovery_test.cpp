@@ -2203,6 +2203,12 @@ TEST_CASE("discover phase requires a complete static inbound-reference census fo
     CHECK(domain.directCallSites == std::vector<uint32_t>{kTextBase + 0xC4, kTextBase + 0xD4,
                                                           kTextBase + 0xE4, kTextBase + 0xFC});
     CHECK(domain.finiteValues == std::vector<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7});
+    REQUIRE(domain.callsites.size() == 4);
+    for (const auto& callsite : domain.callsites) {
+      CHECK(callsite.callerCfgKind == "preliminary");
+      CHECK(callsite.callerCfgJumpTableSites.empty());
+      CHECK_FALSE(callsite.reachableOnlyAfterCaseExpansion);
+    }
   }
 
   SECTION("one static address escape rejects recovery despite the same finite callsites") {

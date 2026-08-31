@@ -50,9 +50,10 @@ struct EntryReferenceSet {
 };
 
 struct CallerCfgEvidence {
-  std::vector<Block> blocks;
   std::vector<Block> preliminaryBlocks;
+  std::vector<Block> expandedBlocks;
   std::vector<uint32_t> jumpTableSites;
+  bool expansionAttempted = false;
 };
 
 bool BlocksContain(std::span<const Block> blocks, uint32_t address) {
@@ -139,22 +140,26 @@ class EntryRegisterDomainAnalyzer {
         continue;
       }
       callsite.callerAddress = caller->base();
-      const auto* callerCfg = CallerCfg(*caller);
+      const auto* callerCfg = CallerCfg(*caller, callAddress);
       if (!callerCfg) {
         callsite.rejections.push_back("caller_cfg_unavailable");
         output.callsites.push_back(std::move(callsite));
         allCallsitesComplete = false;
         continue;
       }
-      callsite = AnalyzeDirectCallArgumentDomain(ctx_.decoded(), callerCfg->blocks, caller->base(),
+      const bool preliminaryReachable = BlocksContain(callerCfg->preliminaryBlocks, callAddress);
+      const bool useExpanded = !preliminaryReachable && !callerCfg->expandedBlocks.empty();
+      const auto& analysisBlocks =
+          useExpanded ? callerCfg->expandedBlocks : callerCfg->preliminaryBlocks;
+      callsite = AnalyzeDirectCallArgumentDomain(ctx_.decoded(), analysisBlocks, caller->base(),
                                                  callAddress, entryAddress, registerIndex, limits);
-      callsite.callerCfgKind =
-          callerCfg->jumpTableSites.empty() ? "preliminary" : "validated_case_expanded";
-      callsite.callerCfgJumpTableSites = callerCfg->jumpTableSites;
+      const bool caseExpanded = useExpanded && !callerCfg->jumpTableSites.empty();
+      callsite.callerCfgKind = caseExpanded ? "validated_case_expanded" : "preliminary";
+      if (caseExpanded)
+        callsite.callerCfgJumpTableSites = callerCfg->jumpTableSites;
       callsite.reachableOnlyAfterCaseExpansion =
-          !BlocksContain(callerCfg->preliminaryBlocks, callAddress) &&
-          BlocksContain(callerCfg->blocks, callAddress);
-      if (!callsite.complete && !callerCfg->jumpTableSites.empty()) {
+          caseExpanded && BlocksContain(callerCfg->expandedBlocks, callAddress);
+      if (!callsite.complete && caseExpanded) {
         for (auto& rejection : callsite.rejections) {
           if (rejection == "callsite_not_reachable_in_preliminary_cfg")
             rejection = "callsite_not_reachable_in_validated_case_expanded_cfg";
@@ -281,24 +286,44 @@ class EntryRegisterDomainAnalyzer {
     }
   }
 
-  const CallerCfgEvidence* CallerCfg(const FunctionNode& caller) {
+  const CallerCfgEvidence* CallerCfg(const FunctionNode& caller, uint32_t callAddress) {
     auto existing = callerBlocks_.find(caller.base());
-    if (existing != callerBlocks_.end())
-      return &existing->second;
+    if (existing == callerBlocks_.end()) {
+      CallerCfgEvidence evidence;
+      if (!caller.jumpTablePreliminaryBlocks().empty()) {
+        evidence.preliminaryBlocks = caller.jumpTablePreliminaryBlocks();
+      } else {
+        const auto size = ctx_.scan.pdataSizes.find(caller.base());
+        if (size == ctx_.scan.pdataSizes.end())
+          return nullptr;
+        const CodeRegion* region = nullptr;
+        for (const auto& candidate : ctx_.scan.codeRegions) {
+          if (candidate.contains(caller.base())) {
+            region = &candidate;
+            break;
+          }
+        }
+        if (!region)
+          return nullptr;
 
-    CallerCfgEvidence evidence;
-    const auto size = ctx_.scan.pdataSizes.find(caller.base());
-    if (size == ctx_.scan.pdataSizes.end())
-      return nullptr;
-    const CodeRegion* region = nullptr;
-    for (const auto& candidate : ctx_.scan.codeRegions) {
-      if (candidate.contains(caller.base())) {
-        region = &candidate;
-        break;
+        auto preliminary = discoverPreliminaryBlocks(ctx_.decoded(), caller.base(), *region,
+                                                     knownFunctions_, size->second);
+        if (preliminary.blocks.empty())
+          return nullptr;
+        evidence.preliminaryBlocks = std::move(preliminary.blocks);
       }
+      existing = callerBlocks_.emplace(caller.base(), std::move(evidence)).first;
     }
-    if (!region)
-      return nullptr;
+
+    auto& evidence = existing->second;
+    if (BlocksContain(evidence.preliminaryBlocks, callAddress) || evidence.expansionAttempted)
+      return &evidence;
+
+    evidence.expansionAttempted = true;
+    const auto size = ctx_.scan.pdataSizes.find(caller.base());
+    const auto* region = ctx_.decoded().regionContaining(caller.base());
+    if (size == ctx_.scan.pdataSizes.end() || !region)
+      return &evidence;
 
     // Analyze the caller locally through the ordinary jump-table fixpoint so a
     // direct call reached only from an independently validated case edge is
@@ -309,14 +334,11 @@ class EntryRegisterDomainAnalyzer {
     // evidence and cannot form a circular domain proof.
     auto expanded = discoverBlocks(ctx_.decoded(), caller.base(), *region, knownFunctions_,
                                    size->second, &ctx_.Config().switchTables);
-    if (expanded.blocks.empty())
-      return nullptr;
-    evidence.blocks = std::move(expanded.blocks);
-    evidence.preliminaryBlocks = std::move(expanded.preliminaryBlocks);
+    evidence.expandedBlocks = std::move(expanded.blocks);
     for (const auto& table : expanded.jumpTables)
       evidence.jumpTableSites.push_back(table.bctrAddress);
     std::sort(evidence.jumpTableSites.begin(), evidence.jumpTableSites.end());
-    return &callerBlocks_.emplace(caller.base(), std::move(evidence)).first->second;
+    return &evidence;
   }
 
   CodegenContext& ctx_;
