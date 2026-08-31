@@ -789,12 +789,15 @@ bool WritesRegister(const Instruction& instruction, uint8_t reg) {
     case Opcode::lbzx:
     case Opcode::ldx:
       return instruction.D.RT == reg;
+    case Opcode::lwa:
+      return instruction.DS.RT == reg;
     case Opcode::ori:
     case Opcode::oris:
     case Opcode::or_:
     case Opcode::mr:
     case Opcode::extsb:
     case Opcode::extsh:
+    case Opcode::extsw:
       return instruction.X.RA == reg;
     case Opcode::add:
       return instruction.XO.RT == reg;
@@ -1812,6 +1815,17 @@ class Resolver {
         result.expression = MakeUnary(ExprKind::Load, address, 0, width, instruction.address);
         break;
       }
+      case Opcode::lwa: {
+        ExprPtr base = instruction.DS.RA == 0
+                           ? MakeConstant(0)
+                           : operand(static_cast<uint8_t>(instruction.DS.RA));
+        auto address =
+            MakeBinary(ExprKind::Add, base,
+                       MakeConstant(static_cast<uint32_t>(instruction.DS.displacement())),
+                       instruction.address);
+        result.expression = MakeUnary(ExprKind::Load, address, 0, 4, instruction.address);
+        break;
+      }
       case Opcode::lwzx:
       case Opcode::lhzx:
       case Opcode::lbzx:
@@ -1830,8 +1844,11 @@ class Resolver {
         break;
       }
       case Opcode::extsb:
-      case Opcode::extsh: {
-        const uint8_t width = instruction.opcode == Opcode::extsb ? 1 : 2;
+      case Opcode::extsh:
+      case Opcode::extsw: {
+        const uint8_t width = instruction.opcode == Opcode::extsb
+                                  ? 1
+                                  : (instruction.opcode == Opcode::extsh ? 2 : 4);
         result.expression =
             MakeUnary(ExprKind::SignExtend, operand(static_cast<uint8_t>(instruction.X.RT)), 0,
                       width, instruction.address);
@@ -2807,6 +2824,7 @@ FreshBoundIndexDefinition FindFreshBoundIndexDefinition(DecodedBinary& decoded, 
       case Opcode::lwzx:
       case Opcode::lhzx:
       case Opcode::lbzx:
+      case Opcode::lwa:
         return true;
       case Opcode::addi:
       case Opcode::addis:
@@ -2819,6 +2837,7 @@ FreshBoundIndexDefinition FindFreshBoundIndexDefinition(DecodedBinary& decoded, 
       case Opcode::or_:
       case Opcode::extsb:
       case Opcode::extsh:
+      case Opcode::extsw:
         return trace(static_cast<uint8_t>(instruction->X.RT), instruction->address, depth + 1);
       case Opcode::rlwinm:
         return trace(static_cast<uint8_t>(instruction->M.RS), instruction->address, depth + 1);
@@ -3680,8 +3699,11 @@ class LocalBoundedSliceTracer {
         break;
       }
       case Opcode::extsb:
-      case Opcode::extsh: {
-        const uint8_t width = instruction->opcode == Opcode::extsb ? 1 : 2;
+      case Opcode::extsh:
+      case Opcode::extsw: {
+        const uint8_t width = instruction->opcode == Opcode::extsb
+                                  ? 1
+                                  : (instruction->opcode == Opcode::extsh ? 2 : 4);
         auto source = operand(static_cast<uint8_t>(instruction->X.RT));
         if (source) {
           result.expression =
@@ -3772,6 +3794,7 @@ std::optional<uint8_t> ExpressionResultRegister(DecodedBinary& decoded, const Ex
       return static_cast<uint8_t>(instruction->M.RA);
     case Opcode::extsb:
     case Opcode::extsh:
+    case Opcode::extsw:
       return static_cast<uint8_t>(instruction->X.RA);
     default:
       return std::nullopt;

@@ -111,6 +111,13 @@ uint32_t Ldx(uint8_t rt, uint8_t ra, uint8_t rb) {
          (static_cast<uint32_t>(rb) << 11);
 }
 
+uint32_t Lwa(uint8_t rt, uint8_t ra, int16_t displacement) {
+  REQUIRE((displacement & 3) == 0);
+  return 0xE8000002u | (static_cast<uint32_t>(rt) << 21) |
+         (static_cast<uint32_t>(ra) << 16) |
+         (static_cast<uint16_t>(displacement) & 0xFFFCu);
+}
+
 uint32_t Add(uint8_t rt, uint8_t ra, uint8_t rb) {
   return 0x7C000214u | (static_cast<uint32_t>(rt) << 21) | (static_cast<uint32_t>(ra) << 16) |
          (static_cast<uint32_t>(rb) << 11);
@@ -122,6 +129,10 @@ uint32_t Extsb(uint8_t ra, uint8_t rs) {
 
 uint32_t Extsh(uint8_t ra, uint8_t rs) {
   return 0x7C000734u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16);
+}
+
+uint32_t Extsw(uint8_t ra, uint8_t rs) {
+  return 0x7C0007B4u | (static_cast<uint32_t>(rs) << 21) | (static_cast<uint32_t>(ra) << 16);
 }
 
 uint32_t Mr(uint8_t ra, uint8_t rs) {
@@ -1128,6 +1139,95 @@ TEST_CASE("jump-table recovery reports a missing dominating bound", "[codegen][j
   auto analysis = Analyze(image);
   CHECK_FALSE(analysis.selectedTable);
   CHECK(HasFailure(analysis, JumpTableFailure::MissingBound));
+}
+
+TEST_CASE("finite switch targets accept PPC64 scalar instructions supported by codegen",
+          "[codegen][jump-table][decoder-parity]") {
+  SECTION("an inline absolute case may begin with extsw") {
+    std::vector<uint8_t> text(0xC0, 0);
+    for (uint32_t offset = 0; offset < text.size(); offset += 4)
+      StoreBe32(text, offset, 0x60000000);  // nop
+
+    constexpr uint32_t kSite = kTextBase + 0x1C;
+    constexpr uint32_t kInlineTable = kTextBase + 0x20;
+    constexpr uint32_t kOwnerEnd = kTextBase + 0xB0;
+    constexpr std::array<uint32_t, 6> kTargets{
+        kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60,
+        kTextBase + 0x70, kTextBase + 0x80, kTextBase + 0x90,
+    };
+
+    StoreBe32(text, 0x00, 0x28030005);  // cmplwi r3,5
+    StoreBe32(text, 0x04, Bc(kTextBase + 0x04, kTextBase + 0xA0, 12, 1));  // bgt default
+    StoreBe32(text, 0x08, 0x3D801000);                                  // lis r12,text@h
+    StoreBe32(text, 0x0C, Addi(12, 12, 0x20));
+    StoreBe32(text, 0x10, Rlwinm(0, 3, 2, 0, 29));
+    StoreBe32(text, 0x14, Lwzx(0, 12, 0));
+    StoreBe32(text, 0x18, Mtctr(0));
+    StoreBe32(text, 0x1C, 0x4E800420);  // bctr, no fallthrough
+    for (uint32_t index = 0; index < kTargets.size(); ++index)
+      StoreBe32(text, 0x20 + index * 4, kTargets[index]);
+    for (uint32_t target : kTargets) {
+      StoreBe32(text, target - kTextBase, 0x60000000);
+      StoreBe32(text, target - kTextBase + 4, 0x4E800020);
+    }
+    StoreBe32(text, 0x90, Extsw(11, 30));
+    StoreBe32(text, 0xA0, 0x4E800020);  // default
+
+    const std::array sections{BinarySectionInput{
+        .name = ".text",
+        .baseAddress = kTextBase,
+        .data = text,
+        .executable = true,
+        .readable = true,
+    }};
+    const auto view = BinaryView::fromSections(kTextBase, kTextBase + text.size(), kTextBase,
+                                               sections);
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const auto* decodedExtsw = decoded.get(kTextBase + 0x90);
+    REQUIRE(decodedExtsw != nullptr);
+    CHECK(decodedExtsw->opcode == ppc::Opcode::extsw);
+    const Block preliminary{kTextBase, kInlineTable - kTextBase};
+    JumpTableRecoveryInput input{
+        .site = kSite,
+        .ownerAddress = kTextBase,
+        .trustedOwnerEnd = kOwnerEnd,
+        .preliminaryBlocks = std::span<const Block>(&preliminary, 1),
+        .containingRegion = decoded.regionContaining(kTextBase),
+        .limits = {},
+    };
+
+    auto analysis = AnalyzeIndirectSite(decoded, input);
+    INFO("failure vector: " << FailureNames(analysis));
+    REQUIRE(analysis.selectedTable);
+    CHECK(analysis.failures.empty());
+    CHECK(analysis.selectedTable->tableAddress == kInlineTable);
+    CHECK(analysis.selectedTable->storageEnd == kTextBase + 0x38);
+    CHECK(analysis.selectedTable->caseCount == kTargets.size());
+    CHECK(analysis.selectedTable->targets ==
+          std::vector<uint32_t>(kTargets.begin(), kTargets.end()));
+  }
+
+  SECTION("a relative halfword case may begin with lwa") {
+    RelativeSwitch image(true);
+    StoreBe32(image.text, 0x60, Lwa(11, 31, 0x98));
+    StoreBe32(image.text, 0x64, 0x4E800020);
+
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const auto* decodedLwa = decoded.get(kTextBase + 0x60);
+    REQUIRE(decodedLwa != nullptr);
+    CHECK(decodedLwa->opcode == ppc::Opcode::lwa);
+
+    auto analysis = Analyze(image);
+    INFO("failure vector: " << FailureNames(analysis));
+    REQUIRE(analysis.selectedTable);
+    CHECK(analysis.failures.empty());
+    CHECK(analysis.selectedTable->caseCount == 3);
+    CHECK(analysis.selectedTable->targets ==
+          std::vector<uint32_t>{kTextBase + 0x40, kTextBase + 0x50, kTextBase + 0x60});
+  }
 }
 
 TEST_CASE("self-delimiting inline absolute tables require an exact static extent",

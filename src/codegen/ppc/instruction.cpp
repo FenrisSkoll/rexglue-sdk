@@ -178,6 +178,7 @@ Instruction::Semantics Instruction::get_semantics() const {
       case Opcode::lwzu:
       case Opcode::ld:
       case Opcode::ldu:
+      case Opcode::lwa:
         sem.reads_memory = true;
         break;
       case Opcode::stb:
