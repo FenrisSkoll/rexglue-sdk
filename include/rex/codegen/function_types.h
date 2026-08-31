@@ -450,6 +450,14 @@ struct JumpTableBoundCandidateEvidence {
   bool inheritedFiniteCaseDomain = false;
   bool finiteCfgDomain = false;
   bool interproceduralEntryDomain = false;
+  // A static table-extent proof, deliberately distinct from a runtime index
+  // domain. For the supported compiler idiom the absolute word table starts
+  // immediately after a non-fallthrough bctr and ends exactly at its earliest
+  // validated case block. This never claims that an observed runtime edge or
+  // the first invalid word bounds the table.
+  bool selfDelimitedInlineTableExtent = false;
+  uint32_t tableStorageStart = 0;
+  uint32_t tableStorageEnd = 0;
   std::vector<uint32_t> finiteValues;
   std::vector<uint32_t> normalizedFiniteValues;
   std::vector<JumpTableCfgEdgeEvidence> inheritedCaseEdges;

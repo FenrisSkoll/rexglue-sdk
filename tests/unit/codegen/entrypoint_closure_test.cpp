@@ -443,6 +443,15 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
   inheritedDomain.stackSlotOffset = 0x20;
   inheritedDomain.stackSlotWidth = 4;
   dataflow.boundCandidates.push_back(std::move(inheritedDomain));
+  JumpTableBoundCandidateEvidence inlineExtent;
+  inlineExtent.domainOriginAddress = kTextBase + 0x44;
+  inlineExtent.value = 3;
+  inlineExtent.caseCount = 4;
+  inlineExtent.indexRegister = 9;
+  inlineExtent.selfDelimitedInlineTableExtent = true;
+  inlineExtent.tableStorageStart = kTextBase + 0x44;
+  inlineExtent.tableStorageEnd = kTextBase + 0x54;
+  dataflow.boundCandidates.push_back(std::move(inlineExtent));
   dataflow.diagnosticProbe.attempted = true;
   dataflow.diagnosticProbe.rejections = {"no_exact_dominating_unsigned_bound"};
   JumpTableEntryRegisterDomainEvidence entryDomain;
@@ -520,6 +529,11 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
     CHECK(inheritedDomain.at("stack_reload_address") == "0x1000000C");
     CHECK(inheritedDomain.at("stack_slot_offset") == 0x20);
     CHECK(inheritedDomain.at("stack_slot_width") == 4);
+    const auto& inlineExtent = site.at("dataflow").at("bound_candidates").back();
+    CHECK(inlineExtent.at("self_delimited_inline_table_extent") == true);
+    CHECK(inlineExtent.at("finite_dense_domain") == false);
+    CHECK(inlineExtent.at("table_storage_start") == "0x10000044");
+    CHECK(inlineExtent.at("table_storage_end") == "0x10000054");
     const auto& entryDomain = site.at("dataflow").at("entry_register_domains").front();
     CHECK(entryDomain.at("all_references_direct_calls") == true);
     CHECK(entryDomain.at("finite_dense_domain") == false);

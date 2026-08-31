@@ -1161,10 +1161,15 @@ static EntrypointClosureReport AnalyzeEntrypointClosureDecoded(const BinaryView&
         !matchingFiniteBound &&
         std::any_of(dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
                     [](const auto& bound) { return bound.finiteDenseDomain; });
+    const bool selfDelimitedInlineExtent = std::any_of(
+        dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
+        [](const auto& bound) { return bound.selfDelimitedInlineTableExtent; });
     if (matchingFiniteBound)
       addEvidence("finite_dominating_bound_for_table_index");
     if (unmatchedFiniteBound)
       addEvidence("finite_bound_for_unrelated_register");
+    if (selfDelimitedInlineExtent)
+      addEvidence("self_delimiting_inline_table_extent");
     if (dataflow.reachingDefinitionInScc)
       addEvidence("loop_carried_reaching_definition");
     if (dataflow.diagnosticProbe.hypothesisComplete && dataflow.diagnosticProbe.allTargetsValid) {
@@ -1176,7 +1181,7 @@ static EntrypointClosureReport AnalyzeEntrypointClosureDecoded(const BinaryView&
       addEvidence("production_table_recovered");
     if (dataflow.mergeShape == "finite_loop_phi" || dataflow.mergeShape == "finite_cfg_domain" ||
         dataflow.mergeShape == "bounded_direct_index" ||
-        dataflow.mergeShape == "interprocedural_entry_domain")
+        dataflow.mergeShape == "interprocedural_entry_domain" || selfDelimitedInlineExtent)
       cluster.syntheticFixtureExists = true;
   }
   for (auto& [unused, cluster] : clusterMap) {
@@ -1549,6 +1554,11 @@ Json JumpBoundCandidateJson(const JumpTableBoundCandidateEvidence& bound) {
       {"inherited_finite_case_domain", bound.inheritedFiniteCaseDomain},
       {"finite_cfg_domain", bound.finiteCfgDomain},
       {"interprocedural_entry_domain", bound.interproceduralEntryDomain},
+      {"self_delimited_inline_table_extent", bound.selfDelimitedInlineTableExtent},
+      {"table_storage_start",
+       bound.tableStorageStart ? Json(Hex(bound.tableStorageStart)) : Json(nullptr)},
+      {"table_storage_end",
+       bound.tableStorageEnd ? Json(Hex(bound.tableStorageEnd)) : Json(nullptr)},
       {"finite_values", std::move(finiteValues)},
       {"normalized_finite_values", std::move(normalizedFiniteValues)},
       {"inherited_case_edges", std::move(inheritedCaseEdges)},
@@ -2290,23 +2300,29 @@ Result<void> WriteEntrypointClosureReports(const EntrypointClosureReport& report
       if (index)
         bounds << ';';
       const auto& bound = dataflow.boundCandidates[index];
+      std::string proofKind = "current_guard";
+      if (bound.priorDirectBoundedIndexRevalidation)
+        proofKind = "direct_bounded_prior";
+      else if (bound.priorExactRevalidation)
+        proofKind = "exact_prior";
+      else if (bound.inheritedFiniteCaseDomain)
+        proofKind = "inherited_finite_case_domain";
+      else if (bound.selfDelimitedInlineTableExtent)
+        proofKind = "self_delimited_inline_table_extent";
+      else if (bound.inheritedCaseEdgeProof)
+        proofKind = "inherited_case_edge";
+      else if (bound.finiteCfgDomain)
+        proofKind = "finite_cfg_domain";
+      else if (bound.interproceduralEntryDomain)
+        proofKind = "interprocedural_entry_domain";
+      const char* domainDisposition = bound.selfDelimitedInlineTableExtent
+                                          ? "finite_table_extent"
+                                      : bound.finiteDenseDomain ? "finite"
+                                                                : "rejected";
       bounds << (bound.compareAddress ? Hex(bound.compareAddress) : Hex(bound.domainOriginAddress))
              << ':' << bound.caseCount << ':'
              << (bound.dominatesDispatch ? "dominates" : "not_dominating") << ':'
-             << (bound.finiteDenseDomain ? "finite" : "rejected") << ':'
-             << (bound.priorDirectBoundedIndexRevalidation
-                     ? "direct_bounded_prior"
-                     : (bound.priorExactRevalidation
-                            ? "exact_prior"
-                            : (bound.inheritedFiniteCaseDomain
-                                   ? "inherited_finite_case_domain"
-                                   : (bound.inheritedCaseEdgeProof
-                                          ? "inherited_case_edge"
-                                          : (bound.finiteCfgDomain
-                                                 ? "finite_cfg_domain"
-                                                 : (bound.interproceduralEntryDomain
-                                                        ? "interprocedural_entry_domain"
-                                                        : "current_guard"))))));
+             << domainDisposition << ':' << proofKind;
       if (!bound.rejection.empty())
         bounds << ':' << bound.rejection;
     }

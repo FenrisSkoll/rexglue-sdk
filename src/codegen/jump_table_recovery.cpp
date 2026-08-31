@@ -4085,6 +4085,210 @@ bool IsFreshTransformedBoundedIndexCandidate(
   });
 }
 
+struct InlineAbsoluteTableExtentRecovery {
+  bool structurallyEligible = false;
+  bool productionEligible = false;
+  bool entryLimitHit = false;
+  std::optional<JumpTable> table;
+  std::optional<JumpTableBoundCandidateEvidence> extentEvidence;
+  std::vector<std::string> rejections;
+};
+
+bool CollectInlineAddressTerms(const ExprPtr& expression, uint32_t& constant,
+                               std::vector<ExprPtr>& dynamicTerms, uint32_t depth = 0) {
+  if (!expression || depth > 64)
+    return false;
+  if (expression->kind == ExprKind::Constant) {
+    constant += expression->value;
+    return true;
+  }
+  if (expression->kind == ExprKind::Add) {
+    return CollectInlineAddressTerms(expression->lhs, constant, dynamicTerms, depth + 1) &&
+           CollectInlineAddressTerms(expression->rhs, constant, dynamicTerms, depth + 1);
+  }
+  dynamicTerms.push_back(expression);
+  return true;
+}
+
+// Recover one compiler-emitted absolute word table whose storage is embedded
+// directly after an unconditional bctr. This is a finite static storage proof,
+// not a runtime index-domain proof: no runtime target and no first invalid word
+// participates. The extent closes only when the next byte after a complete run
+// of validated words is exactly the earliest case block.
+InlineAbsoluteTableExtentRecovery RecoverSelfDelimitedInlineAbsoluteTable(
+    DecodedBinary& decoded, const JumpTableRecoveryInput& input, const Instruction& mtctr,
+    const ResolveResult& target,
+    const std::vector<JumpTableInstructionEvidence>& instructionEvidence) {
+  InlineAbsoluteTableExtentRecovery recovery;
+  const auto reject = [&](std::string reason) {
+    if (std::find(recovery.rejections.begin(), recovery.rejections.end(), reason) ==
+        recovery.rejections.end()) {
+      recovery.rejections.push_back(std::move(reason));
+    }
+  };
+
+  if (input.site < 12 || !target.expression || target.expression->kind != ExprKind::Load ||
+      target.expression->width != 4) {
+    return recovery;
+  }
+  const Expr* tableLoad = target.expression.get();
+  const auto* loadInstruction = decoded.get(tableLoad->origin);
+  if (!loadInstruction || loadInstruction->opcode != Opcode::lwzx ||
+      loadInstruction->address != input.site - 8 || mtctr.address != input.site - 4 ||
+      static_cast<uint8_t>(mtctr.XFX.RS()) != static_cast<uint8_t>(loadInstruction->X.RT)) {
+    return recovery;
+  }
+
+  uint32_t tableBase = 0;
+  std::vector<ExprPtr> dynamicTerms;
+  if (!CollectInlineAddressTerms(tableLoad->lhs, tableBase, dynamicTerms) ||
+      dynamicTerms.size() != 1 || dynamicTerms.front()->kind != ExprKind::ShiftLeft ||
+      dynamicTerms.front()->value != 2 || !dynamicTerms.front()->lhs) {
+    return recovery;
+  }
+  const ExprPtr& scaledIndex = dynamicTerms.front();
+  const ExprPtr& logicalIndex = scaledIndex->lhs;
+  const auto* scaleInstruction = decoded.get(scaledIndex->origin);
+  if (!scaleInstruction || scaleInstruction->opcode != Opcode::rlwinm ||
+      scaleInstruction->address != input.site - 12 || scaleInstruction->M.SH != 2 ||
+      scaleInstruction->M.MB != 0 || scaleInstruction->M.ME != 29 ||
+      scaleInstruction->M.RA != loadInstruction->X.RB ||
+      scaleInstruction->M.RS == loadInstruction->X.RT) {
+    return recovery;
+  }
+
+  const uint64_t expectedBase = static_cast<uint64_t>(input.site) + 4;
+  if (expectedBase > std::numeric_limits<uint32_t>::max() || tableBase != expectedBase)
+    return recovery;
+  recovery.structurallyEligible = true;
+
+  if (input.trustedOwnerEnd <= input.ownerAddress || input.site < input.ownerAddress ||
+      tableBase < input.ownerAddress || tableBase >= input.trustedOwnerEnd) {
+    reject("missing_exact_trusted_owner_envelope");
+    return recovery;
+  }
+  if (!decoded.get(tableBase)) {
+    reject("inline_table_storage_is_not_executable");
+    return recovery;
+  }
+
+  recovery.productionEligible = !target.ambiguous && !target.limitHit &&
+                                !target.incompleteCaseEntryPath &&
+                                CountUnknownLeaves(logicalIndex) == 0;
+  if (target.ambiguous)
+    reject("target_reaching_definition_ambiguous");
+  if (target.limitHit)
+    reject("target_reaching_definition_limit");
+  if (target.incompleteCaseEntryPath)
+    reject("target_has_incomplete_case_entry_path");
+  if (CountUnknownLeaves(logicalIndex) != 0)
+    reject("logical_index_contains_unknown_definition");
+
+  JumpTable table;
+  table.bctrAddress = input.site;
+  table.tableAddress = tableBase;
+  table.indexRegister = static_cast<uint8_t>(scaleInstruction->M.RS);
+  table.kind = JumpTableKind::AbsolutePointer;
+  table.origin = JumpTableOrigin::Automatic;
+  table.ownerAddress = input.ownerAddress;
+  table.anchorAddress = 0;
+  table.targetScale = 1;
+  table.elementWidth = 4;
+  table.elementSigned = false;
+  table.boundInclusive = false;
+  table.defaultIsReturn = false;
+  table.tableInExecutableSection = true;
+  table.boundSemantics = "self_delimiting_inline_absolute_table_extent";
+  table.confidence = "validated_self_delimiting_inline_absolute_table_all_targets";
+  table.evidence = instructionEvidence;
+  table.evidence.push_back(
+      Evidence(*scaleInstruction, "self_delimiting_inline_table_index_scale"));
+  table.evidence.push_back(Evidence(*loadInstruction, "self_delimiting_inline_table_load"));
+
+  constexpr uint32_t kMinimumInlineTableEntries = 3;
+  uint32_t earliestTarget = std::numeric_limits<uint32_t>::max();
+  const std::string logicalIndexKey = ExprKey(logicalIndex);
+  for (uint32_t index = 0; index < input.limits.maxEntries; ++index) {
+    const uint64_t storageWide = static_cast<uint64_t>(tableBase) + index * 4ull;
+    const uint64_t storageEndWide = storageWide + 4;
+    if (storageEndWide > input.trustedOwnerEnd ||
+        storageEndWide > std::numeric_limits<uint32_t>::max()) {
+      reject("inline_table_extent_exceeds_trusted_owner");
+      return recovery;
+    }
+    const uint32_t storage = static_cast<uint32_t>(storageWide);
+    const uint32_t storageEnd = static_cast<uint32_t>(storageEndWide);
+    auto evaluated = Evaluate(target.expression, logicalIndexKey, index, decoded);
+    auto load = evaluated.loads.find(tableLoad->origin);
+    if (!evaluated.ok || load == evaluated.loads.end() || load->second.first != storage ||
+        load->second.second != 4) {
+      reject("inline_table_storage_does_not_match_exact_word_stride");
+      return recovery;
+    }
+    const auto rawValue = decoded.read<uint32_t>(storage);
+    if (!rawValue || *rawValue != evaluated.value) {
+      reject("inline_table_raw_entry_does_not_match_absolute_target");
+      return recovery;
+    }
+
+    const uint32_t caseTarget = evaluated.value;
+    if ((caseTarget & 3) != 0) {
+      reject("inline_table_target_unaligned:index=" + std::to_string(index));
+      return recovery;
+    }
+    const auto* targetInstruction = decoded.get(caseTarget);
+    if (!targetInstruction || isInvalid(*targetInstruction) ||
+        caseTarget < input.ownerAddress || caseTarget >= input.trustedOwnerEnd) {
+      reject("inline_table_target_outside_exact_owner:index=" + std::to_string(index));
+      return recovery;
+    }
+    if (input.independentlyCallableEntries && caseTarget != input.ownerAddress &&
+        input.independentlyCallableEntries->contains(caseTarget)) {
+      reject("inline_table_target_is_independently_callable:index=" + std::to_string(index));
+      return recovery;
+    }
+
+    table.rawEntries.push_back({storage, *rawValue, caseTarget});
+    table.targets.push_back(caseTarget);
+    earliestTarget = std::min(earliestTarget, caseTarget);
+    if (storageEnd > earliestTarget) {
+      reject("inline_table_storage_crosses_earliest_case_target");
+      return recovery;
+    }
+    if (storageEnd != earliestTarget)
+      continue;
+    if (table.targets.size() < kMinimumInlineTableEntries) {
+      reject("inline_table_extent_has_fewer_than_three_entries");
+      return recovery;
+    }
+
+    table.storageEnd = storageEnd;
+    table.caseCount = static_cast<uint32_t>(table.targets.size());
+    table.boundValue = table.caseCount - 1;
+    table.manualComparison = input.manualTable ? CompareManual(table, *input.manualTable)
+                                               : JumpTableManualComparison::NewAutomaticTable;
+    table.evidence.push_back(
+        Evidence(*targetInstruction, "self_delimiting_inline_table_storage_boundary_case"));
+
+    JumpTableBoundCandidateEvidence extent;
+    extent.domainOriginAddress = tableBase;
+    extent.value = table.boundValue;
+    extent.caseCount = table.caseCount;
+    extent.indexRegister = table.indexRegister;
+    extent.finiteDenseDomain = false;
+    extent.selfDelimitedInlineTableExtent = true;
+    extent.tableStorageStart = tableBase;
+    extent.tableStorageEnd = storageEnd;
+    recovery.extentEvidence = std::move(extent);
+    recovery.table = std::move(table);
+    return recovery;
+  }
+
+  recovery.entryLimitHit = recovery.structurallyEligible;
+  reject("inline_table_extent_not_closed_within_max_entries");
+  return recovery;
+}
+
 JumpTableDiagnosticProbe RunDiagnosticProbe(
     DecodedBinary& decoded, const JumpTableRecoveryInput& input, const ResolveResult& target,
     const std::vector<JumpTableBoundCandidateEvidence>& boundEvidence,
@@ -4799,6 +5003,8 @@ void FinalizeJumpTableSiteDisposition(IndirectSiteAnalysis& analysis) {
         evidence.starts_with("ambiguous_bound_candidate:") ||
         evidence.starts_with("local_bounded_slice:") || evidence.starts_with("table_validation:")) {
       rejectionEvidence.push_back(evidence);
+    } else if (evidence.starts_with("self_delimiting_inline_table:")) {
+      rejectionEvidence.push_back(evidence);
     }
   }
   for (auto failure : analysis.failures)
@@ -4813,6 +5019,10 @@ void FinalizeJumpTableSiteDisposition(IndirectSiteAnalysis& analysis) {
   std::string boundShape = "none";
   bool sawUnmatchedFiniteBound = false;
   for (const auto& bound : dataflow.boundCandidates) {
+    if (bound.selfDelimitedInlineTableExtent) {
+      boundShape = "self_delimiting_inline_table_extent";
+      break;
+    }
     if (!bound.finiteDenseDomain)
       continue;
     if (dataflow.indexRegister != 0xFF && bound.indexRegister == dataflow.indexRegister) {
@@ -5573,6 +5783,54 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
           }
         }
       }
+    }
+  }
+
+  // A missing runtime guard does not make an inline table unbounded when the
+  // executable layout supplies an exact, self-delimiting storage extent. Keep
+  // this fallback separate from the ordinary bound/dataflow recognizers and
+  // accept it only for the exact missing_bound lifecycle. Ambiguity, limits,
+  // and any prior target-validation failure remain authoritative.
+  if (!analysis.automaticTable && mtctr && resolvedTarget) {
+    auto inlineExtent = RecoverSelfDelimitedInlineAbsoluteTable(
+        decoded, input, *mtctr, *resolvedTarget, analysis.evidence);
+    for (const auto& rejection : inlineExtent.rejections) {
+      dataflow.rejectionEvidence.push_back("self_delimiting_inline_table:" + rejection);
+    }
+    if (inlineExtent.entryLimitHit) {
+      dataflow.exhaustedBudgets.push_back(
+          {"max_entries", input.limits.maxEntries, input.limits.maxEntries});
+    }
+    if (inlineExtent.extentEvidence) {
+      dataflow.boundCandidates.push_back(*inlineExtent.extentEvidence);
+      std::sort(dataflow.boundCandidates.begin(), dataflow.boundCandidates.end(),
+                [](const auto& lhs, const auto& rhs) {
+                  if (lhs.compareAddress != rhs.compareAddress)
+                    return lhs.compareAddress < rhs.compareAddress;
+                  if (lhs.guardAddress != rhs.guardAddress)
+                    return lhs.guardAddress < rhs.guardAddress;
+                  return lhs.domainOriginAddress < rhs.domainOriginAddress;
+                });
+    }
+
+    const bool exactMissingBoundFailure =
+        analysis.failures.size() == 1 &&
+        analysis.failures.front() == JumpTableFailure::MissingBound;
+    if (inlineExtent.table && inlineExtent.productionEligible && exactMissingBoundFailure) {
+      analysis.automaticTable = std::move(*inlineExtent.table);
+      analysis.classification = IndirectSiteClassification::SwitchBctr;
+      analysis.failures.clear();
+      if (stats)
+        ++stats->recoveredTables;
+    } else if (inlineExtent.table) {
+      std::string failureVector;
+      for (auto failure : analysis.failures) {
+        if (!failureVector.empty())
+          failureVector += ',';
+        failureVector += JumpTableFailureName(failure);
+      }
+      dataflow.rejectionEvidence.push_back(
+          "self_delimiting_inline_table:not_selected_failure_vector=" + failureVector);
     }
   }
 

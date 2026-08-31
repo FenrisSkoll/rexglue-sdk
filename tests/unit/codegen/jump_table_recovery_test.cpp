@@ -174,6 +174,55 @@ struct AbsoluteSwitch {
   }
 };
 
+struct InlineAbsoluteSwitch {
+  std::vector<uint8_t> text = std::vector<uint8_t>(0x180, 0);
+  uint32_t site = kTextBase + 0x2C;
+  uint32_t tableBase = kTextBase + 0x30;
+  uint32_t ownerEnd = kTextBase + 0x140;
+  std::vector<uint32_t> expectedTargets{
+      kTextBase + 0x5C, kTextBase + 0x80, kTextBase + 0x90, kTextBase + 0xA0,
+      kTextBase + 0xA0, kTextBase + 0x70, kTextBase + 0xA0, kTextBase + 0xA0,
+      kTextBase + 0xA0, kTextBase + 0xA0, kTextBase + 0x64,
+  };
+
+  InlineAbsoluteSwitch() {
+    for (uint32_t offset = 0; offset < text.size(); offset += 4)
+      StoreBe32(text, offset, 0x60000000);  // nop
+
+    // Match the structural form at TU1 0x82B951A4. The record-derived value
+    // is deliberately not statically enumerable; the table extent is instead
+    // proven by its exact inline layout without using a runtime target.
+    StoreBe32(text, 0x00, Rlwinm(11, 20, 1, 0, 30));
+    StoreBe32(text, 0x04, Add(11, 20, 11));
+    StoreBe32(text, 0x08, Rlwinm(11, 11, 2, 0, 29));
+    StoreBe32(text, 0x0C, Add(8, 11, 19));
+    StoreBe32(text, 0x10, Lwzx(11, 11, 19));
+    StoreBe32(text, 0x14, Addi(9, 11, -1));
+    StoreBe32(text, 0x18, 0x3D801000);  // lis r12, text@h
+    StoreBe32(text, 0x1C, Addi(12, 12, 0x30));
+    StoreBe32(text, 0x20, Rlwinm(0, 9, 2, 0, 29));
+    StoreBe32(text, 0x24, Lwzx(0, 12, 0));
+    StoreBe32(text, 0x28, Mtctr(0));
+    StoreBe32(text, 0x2C, 0x4E800420);  // bctr, with no fallthrough edge
+
+    for (uint32_t index = 0; index < expectedTargets.size(); ++index)
+      StoreBe32(text, 0x30 + index * 4, expectedTargets[index]);
+    for (uint32_t target : std::set<uint32_t>(expectedTargets.begin(), expectedTargets.end()))
+      StoreBe32(text, target - kTextBase, 0x4E800020);  // case block
+  }
+
+  BinaryView view() const {
+    const std::array sections{BinarySectionInput{
+        .name = ".text",
+        .baseAddress = kTextBase,
+        .data = text,
+        .executable = true,
+        .readable = true,
+    }};
+    return BinaryView::fromSections(kTextBase, kTextBase + text.size(), kTextBase, sections);
+  }
+};
+
 IndirectSiteAnalysis Analyze(AbsoluteSwitch& image, uint32_t site = kTextBase + 0x18,
                              const JumpTable* manual = nullptr, JumpTableRecoveryLimits limits = {},
                              uint32_t blockSize = 0x80) {
@@ -877,6 +926,183 @@ TEST_CASE("jump-table recovery reports a missing dominating bound", "[codegen][j
   auto analysis = Analyze(image);
   CHECK_FALSE(analysis.selectedTable);
   CHECK(HasFailure(analysis, JumpTableFailure::MissingBound));
+}
+
+TEST_CASE("self-delimiting inline absolute tables require an exact static extent",
+          "[codegen][jump-table][inline-table-extent]") {
+  const auto analyze = [](InlineAbsoluteSwitch& image,
+                          const std::unordered_set<uint32_t>* callableEntries = nullptr,
+                          JumpTableRecoveryLimits limits = {}) {
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const Block preliminary{kTextBase, image.tableBase - kTextBase};
+    JumpTableRecoveryInput input{
+        .site = image.site,
+        .ownerAddress = kTextBase,
+        .trustedOwnerEnd = image.ownerEnd,
+        .preliminaryBlocks = std::span<const Block>(&preliminary, 1),
+        .containingRegion = decoded.regionContaining(kTextBase),
+        .independentlyCallableEntries = callableEntries,
+        .limits = limits,
+    };
+    return AnalyzeIndirectSite(decoded, input);
+  };
+
+  SECTION("a record-derived index uses the finite inline storage boundary") {
+    InlineAbsoluteSwitch image;
+    auto analysis = analyze(image);
+    REQUIRE(analysis.selectedTable);
+    CHECK(analysis.failures.empty());
+    CHECK(analysis.classification == IndirectSiteClassification::SwitchBctr);
+    CHECK(analysis.selectedTable->bctrAddress == image.site);
+    CHECK(analysis.selectedTable->tableAddress == image.tableBase);
+    CHECK(analysis.selectedTable->storageEnd == kTextBase + 0x5C);
+    CHECK(analysis.selectedTable->caseCount == 11);
+    CHECK(analysis.selectedTable->indexRegister == 9);
+    CHECK(analysis.selectedTable->kind == JumpTableKind::AbsolutePointer);
+    CHECK(analysis.selectedTable->elementWidth == 4);
+    CHECK_FALSE(analysis.selectedTable->elementSigned);
+    CHECK(analysis.selectedTable->boundSemantics ==
+          "self_delimiting_inline_absolute_table_extent");
+    CHECK(analysis.selectedTable->confidence ==
+          "validated_self_delimiting_inline_absolute_table_all_targets");
+    CHECK(analysis.selectedTable->targets == image.expectedTargets);
+    REQUIRE(analysis.selectedTable->rawEntries.size() == image.expectedTargets.size());
+    for (uint32_t index = 0; index < image.expectedTargets.size(); ++index) {
+      const JumpTableRawEntry expectedEntry{image.tableBase + index * 4,
+                                            image.expectedTargets[index],
+                                            image.expectedTargets[index]};
+      CHECK(analysis.selectedTable->rawEntries[index] == expectedEntry);
+    }
+    REQUIRE(analysis.dataflow);
+    const auto extent = std::find_if(
+        analysis.dataflow->boundCandidates.begin(), analysis.dataflow->boundCandidates.end(),
+        [](const auto& bound) { return bound.selfDelimitedInlineTableExtent; });
+    REQUIRE(extent != analysis.dataflow->boundCandidates.end());
+    CHECK_FALSE(extent->finiteDenseDomain);
+    CHECK(extent->tableStorageStart == image.tableBase);
+    CHECK(extent->tableStorageEnd == kTextBase + 0x5C);
+    CHECK(extent->caseCount == 11);
+
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const auto* region = decoded.regionContaining(kTextBase);
+    REQUIRE(region != nullptr);
+    const std::unordered_set<uint32_t> functions{kTextBase, image.ownerEnd};
+    auto discovered = discoverBlocks(decoded, kTextBase, *region, functions,
+                                     image.ownerEnd - kTextBase);
+    REQUIRE(discovered.jumpTables.size() == 1);
+    CHECK(discovered.jumpTables.front().bctrAddress == image.site);
+    CHECK(discovered.jumpTables.front().targets == image.expectedTargets);
+    CHECK_FALSE(discovered.labels.contains(image.tableBase));
+    for (uint32_t target : image.expectedTargets)
+      CHECK(discovered.labels.contains(target));
+  }
+
+  SECTION("the table must start at the non-fallthrough instruction boundary") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x1C, Addi(12, 12, 0x34));
+    auto analysis = analyze(image);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
+  }
+
+  SECTION("a gap before the earliest case is not a self-delimiting extent") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x30, kTextBase + 0x80);
+    auto analysis = analyze(image);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
+    REQUIRE(analysis.dataflow);
+    CHECK(std::find(analysis.dataflow->rejectionEvidence.begin(),
+                    analysis.dataflow->rejectionEvidence.end(),
+                    "self_delimiting_inline_table:inline_table_target_outside_exact_owner:index=11") !=
+          analysis.dataflow->rejectionEvidence.end());
+  }
+
+  SECTION("an altered raw entry is rejected rather than accepting a prefix") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x34, kTextBase + 0x81);
+    auto analysis = analyze(image);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
+    REQUIRE(analysis.dataflow);
+    CHECK(std::find(analysis.dataflow->rejectionEvidence.begin(),
+                    analysis.dataflow->rejectionEvidence.end(),
+                    "self_delimiting_inline_table:inline_table_target_unaligned:index=1") !=
+          analysis.dataflow->rejectionEvidence.end());
+  }
+
+  SECTION("fewer than three entries remain insufficient evidence") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x30, kTextBase + 0x38);
+    StoreBe32(image.text, 0x34, kTextBase + 0x38);
+    StoreBe32(image.text, 0x38, 0x4E800020);
+    auto analysis = analyze(image);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
+  }
+
+  SECTION("the logical index must survive until generated dispatch") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x24, Lwzx(9, 12, 0));
+    StoreBe32(image.text, 0x28, Mtctr(9));
+    auto analysis = analyze(image);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
+  }
+
+  SECTION("an independently callable target is not converted into an owner case") {
+    InlineAbsoluteSwitch image;
+    const std::unordered_set<uint32_t> callableEntries{kTextBase + 0x80};
+    auto analysis = analyze(image, &callableEntries);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
+  }
+
+  SECTION("incompatible index definitions remain ambiguous despite the storage shape") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x10, 4, 2));
+    StoreBe32(image.text, 0x04, Mr(9, 3));
+    StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x18));
+    StoreBe32(image.text, 0x10, Mr(9, 4));
+    StoreBe32(image.text, 0x14, B(kTextBase + 0x14, kTextBase + 0x18));
+    auto analysis = analyze(image);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(HasFailure(analysis, JumpTableFailure::AmbiguousReachingDefinition));
+    REQUIRE(analysis.dataflow);
+    const auto extent = std::find_if(
+        analysis.dataflow->boundCandidates.begin(), analysis.dataflow->boundCandidates.end(),
+        [](const auto& bound) { return bound.selfDelimitedInlineTableExtent; });
+    REQUIRE(extent != analysis.dataflow->boundCandidates.end());
+    CHECK_FALSE(extent->finiteDenseDomain);
+  }
+
+  SECTION("entry-count safety exhaustion is reported without widening the budget") {
+    InlineAbsoluteSwitch image;
+    JumpTableRecoveryLimits limits;
+    limits.maxEntries = 10;
+    auto analysis = analyze(image, nullptr, limits);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(analysis.failures == std::vector{JumpTableFailure::MissingBound});
+    REQUIRE(analysis.dataflow);
+    CHECK(std::find_if(analysis.dataflow->exhaustedBudgets.begin(),
+                       analysis.dataflow->exhaustedBudgets.end(), [](const auto& budget) {
+                         return budget.budget == "max_entries" && budget.limit == 10 &&
+                                budget.observed == 10;
+                       }) != analysis.dataflow->exhaustedBudgets.end());
+  }
+
+  SECTION("a linked callback remains excluded from switch recovery") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x2C, 0x4E800421);  // bctrl
+    auto analysis = analyze(image);
+    CHECK_FALSE(analysis.selectedTable);
+    CHECK(analysis.classification == IndirectSiteClassification::VirtualOrCallbackBctrl);
+    CHECK(HasFailure(analysis, JumpTableFailure::NonSwitchIndirect));
+  }
 }
 
 TEST_CASE("whole-image direct-call domains recover an otherwise unbounded entry switch",

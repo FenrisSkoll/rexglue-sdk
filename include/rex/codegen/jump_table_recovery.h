@@ -66,7 +66,9 @@ JumpTableEntryCallsiteDomainEvidence AnalyzeDirectCallArgumentDomain(
  *
  * The implementation constructs a bounded local CFG from preliminary owned
  * blocks, computes reaching definitions over predecessor paths, and accepts a
- * table only when a dominating bound and every decoded target validate.
+ * table only when every decoded target validates and either a finite index
+ * domain or the narrowly supported self-delimiting inline-table extent is
+ * proven.
  */
 IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
                                          const JumpTableRecoveryInput& input,
