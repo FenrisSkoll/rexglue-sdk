@@ -87,6 +87,13 @@ IndirectSiteAnalysis AnalyzeIndirectSiteWithPriorLimitRetry(
     JumpTableRecoveryStats* stats = nullptr);
 
 /**
+ * Compare every recovery-relevant table field, including raw storage entries.
+ * Report-only provisional case expansion and prior-table retention use this
+ * same exact-match predicate; neither may accept a target-only match.
+ */
+bool JumpTableRecoveryTablesExactlyMatch(const JumpTable& lhs, const JumpTable& rhs);
+
+/**
  * Recompute final failure stage, likelihood, rejection evidence, and stable
  * structural cluster after fixpoint retention or quarantine changes the
  * selected-table disposition.

@@ -4090,8 +4090,10 @@ bool IsFreshTransformedBoundedIndexCandidate(
 struct InlineAbsoluteTableExtentRecovery {
   bool structurallyEligible = false;
   bool productionEligible = false;
+  bool provisionalCaseLoopEligible = false;
   bool entryLimitHit = false;
   bool boundaryInstructionLimitHit = false;
+  bool caseLoopProofLimitHit = false;
   std::optional<JumpTable> table;
   std::optional<JumpTableBoundCandidateEvidence> extentEvidence;
   std::vector<std::string> rejections;
@@ -4149,6 +4151,57 @@ std::optional<InlineCaseBoundaryCfgProof> ProveInlineCaseBoundaryCfg(
   return std::nullopt;
 }
 
+struct InlineCaseLoopCfgProof {
+  uint32_t caseTarget = 0;
+  uint32_t loopHeader = 0;
+};
+
+std::optional<InlineCaseLoopCfgProof> ProveInlineCaseLoopCfg(const LocalCfg& cfg,
+                                                             const JumpTableRecoveryInput& input,
+                                                             const JumpTable& table,
+                                                             bool* limitHit) {
+  if (limitHit)
+    *limitHit = false;
+  if (!input.priorAutomaticTable || !cfg.contains(input.site) ||
+      !SameRecoveryTableSemantics(table, *input.priorAutomaticTable)) {
+    return std::nullopt;
+  }
+
+  bool topologyLimit = false;
+  if (!cfg.IsInCycle(input.site, input.limits, &topologyLimit)) {
+    if (topologyLimit && limitHit)
+      *limitHit = true;
+    return std::nullopt;
+  }
+
+  std::vector<uint32_t> targets = table.targets;
+  std::sort(targets.begin(), targets.end());
+  targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+  for (uint32_t target : targets) {
+    bool reachabilityLimit = false;
+    // LocalCfg::successors deliberately excludes the current indirect edge.
+    // Reaching the dispatch from a case therefore proves an ordinary CFG
+    // return path; adding the exact candidate edge closes a genuine cycle.
+    if (cfg.Reaches(target, input.site, std::numeric_limits<uint32_t>::max(), input.limits,
+                    &reachabilityLimit)) {
+      bool headerLimit = false;
+      const uint32_t loopHeader = cfg.CanonicalCycleHeader(input.site, input.limits, &headerLimit);
+      if (headerLimit) {
+        if (limitHit)
+          *limitHit = true;
+        return std::nullopt;
+      }
+      return InlineCaseLoopCfgProof{target, loopHeader};
+    }
+    if (reachabilityLimit) {
+      if (limitHit)
+        *limitHit = true;
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
 bool CollectInlineAddressTerms(const ExprPtr& expression, uint32_t& constant,
                                std::vector<ExprPtr>& dynamicTerms, uint32_t depth = 0) {
   if (!expression || depth > 64)
@@ -4171,8 +4224,8 @@ bool CollectInlineAddressTerms(const ExprPtr& expression, uint32_t& constant,
 // participates. The extent closes only when the next byte after a complete run
 // of validated words is exactly the earliest case block.
 InlineAbsoluteTableExtentRecovery RecoverSelfDelimitedInlineAbsoluteTable(
-    DecodedBinary& decoded, const JumpTableRecoveryInput& input, const Instruction& mtctr,
-    const ResolveResult& target,
+    DecodedBinary& decoded, const LocalCfg& cfg, const JumpTableRecoveryInput& input,
+    const Instruction& mtctr, const ResolveResult& target,
     const std::vector<JumpTableInstructionEvidence>& instructionEvidence) {
   InlineAbsoluteTableExtentRecovery recovery;
   const auto reject = [&](std::string reason) {
@@ -4370,6 +4423,26 @@ InlineAbsoluteTableExtentRecovery RecoverSelfDelimitedInlineAbsoluteTable(
     extent.inlineBoundaryBlockStart = boundaryProof->blockStart;
     extent.inlineBoundaryBlockEnd = boundaryProof->blockEnd;
     extent.inlineBoundaryTerminator = boundaryProof->terminator->address;
+
+    if (!recovery.productionEligible && CountUnknownLeaves(logicalIndex) <= 1 &&
+        input.priorAutomaticTable) {
+      if (!SameRecoveryTableSemantics(table, *input.priorAutomaticTable)) {
+        reject("inline_case_loop_prior_table_mismatch");
+      } else {
+        bool caseLoopLimitHit = false;
+        auto caseLoopProof = ProveInlineCaseLoopCfg(cfg, input, table, &caseLoopLimitHit);
+        recovery.caseLoopProofLimitHit = caseLoopLimitHit;
+        if (caseLoopProof) {
+          recovery.provisionalCaseLoopEligible = true;
+          extent.inlineCaseLoopCfgVerified = true;
+          extent.inlineCaseLoopTarget = caseLoopProof->caseTarget;
+          extent.inlineCaseLoopHeader = caseLoopProof->loopHeader;
+        } else {
+          reject(caseLoopLimitHit ? "inline_case_loop_cfg_limit"
+                                  : "inline_case_loop_cfg_not_proven");
+        }
+      }
+    }
     recovery.extentEvidence = std::move(extent);
     recovery.table = std::move(table);
     return recovery;
@@ -4929,6 +5002,10 @@ JumpTableManualComparison CompareManual(const JumpTable& automatic, const JumpTa
 }
 
 }  // namespace
+
+bool JumpTableRecoveryTablesExactlyMatch(const JumpTable& lhs, const JumpTable& rhs) {
+  return SameRecoveryTableSemantics(lhs, rhs);
+}
 
 const char* IndirectSiteClassificationName(IndirectSiteClassification classification) {
   switch (classification) {
@@ -5883,7 +5960,7 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
   // accept it only for the exact missing_bound lifecycle. Ambiguity, limits,
   // and any prior target-validation failure remain authoritative.
   if (!analysis.automaticTable && mtctr && resolvedTarget) {
-    auto inlineExtent = RecoverSelfDelimitedInlineAbsoluteTable(decoded, input, *mtctr,
+    auto inlineExtent = RecoverSelfDelimitedInlineAbsoluteTable(decoded, cfg, input, *mtctr,
                                                                 *resolvedTarget, analysis.evidence);
     for (const auto& rejection : inlineExtent.rejections) {
       dataflow.rejectionEvidence.push_back("self_delimiting_inline_table:" + rejection);
@@ -5896,6 +5973,10 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       dataflow.exhaustedBudgets.push_back({"max_backward_instructions",
                                            input.limits.maxBackwardInstructions,
                                            input.limits.maxBackwardInstructions});
+    }
+    if (inlineExtent.caseLoopProofLimitHit) {
+      dataflow.exhaustedBudgets.push_back(
+          {"max_states", input.limits.maxStates, input.limits.maxStates});
     }
     if (inlineExtent.extentEvidence) {
       dataflow.boundCandidates.push_back(*inlineExtent.extentEvidence);
@@ -5912,10 +5993,28 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
     const bool exactMissingBoundFailure =
         analysis.failures.size() == 1 &&
         analysis.failures.front() == JumpTableFailure::MissingBound;
+    const bool exactProvisionalCaseLoopFailure =
+        analysis.failures.size() == 1 &&
+        (analysis.failures.front() == JumpTableFailure::AmbiguousReachingDefinition ||
+         analysis.failures.front() == JumpTableFailure::AnalysisLimit);
+    const bool onlyResolverStateBudgetExhausted =
+        std::all_of(dataflow.exhaustedBudgets.begin(), dataflow.exhaustedBudgets.end(),
+                    [](const auto& exhaustion) { return exhaustion.budget == "max_states"; });
     if (inlineExtent.table && inlineExtent.productionEligible && exactMissingBoundFailure) {
       analysis.automaticTable = std::move(*inlineExtent.table);
       analysis.classification = IndirectSiteClassification::SwitchBctr;
       analysis.failures.clear();
+      if (stats)
+        ++stats->recoveredTables;
+    } else if (inlineExtent.table && inlineExtent.provisionalCaseLoopEligible &&
+               exactProvisionalCaseLoopFailure && onlyResolverStateBudgetExhausted) {
+      analysis.automaticTable = std::move(*inlineExtent.table);
+      analysis.automaticTable->confidence =
+          "validated_self_delimiting_inline_absolute_table_case_loop";
+      analysis.classification = IndirectSiteClassification::SwitchBctr;
+      analysis.failures.clear();
+      dataflow.rejectionEvidence.push_back(
+          "self_delimiting_inline_table:accepted_exact_provisional_case_loop");
       if (stats)
         ++stats->recoveredTables;
     } else if (inlineExtent.table) {
@@ -5927,6 +6026,15 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
       }
       dataflow.rejectionEvidence.push_back(
           "self_delimiting_inline_table:not_selected_failure_vector=" + failureVector);
+      dataflow.diagnosticProbe.attempted = true;
+      dataflow.diagnosticProbe.reportOnly = true;
+      dataflow.diagnosticProbe.hypothesisComplete = true;
+      dataflow.diagnosticProbe.allTargetsValid = true;
+      dataflow.diagnosticProbe.assumptions = {"self_delimiting_inline_absolute_table_extent",
+                                              "provisional_case_expansion_not_authoritative"};
+      dataflow.diagnosticProbe.rejections = {
+          "requires_exact_reanalysis_with_verified_case_loop_cfg"};
+      dataflow.diagnosticProbe.candidateTable = *inlineExtent.table;
     }
   }
 
@@ -5953,8 +6061,22 @@ IndirectSiteAnalysis AnalyzeIndirectSite(DecodedBinary& decoded,
     analysis.classification = IndirectSiteClassification::ComputedTailBctr;
   }
   if (!analysis.selectedTable && resolvedTarget) {
-    dataflow.diagnosticProbe = RunDiagnosticProbe(decoded, input, *resolvedTarget,
-                                                  dataflow.boundCandidates, analysis.evidence);
+    auto ordinaryProbe = RunDiagnosticProbe(decoded, input, *resolvedTarget,
+                                            dataflow.boundCandidates, analysis.evidence);
+    if (!dataflow.diagnosticProbe.candidateTable) {
+      dataflow.diagnosticProbe = std::move(ordinaryProbe);
+    } else {
+      dataflow.diagnosticProbe.assumptions.insert(dataflow.diagnosticProbe.assumptions.end(),
+                                                  ordinaryProbe.assumptions.begin(),
+                                                  ordinaryProbe.assumptions.end());
+      for (const auto& rejection : ordinaryProbe.rejections) {
+        if (std::find(dataflow.diagnosticProbe.rejections.begin(),
+                      dataflow.diagnosticProbe.rejections.end(),
+                      rejection) == dataflow.diagnosticProbe.rejections.end()) {
+          dataflow.diagnosticProbe.rejections.push_back(rejection);
+        }
+      }
+    }
   }
   FinalizeSiteDataflow(decoded, cfg, input, resolvedTarget ? &*resolvedTarget : nullptr, analysis);
   if (cfg.topologyLimitHit()) {

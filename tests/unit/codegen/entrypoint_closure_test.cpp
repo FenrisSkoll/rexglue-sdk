@@ -455,6 +455,9 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
   inlineExtent.inlineBoundaryBlockStart = kTextBase + 0x54;
   inlineExtent.inlineBoundaryBlockEnd = kTextBase + 0x60;
   inlineExtent.inlineBoundaryTerminator = kTextBase + 0x5C;
+  inlineExtent.inlineCaseLoopCfgVerified = true;
+  inlineExtent.inlineCaseLoopTarget = kTextBase + 0x54;
+  inlineExtent.inlineCaseLoopHeader = kTextBase + 0x20;
   dataflow.boundCandidates.push_back(std::move(inlineExtent));
   dataflow.diagnosticProbe.attempted = true;
   dataflow.diagnosticProbe.rejections = {"no_exact_dominating_unsigned_bound"};
@@ -556,6 +559,9 @@ TEST_CASE("entrypoint closure reports never mutate an unrelated manifest",
     CHECK(inlineExtent.at("inline_boundary_block_start") == "0x10000054");
     CHECK(inlineExtent.at("inline_boundary_block_end") == "0x10000060");
     CHECK(inlineExtent.at("inline_boundary_terminator") == "0x1000005C");
+    CHECK(inlineExtent.at("inline_case_loop_cfg_verified") == true);
+    CHECK(inlineExtent.at("inline_case_loop_target") == "0x10000054");
+    CHECK(inlineExtent.at("inline_case_loop_header") == "0x10000020");
     const auto& entryDomain = site.at("dataflow").at("entry_register_domains").front();
     CHECK(entryDomain.at("all_references_direct_calls") == true);
     CHECK(entryDomain.at("finite_dense_domain") == false);

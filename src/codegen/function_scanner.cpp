@@ -2178,6 +2178,87 @@ BlockDiscoveryResult discoverBlocks(
       input.manualTable = manual;
       input.limits = limits;
       auto analysis = AnalyzeIndirectSiteWithPriorLimitRetry(decoded, input, &iterationStats);
+
+      // A self-delimiting inline table can describe a state-machine loop whose
+      // backedge is invisible until that same table's case edges are present.
+      // Keep the first-pass candidate report-only, expand only this exact
+      // candidate in an isolated CFG pass, and accept only when ordinary
+      // reanalysis reproduces every table field and proves the case loop.
+      const bool exactBootstrapFailure =
+          analysis.failures.size() == 1 &&
+          (analysis.failures.front() == JumpTableFailure::AmbiguousReachingDefinition ||
+           analysis.failures.front() == JumpTableFailure::AnalysisLimit);
+      const bool onlyResolverStateBudgetExhausted =
+          analysis.dataflow &&
+          std::all_of(analysis.dataflow->exhaustedBudgets.begin(),
+                      analysis.dataflow->exhaustedBudgets.end(),
+                      [](const auto& exhaustion) { return exhaustion.budget == "max_states"; });
+      const JumpTable* reportOnlyCandidate =
+          analysis.dataflow && analysis.dataflow->diagnosticProbe.reportOnly &&
+                  analysis.dataflow->diagnosticProbe.hypothesisComplete &&
+                  analysis.dataflow->diagnosticProbe.allTargetsValid &&
+                  analysis.dataflow->diagnosticProbe.candidateTable
+              ? &*analysis.dataflow->diagnosticProbe.candidateTable
+              : nullptr;
+      const bool exactInlineCandidate =
+          reportOnlyCandidate && reportOnlyCandidate->origin == JumpTableOrigin::Automatic &&
+          reportOnlyCandidate->ownerAddress == entryPoint &&
+          reportOnlyCandidate->bctrAddress == site &&
+          reportOnlyCandidate->boundSemantics == "self_delimiting_inline_absolute_table_extent" &&
+          !reportOnlyCandidate->boundValueIsFiniteIndexDomain &&
+          reportOnlyCandidate->caseCount >= 3 &&
+          reportOnlyCandidate->targets.size() == reportOnlyCandidate->caseCount &&
+          reportOnlyCandidate->rawEntries.size() == reportOnlyCandidate->caseCount;
+      if (previous == selectedTables.end() && !analysis.selectedTable && exactBootstrapFailure &&
+          onlyResolverStateBudgetExhausted && exactInlineCandidate) {
+        const JumpTable candidate = *reportOnlyCandidate;
+        auto provisionalTables = selectedTables;
+        provisionalTables.emplace(site, candidate);
+
+        const auto provisionalCfgStarted = Clock::now();
+        auto provisionalBlocks = discoverBlocksPass(decoded, entryPoint, containingRegion,
+                                                    knownFunctions, pdataSize, &provisionalTables);
+        aggregate.caseExpansionCfgMicroseconds += elapsedMicroseconds(provisionalCfgStarted);
+
+        JumpTableRecoveryInput provisionalInput = input;
+        provisionalInput.preliminaryBlocks = provisionalBlocks.blocks;
+        provisionalInput.priorAutomaticTable = &candidate;
+        JumpTableRecoveryStats provisionalStats;
+        auto provisional =
+            AnalyzeIndirectSiteWithPriorLimitRetry(decoded, provisionalInput, &provisionalStats);
+        iterationStats.elapsedMicroseconds += provisionalStats.elapsedMicroseconds;
+        iterationStats.decodedInstructions += provisionalStats.decodedInstructions;
+        iterationStats.analysisLimitHit =
+            iterationStats.analysisLimitHit || provisionalStats.analysisLimitHit;
+
+        const bool loopProof =
+            provisional.dataflow &&
+            std::any_of(provisional.dataflow->boundCandidates.begin(),
+                        provisional.dataflow->boundCandidates.end(), [](const auto& bound) {
+                          return bound.selfDelimitedInlineTableExtent &&
+                                 bound.inlineCaseLoopCfgVerified;
+                        });
+        const bool accepted =
+            provisional.selectedTable && provisional.automaticTable && loopProof &&
+            JumpTableRecoveryTablesExactlyMatch(*provisional.selectedTable, candidate) &&
+            JumpTableRecoveryTablesExactlyMatch(*provisional.automaticTable, candidate);
+        if (accepted) {
+          if (iterationStats.unresolvedSites > 0)
+            --iterationStats.unresolvedSites;
+          ++iterationStats.recoveredTables;
+          analysis = std::move(provisional);
+        } else if (analysis.dataflow) {
+          std::string failures;
+          for (auto failure : provisional.failures) {
+            if (!failures.empty())
+              failures += '+';
+            failures += JumpTableFailureName(failure);
+          }
+          analysis.dataflow->rejectionEvidence.push_back(
+              "provisional_inline_case_expansion:" +
+              (failures.empty() ? std::string("exact_case_loop_not_proven") : failures));
+        }
+      }
       if (!analysis.selectedTable && previous != selectedTables.end() &&
           previous->second.origin == JumpTableOrigin::Automatic) {
         // A case-expanded CFG can expose a disconnected prior case root, but

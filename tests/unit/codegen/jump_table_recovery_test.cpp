@@ -1138,6 +1138,163 @@ TEST_CASE("self-delimiting inline absolute tables require an exact static extent
         [](const auto& bound) { return bound.selfDelimitedInlineTableExtent; });
     REQUIRE(extent != analysis.dataflow->boundCandidates.end());
     CHECK_FALSE(extent->finiteDenseDomain);
+    REQUIRE(analysis.dataflow->diagnosticProbe.candidateTable);
+    CHECK(analysis.dataflow->diagnosticProbe.reportOnly);
+    CHECK(analysis.dataflow->diagnosticProbe.hypothesisComplete);
+    CHECK(analysis.dataflow->diagnosticProbe.allTargetsValid);
+
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const auto* region = decoded.regionContaining(kTextBase);
+    REQUIRE(region != nullptr);
+    const std::unordered_set<uint32_t> functions{kTextBase};
+    auto discovered =
+        discoverBlocks(decoded, kTextBase, *region, functions, image.ownerEnd - kTextBase);
+    const auto finalSite =
+        std::find_if(discovered.indirectSites.begin(), discovered.indirectSites.end(),
+                     [&](const auto& site) { return site.site == image.site; });
+    REQUIRE(finalSite != discovered.indirectSites.end());
+    CHECK_FALSE(finalSite->selectedTable);
+    CHECK_FALSE(finalSite->automaticTable);
+    CHECK(HasFailure(*finalSite, JumpTableFailure::AmbiguousReachingDefinition));
+  }
+
+  SECTION("an exact provisional case edge exposes a genuine state-machine loop") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x10, 4, 2));
+    StoreBe32(image.text, 0x04, Mr(9, 3));
+    StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x18));
+    StoreBe32(image.text, 0x10, Mr(9, 4));
+    StoreBe32(image.text, 0x14, B(kTextBase + 0x14, kTextBase + 0x18));
+    StoreBe32(image.text, 0x5C, 0x60000000);  // first case block
+    StoreBe32(image.text, 0x60,
+              B(kTextBase + 0x60, kTextBase + 0x18));  // ordinary case-to-dispatch loop
+
+    auto initial = analyze(image);
+    CHECK_FALSE(initial.selectedTable);
+    CHECK_FALSE(initial.automaticTable);
+    CHECK(initial.failures == std::vector{JumpTableFailure::AmbiguousReachingDefinition});
+    REQUIRE(initial.dataflow);
+    REQUIRE(initial.dataflow->diagnosticProbe.candidateTable);
+    CHECK(initial.dataflow->diagnosticProbe.reportOnly);
+    CHECK(initial.dataflow->diagnosticProbe.candidateTable->targets == image.expectedTargets);
+
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const auto* region = decoded.regionContaining(kTextBase);
+    REQUIRE(region != nullptr);
+    const std::unordered_set<uint32_t> functions{kTextBase};
+    auto discovered =
+        discoverBlocks(decoded, kTextBase, *region, functions, image.ownerEnd - kTextBase);
+    const auto finalSite =
+        std::find_if(discovered.indirectSites.begin(), discovered.indirectSites.end(),
+                     [&](const auto& site) { return site.site == image.site; });
+    REQUIRE(finalSite != discovered.indirectSites.end());
+    REQUIRE(finalSite->selectedTable);
+    REQUIRE(finalSite->automaticTable);
+    CHECK(finalSite->failures.empty());
+    CHECK(finalSite->selectedTable->targets == image.expectedTargets);
+    CHECK_FALSE(finalSite->selectedTable->boundValueIsFiniteIndexDomain);
+    CHECK(finalSite->selectedTable->confidence ==
+          "validated_self_delimiting_inline_absolute_table_case_loop");
+    REQUIRE(finalSite->dataflow);
+    CHECK(finalSite->dataflow->sourceInScc);
+    const auto loopExtent = std::find_if(
+        finalSite->dataflow->boundCandidates.begin(), finalSite->dataflow->boundCandidates.end(),
+        [](const auto& bound) {
+          return bound.selfDelimitedInlineTableExtent && bound.inlineCaseLoopCfgVerified;
+        });
+    REQUIRE(loopExtent != finalSite->dataflow->boundCandidates.end());
+    CHECK_FALSE(loopExtent->finiteDenseDomain);
+    CHECK(loopExtent->inlineCaseLoopTarget == kTextBase + 0x5C);
+    CHECK(loopExtent->inlineCaseLoopHeader != 0);
+    CHECK(discovered.jumpTableRecovery.fixpointIterations == 2);
+  }
+
+  SECTION("an identity case predecessor reuses the same opaque index") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x70, 0x60000000);  // case preserves r9
+    StoreBe32(image.text, 0x74,
+              B(kTextBase + 0x74, kTextBase + 0x18));  // redispatch through fixed tail
+
+    auto initial = analyze(image);
+    REQUIRE(initial.selectedTable);
+    CHECK(initial.failures.empty());
+    CHECK(initial.selectedTable->targets == image.expectedTargets);
+
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const auto* region = decoded.regionContaining(kTextBase);
+    REQUIRE(region != nullptr);
+    const std::unordered_set<uint32_t> functions{kTextBase};
+    auto discovered =
+        discoverBlocks(decoded, kTextBase, *region, functions, image.ownerEnd - kTextBase);
+    const auto finalSite =
+        std::find_if(discovered.indirectSites.begin(), discovered.indirectSites.end(),
+                     [&](const auto& site) { return site.site == image.site; });
+    REQUIRE(finalSite != discovered.indirectSites.end());
+    REQUIRE(finalSite->selectedTable);
+    CHECK(finalSite->failures.empty());
+    CHECK(finalSite->selectedTable->targets == image.expectedTargets);
+    CHECK_FALSE(finalSite->selectedTable->boundValueIsFiniteIndexDomain);
+    CHECK(finalSite->selectedTable->confidence ==
+          "validated_self_delimiting_inline_absolute_table_case_loop");
+    REQUIRE(finalSite->dataflow);
+    CHECK(finalSite->dataflow->sourceInScc);
+    CHECK(std::any_of(finalSite->dataflow->boundCandidates.begin(),
+                      finalSite->dataflow->boundCandidates.end(), [](const auto& bound) {
+                        return bound.selfDelimitedInlineTableExtent &&
+                               bound.inlineCaseLoopCfgVerified;
+                      }));
+  }
+
+  SECTION("provisional loop proof rejects altered prior raw table evidence") {
+    InlineAbsoluteSwitch image;
+    StoreBe32(image.text, 0x00, Bc(kTextBase, kTextBase + 0x10, 4, 2));
+    StoreBe32(image.text, 0x04, Mr(9, 3));
+    StoreBe32(image.text, 0x08, B(kTextBase + 0x08, kTextBase + 0x18));
+    StoreBe32(image.text, 0x10, Mr(9, 4));
+    StoreBe32(image.text, 0x14, B(kTextBase + 0x14, kTextBase + 0x18));
+    StoreBe32(image.text, 0x5C, 0x60000000);
+    StoreBe32(image.text, 0x60, B(kTextBase + 0x60, kTextBase + 0x18));
+
+    auto preliminary = analyze(image);
+    REQUIRE(preliminary.dataflow);
+    REQUIRE(preliminary.dataflow->diagnosticProbe.candidateTable);
+    auto altered = *preliminary.dataflow->diagnosticProbe.candidateTable;
+    REQUIRE_FALSE(altered.rawEntries.empty());
+    altered.rawEntries.front().rawValue ^= 1;
+
+    auto view = image.view();
+    DecodedBinary decoded(view);
+    decoded.decode();
+    const auto* region = decoded.regionContaining(kTextBase);
+    REQUIRE(region != nullptr);
+    const std::array expandedBlocks{
+        Block{kTextBase, 0x30},        Block{kTextBase + 0x5C, 0x08}, Block{kTextBase + 0x64, 0x04},
+        Block{kTextBase + 0x70, 0x04}, Block{kTextBase + 0x80, 0x04}, Block{kTextBase + 0x90, 0x04},
+        Block{kTextBase + 0xA0, 0x04},
+    };
+    JumpTableRecoveryInput input;
+    input.site = image.site;
+    input.ownerAddress = kTextBase;
+    input.trustedOwnerEnd = image.ownerEnd;
+    input.preliminaryBlocks = expandedBlocks;
+    input.containingRegion = region;
+    input.priorAutomaticTable = &altered;
+
+    auto expanded = AnalyzeIndirectSite(decoded, input);
+    CHECK_FALSE(expanded.selectedTable);
+    CHECK_FALSE(expanded.automaticTable);
+    CHECK(expanded.failures == std::vector{JumpTableFailure::AmbiguousReachingDefinition});
+    REQUIRE(expanded.dataflow);
+    CHECK(std::find(expanded.dataflow->rejectionEvidence.begin(),
+                    expanded.dataflow->rejectionEvidence.end(),
+                    "self_delimiting_inline_table:inline_case_loop_prior_table_mismatch") !=
+          expanded.dataflow->rejectionEvidence.end());
   }
 
   SECTION("entry-count safety exhaustion is reported without widening the budget") {

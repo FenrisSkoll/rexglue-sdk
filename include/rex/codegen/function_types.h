@@ -465,6 +465,14 @@ struct JumpTableBoundCandidateEvidence {
   uint32_t inlineBoundaryBlockStart = 0;
   uint32_t inlineBoundaryBlockEnd = 0;
   uint32_t inlineBoundaryTerminator = 0;
+  // A report-only self-delimited candidate may be used once to expose its
+  // own case blocks. Recovery is authoritative only when one of those case
+  // blocks has an ordinary CFG path back to the dispatch and reanalysis
+  // reproduces the complete candidate exactly. This proves state-machine
+  // topology; it deliberately does not prove a finite runtime index domain.
+  bool inlineCaseLoopCfgVerified = false;
+  uint32_t inlineCaseLoopTarget = 0;
+  uint32_t inlineCaseLoopHeader = 0;
   std::vector<uint32_t> finiteValues;
   std::vector<uint32_t> normalizedFiniteValues;
   std::vector<JumpTableCfgEdgeEvidence> inheritedCaseEdges;
