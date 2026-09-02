@@ -27,6 +27,7 @@
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/system/kernel_module.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/save_trace.h>
 #include <rex/system/function_dispatcher.h>
 #include <chrono>
 #include <thread>
@@ -1142,22 +1143,29 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
   XOverlappedSetExtendedError(ptr, extended_error);
   XOverlappedSetLength(ptr, length);
   X_HANDLE event_handle = XOverlappedGetEvent(ptr);
+  bool event_signaled = false;
   if (event_handle) {
     auto ev = object_table()->LookupObject<XEvent>(event_handle);
     assert_not_null(ev);
     if (ev) {
       ev->Set(0, false);
+      event_signaled = true;
     }
   }
-  if (XOverlappedGetCompletionRoutine(ptr)) {
+  const uint32_t completion_routine = XOverlappedGetCompletionRoutine(ptr);
+  bool apc_queued = false;
+  if (completion_routine) {
     X_HANDLE thread_handle = XOverlappedGetContext(ptr);
     auto thread = object_table()->LookupObject<XThread>(thread_handle);
     if (thread) {
       // Queue APC on the thread that requested the overlapped operation.
-      uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
-      thread->EnqueueApc(routine, result, length, overlapped_ptr);
+      thread->EnqueueApc(completion_routine, result, length, overlapped_ptr);
+      apc_queued = true;
     }
   }
+  SaveTrace::Get().CompleteOverlapped(overlapped_ptr, result, extended_error, length,
+                                      event_handle, completion_routine, event_signaled,
+                                      apc_queued);
 }
 
 void KernelState::CompleteOverlappedImmediate(uint32_t overlapped_ptr, X_RESULT result) {

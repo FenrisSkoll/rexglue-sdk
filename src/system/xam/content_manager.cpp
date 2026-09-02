@@ -21,6 +21,7 @@
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/save_trace.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xfile.h>
@@ -201,25 +202,58 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
   auto header_path =
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
   auto parent_path = header_path.parent_path();
+  const bool save_trace = data.content_type == XContentType::kSavedGame &&
+                          SaveTrace::Get().enabled();
+  const uint64_t trace_request =
+      save_trace
+          ? SaveTrace::Get().Record(
+                "WriteContentHeaderFile", "request",
+                {{"host_path", rex::path_to_utf8(header_path)},
+                 {"file_name", data.file_name()},
+                 {"profile_xuid", fmt::format("{:016X}", used_xuid)},
+                 {"title_id", uint64_t(data.title_id)},
+                 {"content_type", uint64_t(static_cast<XContentType>(data.content_type))},
+                 {"header_bytes", uint64_t(sizeof(XCONTENT_AGGREGATE_DATA))},
+                 {"license_bytes", uint64_t(license_mask ? sizeof(license_mask) : 0)}})
+          : 0;
+
+  auto finish_trace = [save_trace, trace_request, &header_path](X_RESULT result,
+                                                                uint64_t actual_bytes) {
+    if (save_trace) {
+      SaveTrace::Get().Record("WriteContentHeaderFile", "result",
+                              {{"request_sequence", trace_request},
+                               {"host_path", rex::path_to_utf8(header_path)},
+                               {"actual_bytes", actual_bytes},
+                               {"result", uint64_t(result)}});
+    }
+    return result;
+  };
 
   if (!std::filesystem::exists(parent_path)) {
     if (!std::filesystem::create_directories(parent_path)) {
-      return X_ERROR_ACCESS_DENIED;
+      return finish_trace(X_ERROR_ACCESS_DENIED, 0);
     }
   }
 
-  rex::filesystem::CreateEmptyFile(header_path);
+  if (!rex::filesystem::CreateEmptyFile(header_path)) {
+    return finish_trace(X_ERROR_ACCESS_DENIED, 0);
+  }
 
   auto file = rex::filesystem::OpenFile(header_path, "wb");
   if (!file) {
-    return X_ERROR_FILE_NOT_FOUND;
+    return finish_trace(X_ERROR_FILE_NOT_FOUND, 0);
   }
-  fwrite(&data, 1, sizeof(XCONTENT_AGGREGATE_DATA), file);
+  uint64_t bytes_written = fwrite(&data, 1, sizeof(XCONTENT_AGGREGATE_DATA), file);
   if (license_mask != 0) {
-    fwrite(&license_mask, 1, sizeof(license_mask), file);
+    bytes_written += fwrite(&license_mask, 1, sizeof(license_mask), file);
   }
-  fclose(file);
-  return X_ERROR_SUCCESS;
+  const uint64_t expected_bytes =
+      sizeof(XCONTENT_AGGREGATE_DATA) + (license_mask ? sizeof(license_mask) : 0);
+  const bool close_succeeded = fclose(file) == 0;
+  if (bytes_written != expected_bytes || !close_succeeded) {
+    return finish_trace(X_ERROR_FUNCTION_FAILED, bytes_written);
+  }
+  return finish_trace(X_ERROR_SUCCESS, bytes_written);
 }
 
 X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name, uint64_t xuid,
@@ -326,6 +360,31 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
     package = DetachPackage(it);
   }
   delete package;
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT ContentManager::FlushContent(const std::string_view root_name) {
+  std::string resolved_path;
+  if (!kernel_state_->file_system()->FindSymbolicLink(std::string(root_name) + ':',
+                                                      resolved_path)) {
+    // Preserve XamContentFlush's historically tolerant behavior when there is
+    // no active mount. There is nothing to flush in this state.
+    return X_ERROR_SUCCESS;
+  }
+
+  const std::vector<object_ref<XFile>> all_file_handles =
+      kernel_state_->object_table()->GetObjectsByType<XFile>(XObject::Type::File);
+  for (const object_ref<XFile>& file : all_file_handles) {
+    if (!rex::string::utf8_starts_with_case(file->entry()->absolute_path(), resolved_path)) {
+      continue;
+    }
+    if (file->entry()->attributes() & rex::filesystem::kFileAttributeDirectory) {
+      continue;
+    }
+    if (XFAILED(file->Flush())) {
+      return X_ERROR_FUNCTION_FAILED;
+    }
+  }
   return X_ERROR_SUCCESS;
 }
 

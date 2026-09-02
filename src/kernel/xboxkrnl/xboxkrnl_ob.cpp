@@ -18,6 +18,8 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/save_trace.h>
+#include <rex/system/xfile.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xobject.h>
@@ -221,7 +223,25 @@ u32 NtDuplicateObject_entry(u32 handle, mapped_u32 new_handle_ptr, u32 options) 
 
 u32 NtClose_entry(u32 handle) {
   REXKRNL_IMPORT_TRACE("NtClose", "handle={:#x}", (uint32_t)handle);
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(handle);
+  const bool save_trace = file && IsSaveGuestPath(file->entry()->absolute_path()) &&
+                          SaveTrace::Get().enabled();
+  const uint64_t trace_request =
+      save_trace
+          ? SaveTrace::Get().Record(
+                "NtClose", "request",
+                {{"guest_path", file->entry()->absolute_path()},
+                 {"host_path", SaveTraceHostPath(file->file())},
+                 {"handle", uint64_t(handle)},
+                 {"handle_type", std::string_view("file")}})
+          : 0;
   auto result = REX_KERNEL_OBJECTS()->ReleaseHandle(handle);
+  if (save_trace) {
+    SaveTrace::Get().Record("NtClose", "result",
+                            {{"request_sequence", trace_request},
+                             {"handle", uint64_t(handle)},
+                             {"result", uint64_t(result)}});
+  }
   REXKRNL_IMPORT_RESULT("NtClose", "{:#x}", result);
   return result;
 }

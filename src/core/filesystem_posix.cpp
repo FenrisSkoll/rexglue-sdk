@@ -208,7 +208,7 @@ class PosixFileHandle : public FileHandle {
     return true;
   }
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
-  void Flush() override { fsync(handle_); }
+  bool Flush() override { return fsync(handle_) == 0; }
 
  private:
   int handle_ = -1;
