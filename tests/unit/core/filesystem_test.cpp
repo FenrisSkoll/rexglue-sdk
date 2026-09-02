@@ -12,6 +12,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/filesystem.h>
+#include <rex/platform.h>
+
+#if REX_PLATFORM_WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 using rex::filesystem::FileAccess;
 using rex::filesystem::FileHandle;
@@ -20,11 +27,20 @@ namespace {
 
 constexpr std::string_view kPayload = "rexglue";
 
+int CurrentProcessId() {
+#if REX_PLATFORM_WIN32
+  return _getpid();
+#else
+  return getpid();
+#endif
+}
+
 class ScopedTempFile {
  public:
   ScopedTempFile() {
     path_ = std::filesystem::temp_directory_path() /
-            ("rexglue_filesystem_test_" + std::to_string(counter_++) + ".bin");
+            ("rexglue_filesystem_test_" + std::to_string(CurrentProcessId()) + "_" +
+             std::to_string(counter_++) + ".bin");
     FILE* file = rex::filesystem::OpenFile(path_, "wb");
     REQUIRE(file != nullptr);
     fwrite(kPayload.data(), 1, kPayload.size(), file);
@@ -128,8 +144,8 @@ TEST_CASE("OpenExisting failed read reports zero bytes", "[filesystem]") {
 
 TEST_CASE("OpenExisting write handle truncates and flushes durably", "[filesystem]") {
   ScopedTempFile temp;
-  auto handle = FileHandle::OpenExisting(
-      temp.path(), FileAccess::kGenericWrite | FileAccess::kFileWriteData);
+  auto handle =
+      FileHandle::OpenExisting(temp.path(), FileAccess::kGenericWrite | FileAccess::kFileWriteData);
   REQUIRE(handle != nullptr);
 
   REQUIRE(handle->SetLength(3));
@@ -148,8 +164,8 @@ TEST_CASE("OpenExisting write handle truncates and flushes durably", "[filesyste
 
 TEST_CASE("OpenExisting supports extending after an explicit-offset write", "[filesystem]") {
   ScopedTempFile temp;
-  auto handle = FileHandle::OpenExisting(
-      temp.path(), FileAccess::kGenericWrite | FileAccess::kFileWriteData);
+  auto handle =
+      FileHandle::OpenExisting(temp.path(), FileAccess::kGenericWrite | FileAccess::kFileWriteData);
   REQUIRE(handle != nullptr);
 
   const std::array<uint8_t, 3> suffix{'e', 'n', 'd'};
