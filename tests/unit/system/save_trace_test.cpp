@@ -4,15 +4,31 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <rex/platform.h>
 #include <rex/system/save_trace.h>
 
+#if REX_PLATFORM_WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace {
+
+int CurrentProcessId() {
+#if REX_PLATFORM_WIN32
+  return _getpid();
+#else
+  return getpid();
+#endif
+}
 
 class ScopedTraceDirectory {
  public:
   ScopedTraceDirectory() {
     path_ = std::filesystem::temp_directory_path() /
-            ("rexglue_save_trace_test_" + std::to_string(counter_++));
+            ("rexglue_save_trace_test_" + std::to_string(CurrentProcessId()) + "_" +
+             std::to_string(counter_++));
     std::error_code ec;
     std::filesystem::remove_all(path_, ec);
   }
@@ -39,17 +55,16 @@ std::string ReadText(const std::filesystem::path& path) {
 
 }  // namespace
 
-TEST_CASE("Save trace writes separate versioned metadata and payload-free events",
-          "[save_trace]") {
+TEST_CASE("Save trace writes separate versioned metadata and payload-free events", "[save_trace]") {
   ScopedTraceDirectory directory;
   auto& trace = rex::system::SaveTrace::Get();
   REQUIRE(trace.InitializeForTesting(std::filesystem::absolute(directory.path())));
 
-  const auto request_sequence = trace.Record(
-      "NtWriteFile", "request",
-      {{"guest_path", std::string_view("Save:\\Hero000\\mainsave.bin")},
-       {"requested_bytes", uint64_t(4096)},
-       {"offset_is_current", true}});
+  const auto request_sequence =
+      trace.Record("NtWriteFile", "request",
+                   {{"guest_path", std::string_view("Save:\\Hero000\\mainsave.bin")},
+                    {"requested_bytes", uint64_t(4096)},
+                    {"offset_is_current", true}});
   REQUIRE(request_sequence == 1);
   trace.Record("NtWriteFile", "result",
                {{"request_sequence", request_sequence}, {"actual_bytes", uint64_t(4096)}});
@@ -77,16 +92,14 @@ TEST_CASE("Save trace refuses to overwrite a prior capture", "[save_trace]") {
   CHECK_FALSE(trace.InitializeForTesting(std::filesystem::absolute(directory.path())));
 }
 
-TEST_CASE("Save path filter is case insensitive and excludes unrelated paths",
-          "[save_trace]") {
+TEST_CASE("Save path filter is case insensitive and excludes unrelated paths", "[save_trace]") {
   CHECK(rex::system::IsSaveGuestPath("Save:\\Hero000\\herosave.bin"));
   CHECK(rex::system::IsSaveGuestPath("SAVE:\\Hero000\\mainsave.bin"));
   CHECK(rex::system::IsSaveGuestPath("\\Device\\Content\\3\\saveuid.bin"));
   CHECK_FALSE(rex::system::IsSaveGuestPath("game:\\data\\scripts\\gameface\\"));
 }
 
-TEST_CASE("Save trace remains disabled without an explicit output directory",
-          "[save_trace]") {
+TEST_CASE("Save trace remains disabled without an explicit output directory", "[save_trace]") {
   auto& trace = rex::system::SaveTrace::Get();
   trace.ShutdownForTesting();
   CHECK_FALSE(trace.enabled());
