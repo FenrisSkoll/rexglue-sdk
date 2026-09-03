@@ -257,16 +257,41 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
     result = X_STATUS_INVALID_HANDLE;
   }
 
+  const bool save_trace =
+      file && IsSaveGuestPath(file->entry()->absolute_path()) && SaveTrace::Get().enabled();
+  const uint64_t requested_offset =
+      byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : uint64_t(-1);
+  uint64_t trace_request = 0;
+  if (save_trace) {
+    trace_request =
+        SaveTrace::Get().Record("NtReadFile", "request",
+                                {{"guest_path", file->entry()->absolute_path()},
+                                 {"host_path", SaveTraceHostPath(file->file())},
+                                 {"handle", uint64_t(file_handle)},
+                                 {"handle_type", std::string_view("file")},
+                                 {"event_handle", uint64_t(event_handle)},
+                                 {"apc_routine", uint64_t(apc_routine_ptr.guest_address())},
+                                 {"apc_context", uint64_t(apc_context.guest_address())},
+                                 {"io_status_block", uint64_t(io_status_block.guest_address())},
+                                 {"offset", requested_offset},
+                                 {"offset_is_current", !byte_offset_ptr},
+                                 {"requested_bytes", uint64_t(buffer_length)},
+                                 {"synchronous_handle", file->is_synchronous()}});
+  }
+
+  X_STATUS operation_result = result;
+  uint32_t completed_bytes = 0;
   if (XSUCCEEDED(result)) {
     if (true || file->is_synchronous()) {
       // Synchronous.
-      uint32_t bytes_read = 0;
-      result = file->Read(buffer.guest_address(), buffer_length,
-                          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-                          &bytes_read, apc_context.guest_address());
+      operation_result =
+          file->Read(buffer.guest_address(), buffer_length,
+                     byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : uint64_t(-1),
+                     &completed_bytes, apc_context.guest_address());
+      result = operation_result;
       if (io_status_block) {
         io_status_block->status = result;
-        io_status_block->information = bytes_read;
+        io_status_block->information = completed_bytes;
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even
@@ -325,6 +350,24 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
 
   if (ev && signal_event) {
     ev->Set(0, false);
+  }
+
+  if (save_trace) {
+    SaveTrace::Get().Record(
+        "NtReadFile", "result",
+        {{"request_sequence", trace_request},
+         {"handle", uint64_t(file_handle)},
+         {"offset", requested_offset},
+         {"requested_bytes", uint64_t(buffer_length)},
+         {"actual_bytes", uint64_t(completed_bytes)},
+         {"operation_result", uint64_t(operation_result)},
+         {"immediate_result", uint64_t(result)},
+         {"io_status", io_status_block ? uint64_t(io_status_block->status) : uint64_t(0)},
+         {"io_information", io_status_block ? uint64_t(io_status_block->information) : uint64_t(0)},
+         {"event_signaled", bool(ev && signal_event)},
+         {"apc_queued", apc_queued},
+         {"asynchronous_handle", !file->is_synchronous()},
+         {"returns_pending", result == X_STATUS_PENDING}});
   }
 
   // Log detailed completion info for debugging async IO issues

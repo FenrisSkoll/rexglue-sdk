@@ -92,6 +92,33 @@ TEST_CASE("Save trace refuses to overwrite a prior capture", "[save_trace]") {
   CHECK_FALSE(trace.InitializeForTesting(std::filesystem::absolute(directory.path())));
 }
 
+TEST_CASE("Save trace records read metadata without payload bytes", "[save_trace]") {
+  ScopedTraceDirectory directory;
+  auto& trace = rex::system::SaveTrace::Get();
+  REQUIRE(trace.InitializeForTesting(std::filesystem::absolute(directory.path())));
+
+  const auto request_sequence =
+      trace.Record("NtReadFile", "request",
+                   {{"guest_path", std::string_view("Save:\\Hero000\\mainsave.bin")},
+                    {"handle", uint64_t(0xF8000308)},
+                    {"offset", uint64_t(4096)},
+                    {"requested_bytes", uint64_t(2048)}});
+  trace.Record("NtReadFile", "result",
+               {{"request_sequence", request_sequence},
+                {"actual_bytes", uint64_t(2048)},
+                {"operation_result", uint64_t(0)},
+                {"io_status", uint64_t(0)},
+                {"io_information", uint64_t(2048)}});
+  trace.ShutdownForTesting();
+
+  const auto events = ReadText(directory.path() / "save-trace-events-v1.ndjson");
+  CHECK(events.find("NtReadFile") != std::string::npos);
+  CHECK(events.find("Save:\\\\Hero000\\\\mainsave.bin") != std::string::npos);
+  CHECK(events.find("\"requested_bytes\":2048") != std::string::npos);
+  CHECK(events.find("\"actual_bytes\":2048") != std::string::npos);
+  CHECK(events.find("payload_bytes") == std::string::npos);
+}
+
 TEST_CASE("Save path filter is case insensitive and excludes unrelated paths", "[save_trace]") {
   CHECK(rex::system::IsSaveGuestPath("Save:\\Hero000\\herosave.bin"));
   CHECK(rex::system::IsSaveGuestPath("SAVE:\\Hero000\\mainsave.bin"));
