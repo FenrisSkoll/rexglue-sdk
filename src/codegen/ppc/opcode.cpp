@@ -30,7 +30,7 @@ constexpr u32 extract_bits(u32 value, u32 start, u32 count) {
 // Opcode information table
 //=============================================================================
 
-static const std::array<OpcodeInfo, 320> g_opcode_table = {{
+static const std::array<OpcodeInfo, 322> g_opcode_table = {{
     // Primary opcode 16: bcx (conditional branch) - all variants
     {Opcode::bc, InstrFormat::kB, OpcodeGroup::kBranch, "bc", 16, 0, false},
     {Opcode::bca, InstrFormat::kB, OpcodeGroup::kBranch, "bca", 16, 0, false},
@@ -109,9 +109,10 @@ static const std::array<OpcodeInfo, 320> g_opcode_table = {{
     // Primary opcode 45: sthu
     {Opcode::sthu, InstrFormat::kD, OpcodeGroup::kMemory, "sthu", 45, 0, false},
 
-    // Primary opcode 58: ld, ldu (DS format with XO)
+    // Primary opcode 58: ld, ldu, lwa (DS format with XO)
     {Opcode::ld, InstrFormat::kDS, OpcodeGroup::kMemory, "ld", 58, 0, true},
     {Opcode::ldu, InstrFormat::kDS, OpcodeGroup::kMemory, "ldu", 58, 1, true},
+    {Opcode::lwa, InstrFormat::kDS, OpcodeGroup::kMemory, "lwa", 58, 2, true},
 
     // Primary opcode 62: std, stdu (DS format with XO)
     {Opcode::std, InstrFormat::kDS, OpcodeGroup::kMemory, "std", 62, 0, true},
@@ -149,6 +150,9 @@ static const std::array<OpcodeInfo, 320> g_opcode_table = {{
 
     // Primary opcode 10: cmpli
     {Opcode::cmpli, InstrFormat::kD, OpcodeGroup::kGeneral, "cmpli", 10, 0, false},
+
+    // Primary opcode 20: rlwimi
+    {Opcode::rlwimi, InstrFormat::kM, OpcodeGroup::kGeneral, "rlwimi", 20, 0, false},
 
     // Primary opcode 21: rlwinm
     {Opcode::rlwinm, InstrFormat::kM, OpcodeGroup::kGeneral, "rlwinm", 21, 0, false},
@@ -442,13 +446,14 @@ static const std::array<OpcodeInfo, 320> g_opcode_table = {{
     {Opcode::srawi, InstrFormat::kX, OpcodeGroup::kGeneral, "srawi", 31, 824, true},
     {Opcode::extsb, InstrFormat::kX, OpcodeGroup::kGeneral, "extsb", 31, 954, true},
     {Opcode::extsh, InstrFormat::kX, OpcodeGroup::kGeneral, "extsh", 31, 922, true},
+    {Opcode::extsw, InstrFormat::kX, OpcodeGroup::kGeneral, "extsw", 31, 986, true},
 
     //=========================================================================
     // Indexed Memory Operations
     //=========================================================================
     {Opcode::lbzx, InstrFormat::kX, OpcodeGroup::kMemory, "lbzx", 31, 87, true},
     {Opcode::lhzx, InstrFormat::kX, OpcodeGroup::kMemory, "lhzx", 31, 279, true},
-    {Opcode::lhax, InstrFormat::kX, OpcodeGroup::kMemory, "lhax", 31, 311, true},
+    {Opcode::lhax, InstrFormat::kX, OpcodeGroup::kMemory, "lhax", 31, 343, true},
     {Opcode::lwzx, InstrFormat::kX, OpcodeGroup::kMemory, "lwzx", 31, 23, true},
     {Opcode::ldx, InstrFormat::kX, OpcodeGroup::kMemory, "ldx", 31, 21, true},
     {Opcode::stbx, InstrFormat::kX, OpcodeGroup::kMemory, "stbx", 31, 215, true},
@@ -536,6 +541,8 @@ Opcode lookup_opcode(u32 code) {
         return Opcode::ba;
       return Opcode::b;
     }
+    case 20:
+      return Opcode::rlwimi;
     case 21:
       return Opcode::rlwinm;
     case 23:
@@ -618,6 +625,8 @@ Opcode lookup_opcode(u32 code) {
     switch (extended) {
       case 0:
         return Opcode::cmp;
+      case 21:
+        return Opcode::ldx;
       case 4:
         return Opcode::tw;
       case 11:
@@ -660,7 +669,7 @@ Opcode lookup_opcode(u32 code) {
         return Opcode::lhzx;
       case 284:
         return Opcode::eqv;
-      case 311:
+      case 343:
         return Opcode::lhax;
       case 316:
         return Opcode::xor_;
@@ -692,6 +701,8 @@ Opcode lookup_opcode(u32 code) {
         return Opcode::extsh;
       case 954:
         return Opcode::extsb;
+      case 986:
+        return Opcode::extsw;
     }
   } else if (primary == 58) {
     // DS format: XO in bits 30-31
@@ -700,6 +711,8 @@ Opcode lookup_opcode(u32 code) {
       return Opcode::ld;
     if (extended == 1)
       return Opcode::ldu;
+    if (extended == 2)
+      return Opcode::lwa;
   } else if (primary == 62) {
     // DS format: XO in bits 30-31
     extended = extract_bits(code, 30, 2);

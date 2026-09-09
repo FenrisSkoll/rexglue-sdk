@@ -14,9 +14,15 @@
 #include <rex/codegen/analyze.h>
 #include <rex/codegen/codegen.h>
 #include <rex/codegen/codegen_writer.h>
+#include <rex/codegen/manifest.h>
 #include <rex/kernel/init.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/user_module.h>
+#include <rex/system/xex_module.h>
+
+#include <algorithm>
 
 namespace rex::codegen {
 
@@ -63,6 +69,77 @@ Result<CodegenPipeline> CodegenPipeline::Create(const std::filesystem::path& con
   }
   pipeline.ctx_ = std::make_unique<CodegenContext>(std::move(*ctxResult));
 
+  return Ok(std::move(pipeline));
+}
+
+Result<CodegenPipeline> CodegenPipeline::CreateEntrypoint(const ManifestConfig& manifest) {
+  namespace fs = std::filesystem;
+
+  CodegenPipeline pipeline;
+  const auto& config = manifest.entrypoint.recompiler;
+  fs::path xexPath = manifest.manifestDir / config.filePath;
+  if (!fs::exists(xexPath)) {
+    return Err<CodegenPipeline>(ErrorCategory::IO,
+                                fmt::format("Entrypoint XEX not found: {}", xexPath.string()));
+  }
+  xexPath = fs::canonical(xexPath);
+
+  fs::path gameRoot;
+  if (manifest.gameRoot && !manifest.gameRoot->empty()) {
+    fs::path configuredRoot = manifest.manifestDir / *manifest.gameRoot;
+    if (!fs::exists(configuredRoot) || !fs::is_directory(configuredRoot)) {
+      return Err<CodegenPipeline>(
+          ErrorCategory::Validation,
+          fmt::format("[project].game_root '{}' does not resolve to a directory",
+                      configuredRoot.string()));
+    }
+    gameRoot = fs::canonical(configuredRoot);
+  } else {
+    gameRoot = fs::canonical(xexPath.parent_path());
+  }
+
+  fs::path relativeXex = fs::relative(xexPath, gameRoot);
+  if (relativeXex.empty() || *relativeXex.begin() == "..") {
+    return Err<CodegenPipeline>(ErrorCategory::Validation,
+                                fmt::format("Entrypoint XEX '{}' resolves outside game root '{}'",
+                                            xexPath.string(), gameRoot.string()));
+  }
+
+  pipeline.runtime_ = std::make_unique<Runtime>(gameRoot.string());
+  auto status = pipeline.runtime_->Setup(rex::RuntimeConfig{
+      .kernel_init = rex::kernel::InitializeKernel,
+      .tool_mode = true,
+  });
+  if (status != X_STATUS_SUCCESS) {
+    return Err<CodegenPipeline>(ErrorCategory::IO,
+                                fmt::format("Failed to initialize Runtime: {:#x}", status));
+  }
+
+  std::string relativeXexString = relativeXex.string();
+  std::replace(relativeXexString.begin(), relativeXexString.end(), '/', '\\');
+  status = pipeline.runtime_->LoadXexImage("game:\\" + relativeXexString);
+  if (status != X_STATUS_SUCCESS) {
+    return Err<CodegenPipeline>(ErrorCategory::IO,
+                                fmt::format("Failed to load entrypoint XEX: {:#x}", status));
+  }
+
+  auto executable = pipeline.runtime_->kernel_state()->GetExecutableModule();
+  if (!executable || !executable->xex_module()) {
+    return Err<CodegenPipeline>(ErrorCategory::Format,
+                                "Runtime did not expose the loaded entrypoint XEX");
+  }
+
+  auto binary = BinaryView::fromModule(*executable->xex_module());
+  auto context = CodegenContext::Create(std::move(binary), config);
+  context.setResolver(pipeline.runtime_->export_resolver());
+  context.setConfigDir(manifest.manifestDir);
+  context.analysisState().format = "xex";
+  context.analysisState().loadAddress = context.binary().baseAddress();
+  context.analysisState().entryPoint = context.binary().entryPoint();
+  context.analysisState().imageSize = context.binary().imageSize();
+  context.setHasDllModules(!manifest.modules.empty());
+  context.setDllModule(config.isDll.value_or(false));
+  pipeline.ctx_ = std::make_unique<CodegenContext>(std::move(context));
   return Ok(std::move(pipeline));
 }
 

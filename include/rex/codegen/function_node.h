@@ -126,6 +126,12 @@ class FunctionNode {
   // Jump tables
   const std::vector<JumpTable>& jumpTables() const { return jumpTables_; }
 
+  // Every relevant indirect site, including returns and unresolved transfers.
+  const std::vector<IndirectSiteAnalysis>& indirectSites() const { return indirectSites_; }
+  const std::vector<Block>& jumpTablePreliminaryBlocks() const {
+    return jumpTablePreliminaryBlocks_;
+  }
+
   // Unresolved jumps (pending resolution)
   const std::vector<UnresolvedJump>& unresolvedJumps() const { return unresolvedJumps_; }
 
@@ -163,6 +169,8 @@ class FunctionNode {
   void addCall(uint32_t site, CallTarget target);
   void addTailCall(uint32_t site, CallTarget target);
   void addJumpTable(JumpTable jt);
+  void setJumpTableRecovery(std::vector<IndirectSiteAnalysis> sites,
+                            std::vector<Block> preliminaryBlocks);
   void addUnresolvedJump(uint32_t site, uint32_t target, bool isCall, bool conditional);
 
   // Resolution (reactive - called by graph on events)
@@ -191,12 +199,16 @@ class FunctionNode {
 
   // Populated at discover()
   std::vector<Block> blocks_;
+  uint32_t blockExtentStart_ = 0;
+  uint32_t blockExtentEnd_ = 0;
   std::vector<rex::codegen::ppc::Instruction*> instructions_;  // Pointers into DecodedBinary
   std::set<uint32_t> labels_;  // Branch targets within this function
 
   std::vector<CallEdge> calls_;
   std::vector<CallEdge> tailCalls_;
   std::vector<JumpTable> jumpTables_;
+  std::vector<IndirectSiteAnalysis> indirectSites_;
+  std::vector<Block> jumpTablePreliminaryBlocks_;
 
   std::vector<UnresolvedJump> unresolvedJumps_;
 

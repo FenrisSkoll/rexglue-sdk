@@ -32,4 +32,8 @@ REXCVAR_DECLARE(uint32_t, max_seh_scope_entries);
 // Codegen/Discovery
 REXCVAR_DECLARE(uint32_t, backward_scan_limit);
 REXCVAR_DECLARE(uint32_t, max_jump_table_entries);
+REXCVAR_DECLARE(uint32_t, jump_table_max_predecessors);
+REXCVAR_DECLARE(uint32_t, jump_table_max_states);
+REXCVAR_DECLARE(uint32_t, jump_table_max_cfg_topology_nodes);
+REXCVAR_DECLARE(uint32_t, jump_table_fixpoint_iterations);
 REXCVAR_DECLARE(uint32_t, max_blocks_per_function);

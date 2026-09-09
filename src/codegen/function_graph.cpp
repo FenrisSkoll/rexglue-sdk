@@ -95,7 +95,15 @@ void FunctionNode::discover(std::vector<Block> blocks,
   labels_ = std::move(labels);
 
   // Update size based on blocks
+  blockExtentStart_ = 0;
+  blockExtentEnd_ = 0;
+  if (!blocks_.empty()) {
+    blockExtentStart_ = blocks_.front().base;
+    blockExtentEnd_ = blocks_.front().end();
+  }
   for (const auto& block : blocks_) {
+    blockExtentStart_ = std::min(blockExtentStart_, block.base);
+    blockExtentEnd_ = std::max(blockExtentEnd_, block.end());
     uint32_t blockEnd = block.base + block.size;
     if (blockEnd > base_ + size_) {
       size_ = blockEnd - base_;
@@ -136,6 +144,13 @@ const FunctionAnalysis& FunctionNode::analysis() const {
 }
 
 void FunctionNode::addBlock(Block block) {
+  if (blocks_.empty()) {
+    blockExtentStart_ = block.base;
+    blockExtentEnd_ = block.end();
+  } else {
+    blockExtentStart_ = std::min(blockExtentStart_, block.base);
+    blockExtentEnd_ = std::max(blockExtentEnd_, block.end());
+  }
   blocks_.push_back(block);
 
   // Extend size if block extends past current end
@@ -146,29 +161,27 @@ void FunctionNode::addBlock(Block block) {
 }
 
 bool FunctionNode::containsAddress(uint32_t addr) const {
-  // First check overall bounds
-  if (addr < base_ || addr >= base_ + size_) {
-    return false;
-  }
-
-  // If no blocks defined, use linear range
-  if (blocks_.empty()) {
-    return true;
-  }
-
-  // Check individual blocks
-  for (const auto& block : blocks_) {
-    if (block.contains(addr)) {
-      return true;
-    }
-  }
+  // If no blocks are available yet, use the registered linear range.
+  if (blocks_.empty())
+    return addr >= base_ && addr < base_ + size_;
 
   // For CONFIG and PDATA functions, trust the declared size even if blocks don't cover it
   // This handles out-of-line switch cases where compiler places code after epilogue
-  if (authority_ == FunctionAuthority::CONFIG || authority_ == FunctionAuthority::PDATA) {
-    return true;  // Already passed bounds check above
+  const bool inDeclaredRange = addr >= base_ && addr < base_ + size_;
+  if (inDeclaredRange &&
+      (authority_ == FunctionAuthority::CONFIG || authority_ == FunctionAuthority::PDATA)) {
+    return true;
   }
 
+  // Reject addresses outside both the declared range and the cached envelope
+  // before scanning exact fragments. This preserves cases emitted before the
+  // callable entry while keeping ubiquitous containment checks constant-time.
+  if (addr < blockExtentStart_ || addr >= blockExtentEnd_)
+    return false;
+  for (const auto& block : blocks_) {
+    if (block.contains(addr))
+      return true;
+  }
   return false;
 }
 
@@ -190,6 +203,12 @@ void FunctionNode::addJumpTable(JumpTable jt) {
     labels_.insert(target);
   }
   jumpTables_.push_back(std::move(jt));
+}
+
+void FunctionNode::setJumpTableRecovery(std::vector<IndirectSiteAnalysis> sites,
+                                        std::vector<Block> preliminaryBlocks) {
+  indirectSites_ = std::move(sites);
+  jumpTablePreliminaryBlocks_ = std::move(preliminaryBlocks);
 }
 
 void FunctionNode::addUnresolvedJump(uint32_t site, uint32_t target, bool isCall,
@@ -367,7 +386,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     }
 
     emit_println(out, "// STUB: Function at 0x{:08X} has no discovered code blocks", base());
-    emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
+    emit_println(out, "DEFINE_REX_FUNC({}, 0x{:08X}, false) {{", name, base());
     emit_println(out, "\tREX_FUNC_PROLOGUE();");
     emit_println(out, "}}\n");
     return out;
@@ -381,6 +400,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       REXCODEGEN_TRACE("Function 0x{:08X} has {} SEH scopes", base(), sehInfo->scopes.size());
     }
   }
+  const bool generateSeh =
+      sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers;
 
   // --- First pass: collect labels from all blocks ---
   std::unordered_set<size_t> labels;
@@ -479,7 +500,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   }
 
   // Function signature with weak/alias pattern
-  emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
+  emit_println(out, "DEFINE_REX_FUNC({}, 0x{:08X}, {}) {{", name, base(), generateSeh);
   emit_println(out, "\tREX_FUNC_PROLOGUE();");
 
   // --- Second pass: emit instruction code ---
@@ -487,9 +508,6 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   bool allRecompiled = true;
   CSRState csrState = CSRState::Unknown;
   RecompilerLocalVariables localVariables;
-
-  // Local map for late-detected jump tables (can't mutate const config)
-  std::unordered_map<uint32_t, JumpTable> lateJumpTables;
 
   std::string body;
   body.reserve(4096);
@@ -520,10 +538,11 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       if (stIt != ctx.config.switchTables.end()) {
         activeJt = &stIt->second;
       } else {
-        auto lateIt = lateJumpTables.find(blockBase);
-        if (lateIt != lateJumpTables.end()) {
-          activeJt = &lateIt->second;
-        }
+        auto analyzedIt = std::find_if(
+            jumpTables().begin(), jumpTables().end(),
+            [blockBase](const JumpTable& table) { return table.bctrAddress == blockBase; });
+        if (analyzedIt != jumpTables().end())
+          activeJt = &*analyzedIt;
       }
 
       Disassemble(data, 4, blockBase, insn);
@@ -533,43 +552,6 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         if (*data != 0)
           REXCODEGEN_WARN("Unable to decode instruction {:X} at {:X}", *data, blockBase);
       } else {
-        // Late jump table detection for bctr
-        if (insn.opcode->id == PPC_INST_BCTR && !activeJt) {
-          bool is_switch_pattern = false;
-          constexpr uint32_t MTCTR_MASK = 0xFC1FFFFF;
-          constexpr uint32_t MTCTR_OPCODE = 0x7C0003A6;
-          constexpr uint32_t NOP = 0x60000000;
-
-          for (int i = 1; i <= 3 && !is_switch_pattern; i++) {
-            uint32_t prev_insn = load_and_swap<uint32_t>(data - i);
-            if ((prev_insn & MTCTR_MASK) == MTCTR_OPCODE) {
-              is_switch_pattern = true;
-              for (int j = 1; j < i; j++) {
-                if (load_and_swap<uint32_t>(data - j) != NOP) {
-                  is_switch_pattern = false;
-                  break;
-                }
-              }
-            } else if (prev_insn != NOP) {
-              break;
-            }
-          }
-
-          if (is_switch_pattern) {
-            FunctionScanner scanner(ctx.binary);
-            auto jt_opt = scanner.detect_jump_table(blockBase);
-            if (jt_opt.has_value()) {
-              lateJumpTables.emplace(blockBase, std::move(*jt_opt));
-              activeJt = &lateJumpTables.at(blockBase);
-              for (auto label : activeJt->targets) {
-                labels.emplace(label);
-              }
-              REXCODEGEN_TRACE("Late-detected jump table at 0x{:08X} with {} entries", blockBase,
-                               activeJt->targets.size());
-            }
-          }
-        }
-
         // Emit comment with instruction disassembly
         emit_println(body, "\t// {} {}", insn.opcode->name, insn.op_str);
 
@@ -604,7 +586,6 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   }
 
   // --- Close function body (or SEH try block) ---
-  bool generateSeh = sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers;
   if (generateSeh) {
     emit_println(body, "\t\t}} SEH_CATCH_ALL {{");
     emit_println(body, "\t\t\tREXLOG_WARN(\"SEH exception caught in sub_{:08X}\");", base());
@@ -925,6 +906,14 @@ void FunctionGraph::addTailCallToFunction(uint32_t entry, uint32_t site, CallTar
 void FunctionGraph::addJumpTableToFunction(uint32_t entry, JumpTable jt) {
   if (auto* node = getFunction(entry)) {
     node->addJumpTable(std::move(jt));
+  }
+}
+
+void FunctionGraph::setJumpTableRecoveryForFunction(uint32_t entry,
+                                                    std::vector<IndirectSiteAnalysis> sites,
+                                                    std::vector<Block> preliminaryBlocks) {
+  if (auto* node = getFunction(entry)) {
+    node->setJumpTableRecovery(std::move(sites), std::move(preliminaryBlocks));
   }
 }
 

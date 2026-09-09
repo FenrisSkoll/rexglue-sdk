@@ -157,6 +157,7 @@ class ContentManager {
   X_RESULT OpenContent(const std::string_view root_name, uint64_t xuid,
                        const XCONTENT_AGGREGATE_DATA& data, uint32_t& content_license);
   X_RESULT CloseContent(const std::string_view root_name);
+  X_RESULT FlushContent(const std::string_view root_name);
   X_RESULT GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t>* buffer);
   X_RESULT SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,

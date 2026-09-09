@@ -1,5 +1,6 @@
 set(REXSYSTEM_SOURCES
     runtime.cpp
+    save_trace.cpp
     embedded_metadata.cpp
     achievement_manager.cpp
     achievements.cpp
@@ -42,6 +43,7 @@ set(REXSYSTEM_SOURCES
     map_parser.cpp
     module.cpp
     function_dispatcher.cpp
+    fault_walk.cpp
     gpu_plugin_loader.cpp
     thread.cpp
     thread_state.cpp
@@ -84,10 +86,10 @@ target_link_libraries(rexruntime
         spdlog::spdlog
         tomlplusplus
         SDL3::SDL3
+        xxHash::xxhash
     PRIVATE
         aes128
         mspack
-        xxHash::xxhash
 )
 
 if(REXGLUE_ENABLE_TRACY)

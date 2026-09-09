@@ -20,6 +20,7 @@
 #include <rex/types.h>
 #include <rex/system/info/file.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/save_trace.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xfile.h>
@@ -123,6 +124,19 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   // Compute path, possibly attrs relative.
   auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  bool save_trace = IsSaveGuestPath(target_path) && SaveTrace::Get().enabled();
+  uint64_t trace_request = 0;
+  if (save_trace) {
+    trace_request = SaveTrace::Get().Record(
+        "NtCreateFile", "request",
+        {{"guest_path", target_path},
+         {"root_handle", uint64_t(object_attrs->root_directory)},
+         {"desired_access", uint64_t(desired_access)},
+         {"file_attributes", uint64_t(file_attributes)},
+         {"share_access", uint64_t(share_access)},
+         {"creation_disposition", uint64_t(creation_disposition)},
+         {"create_options", uint64_t(create_options)}});
+  }
   REXKRNL_IMPORT_TRACE(
       "NtCreateFile", "path={} access={:#x} attrs={:#x} share={:#x} disp={:#x} options={:#x}",
       target_path, (uint32_t)desired_access, (uint32_t)file_attributes, (uint32_t)share_access,
@@ -130,6 +144,13 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
+    if (save_trace) {
+      SaveTrace::Get().Record(
+          "NtCreateFile", "result",
+          {{"request_sequence", trace_request},
+           {"guest_path", target_path},
+           {"result", uint64_t(X_STATUS_OBJECT_NAME_INVALID)}});
+    }
     return X_STATUS_OBJECT_NAME_INVALID;
   }
 
@@ -142,9 +163,24 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     root_entry = root_file->entry();
   }
 
+  if (!save_trace && root_entry && IsSaveGuestPath(root_entry->absolute_path()) &&
+      SaveTrace::Get().enabled()) {
+    save_trace = true;
+    trace_request = SaveTrace::Get().Record(
+        "NtCreateFile", "request",
+        {{"guest_path", target_path},
+         {"root_guest_path", root_entry->absolute_path()},
+         {"root_handle", uint64_t(object_attrs->root_directory)},
+         {"desired_access", uint64_t(desired_access)},
+         {"file_attributes", uint64_t(file_attributes)},
+         {"share_access", uint64_t(share_access)},
+         {"creation_disposition", uint64_t(creation_disposition)},
+         {"create_options", uint64_t(create_options)}});
+  }
+
   // Attempt open (or create).
-  rex::filesystem::File* vfs_file;
-  rex::filesystem::FileAction file_action;
+  rex::filesystem::File* vfs_file = nullptr;
+  rex::filesystem::FileAction file_action = rex::filesystem::FileAction::kDoesNotExist;
   X_STATUS result = REX_KERNEL_FS()->OpenFile(
       root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
       desired_access, (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
@@ -168,6 +204,18 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   }
 
   *handle_out = handle;
+  if (save_trace) {
+    SaveTrace::Get().Record(
+        "NtCreateFile", "result",
+        {{"request_sequence", trace_request},
+         {"guest_path", target_path},
+         {"host_path", SaveTraceHostPath(vfs_file)},
+         {"handle", uint64_t(handle)},
+         {"handle_type", std::string_view("file")},
+         {"file_action", uint64_t(file_action)},
+         {"synchronous", file ? file->is_synchronous() : false},
+         {"result", uint64_t(result)}});
+  }
   if (XFAILED(result)) {
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
@@ -209,16 +257,41 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
     result = X_STATUS_INVALID_HANDLE;
   }
 
+  const bool save_trace =
+      file && IsSaveGuestPath(file->entry()->absolute_path()) && SaveTrace::Get().enabled();
+  const uint64_t requested_offset =
+      byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : uint64_t(-1);
+  uint64_t trace_request = 0;
+  if (save_trace) {
+    trace_request =
+        SaveTrace::Get().Record("NtReadFile", "request",
+                                {{"guest_path", file->entry()->absolute_path()},
+                                 {"host_path", SaveTraceHostPath(file->file())},
+                                 {"handle", uint64_t(file_handle)},
+                                 {"handle_type", std::string_view("file")},
+                                 {"event_handle", uint64_t(event_handle)},
+                                 {"apc_routine", uint64_t(apc_routine_ptr.guest_address())},
+                                 {"apc_context", uint64_t(apc_context.guest_address())},
+                                 {"io_status_block", uint64_t(io_status_block.guest_address())},
+                                 {"offset", requested_offset},
+                                 {"offset_is_current", !byte_offset_ptr},
+                                 {"requested_bytes", uint64_t(buffer_length)},
+                                 {"synchronous_handle", file->is_synchronous()}});
+  }
+
+  X_STATUS operation_result = result;
+  uint32_t completed_bytes = 0;
   if (XSUCCEEDED(result)) {
     if (true || file->is_synchronous()) {
       // Synchronous.
-      uint32_t bytes_read = 0;
-      result = file->Read(buffer.guest_address(), buffer_length,
-                          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-                          &bytes_read, apc_context.guest_address());
+      operation_result =
+          file->Read(buffer.guest_address(), buffer_length,
+                     byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : uint64_t(-1),
+                     &completed_bytes, apc_context.guest_address());
+      result = operation_result;
       if (io_status_block) {
         io_status_block->status = result;
-        io_status_block->information = bytes_read;
+        io_status_block->information = completed_bytes;
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even
@@ -277,6 +350,24 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
 
   if (ev && signal_event) {
     ev->Set(0, false);
+  }
+
+  if (save_trace) {
+    SaveTrace::Get().Record(
+        "NtReadFile", "result",
+        {{"request_sequence", trace_request},
+         {"handle", uint64_t(file_handle)},
+         {"offset", requested_offset},
+         {"requested_bytes", uint64_t(buffer_length)},
+         {"actual_bytes", uint64_t(completed_bytes)},
+         {"operation_result", uint64_t(operation_result)},
+         {"immediate_result", uint64_t(result)},
+         {"io_status", io_status_block ? uint64_t(io_status_block->status) : uint64_t(0)},
+         {"io_information", io_status_block ? uint64_t(io_status_block->information) : uint64_t(0)},
+         {"event_signaled", bool(ev && signal_event)},
+         {"apc_queued", apc_queued},
+         {"asynchronous_handle", !file->is_synchronous()},
+         {"returns_pending", result == X_STATUS_PENDING}});
   }
 
   // Log detailed completion info for debugging async IO issues
@@ -397,19 +488,45 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
     result = X_STATUS_INVALID_HANDLE;
   }
 
+  const bool save_trace =
+      file && IsSaveGuestPath(file->entry()->absolute_path()) && SaveTrace::Get().enabled();
+  const uint64_t requested_offset =
+      byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : uint64_t(-1);
+  uint64_t trace_request = 0;
+  if (save_trace) {
+    trace_request = SaveTrace::Get().Record(
+        "NtWriteFile", "request",
+        {{"guest_path", file->entry()->absolute_path()},
+         {"host_path", SaveTraceHostPath(file->file())},
+         {"handle", uint64_t(file_handle)},
+         {"handle_type", std::string_view("file")},
+         {"event_handle", uint64_t(event_handle)},
+         {"apc_routine", uint64_t(apc_routine)},
+         {"apc_context", uint64_t(apc_context.guest_address())},
+         {"io_status_block", uint64_t(io_status_block.guest_address())},
+         {"offset", requested_offset},
+         {"offset_is_current", !byte_offset_ptr},
+         {"requested_bytes", uint64_t(buffer_length)},
+         {"synchronous_handle", file->is_synchronous()}});
+  }
+
+  X_STATUS operation_result = result;
+  uint32_t completed_bytes = 0;
+  bool apc_queued = false;
+
   // Execute write.
   if (XSUCCEEDED(result)) {
     // TODO(benvanik): async path.
     if (true || file->is_synchronous()) {
       // Synchronous request.
-      uint32_t bytes_written = 0;
-      result = file->Write(buffer.guest_address(), buffer_length,
-                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-                           &bytes_written, apc_context.guest_address());
+      operation_result = file->Write(buffer.guest_address(), buffer_length,
+                                     byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
+                                     &completed_bytes, apc_context.guest_address());
+      result = operation_result;
 
       if (io_status_block) {
         io_status_block->status = result;
-        io_status_block->information = static_cast<uint32_t>(bytes_written);
+        io_status_block->information = completed_bytes;
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even
@@ -420,6 +537,7 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
           auto thread = XThread::GetCurrentThread();
           thread->EnqueueApc(static_cast<uint32_t>(apc_routine) & ~1u, apc_context.guest_address(),
                              io_status_block.guest_address(), 0);
+          apc_queued = true;
         }
       }
 
@@ -448,6 +566,25 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
 
   if (ev && signal_event) {
     ev->Set(0, false);
+  }
+
+  if (save_trace) {
+    SaveTrace::Get().Record(
+        "NtWriteFile", "result",
+        {{"request_sequence", trace_request},
+         {"handle", uint64_t(file_handle)},
+         {"offset", requested_offset},
+         {"requested_bytes", uint64_t(buffer_length)},
+         {"actual_bytes", uint64_t(completed_bytes)},
+         {"operation_result", uint64_t(operation_result)},
+         {"immediate_result", uint64_t(result)},
+         {"io_status", io_status_block ? uint64_t(io_status_block->status) : uint64_t(0)},
+         {"io_information",
+          io_status_block ? uint64_t(io_status_block->information) : uint64_t(0)},
+         {"event_signaled", bool(ev && signal_event)},
+         {"apc_queued", apc_queued},
+         {"asynchronous_handle", !file->is_synchronous()},
+         {"returns_pending", result == X_STATUS_PENDING}});
   }
 
   return result;
@@ -569,6 +706,22 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
 
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   auto name = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), file_name);
+  const bool save_trace =
+      file && IsSaveGuestPath(file->entry()->absolute_path()) && SaveTrace::Get().enabled();
+  const uint64_t trace_request =
+      save_trace
+          ? SaveTrace::Get().Record(
+                "NtQueryDirectoryFile", "request",
+                {{"guest_path", file->entry()->absolute_path()},
+                 {"host_path", SaveTraceHostPath(file->file())},
+                 {"handle", uint64_t(file_handle)},
+                 {"event_handle", uint64_t(event_handle)},
+                 {"apc_routine", uint64_t(apc_routine)},
+                 {"apc_context", uint64_t(apc_context.guest_address())},
+                 {"pattern", name},
+                 {"buffer_length", uint64_t(length)},
+                 {"restart_scan", bool(restart_scan)}})
+          : 0;
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(name, true)) {
@@ -594,15 +747,44 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
     io_status_block->information = info;
   }
 
+  if (save_trace) {
+    SaveTrace::Get().Record("NtQueryDirectoryFile", "result",
+                            {{"request_sequence", trace_request},
+                             {"result", uint64_t(result)},
+                             {"information", uint64_t(info)}});
+  }
+
   return result;
 }
 
 u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
-  auto result = X_STATUS_SUCCESS;
+  X_STATUS result = X_STATUS_INVALID_HANDLE;
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  const bool save_trace =
+      file && IsSaveGuestPath(file->entry()->absolute_path()) && SaveTrace::Get().enabled();
+  uint64_t trace_request = 0;
+  if (save_trace) {
+    trace_request = SaveTrace::Get().Record(
+        "NtFlushBuffersFile", "request",
+        {{"guest_path", file->entry()->absolute_path()},
+         {"host_path", SaveTraceHostPath(file->file())},
+         {"handle", uint64_t(file_handle)}});
+  }
+
+  if (file) {
+    result = file->Flush();
+  }
 
   if (io_status_block_ptr) {
     io_status_block_ptr->status = result;
     io_status_block_ptr->information = 0;
+  }
+
+  if (save_trace) {
+    SaveTrace::Get().Record("NtFlushBuffersFile", "result",
+                            {{"request_sequence", trace_request},
+                             {"handle", uint64_t(file_handle)},
+                             {"result", uint64_t(result)}});
   }
 
   return result;

@@ -13,10 +13,14 @@ add_executable(unit_tests
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
     system/guest_path_test.cpp
+    system/save_trace_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
     input/input_assignment_test.cpp
     codegen/codegen_writer_test.cpp
+    codegen/entrypoint_closure_test.cpp
+    codegen/function_node_test.cpp
+    codegen/jump_table_recovery_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
 )

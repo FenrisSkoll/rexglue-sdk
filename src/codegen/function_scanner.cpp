@@ -14,6 +14,7 @@
 #include "ppc/opcode.h"
 
 #include <algorithm>
+#include <chrono>
 #include <queue>
 #include <set>
 #include <stack>
@@ -24,6 +25,7 @@
 #include <rex/codegen/binary_view.h>
 #include <rex/codegen/codegen_context.h>
 #include <rex/codegen/function_scanner.h>
+#include <rex/codegen/jump_table_recovery.h>
 #include <rex/logging.h>
 
 #include "codegen_logging.h"
@@ -1812,13 +1814,14 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
 // Block Discovery
 //=============================================================================
 
-BlockDiscoveryResult discoverBlocks(
+static BlockDiscoveryResult discoverBlocksPass(
     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize,
-    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables) {
+    const std::unordered_map<uint32_t, JumpTable>* activeSwitchTables) {
   BlockDiscoveryResult result;
   std::unordered_set<uint32_t> visited;
   std::unordered_set<uint32_t> blockStarts;
+  std::unordered_set<uint32_t> outOfLineBlockStarts;
   std::queue<uint32_t> worklist;
 
   // Function extent - use pdataSize when available
@@ -1843,7 +1846,8 @@ BlockDiscoveryResult discoverBlocks(
 
     if (visited.contains(blockStart))
       continue;
-    if (!isWithinFunction(blockStart))
+    const bool outOfLineBlock = outOfLineBlockStarts.contains(blockStart);
+    if (!isWithinFunction(blockStart) && !outOfLineBlock)
       continue;
 
     // Linear scan until terminator
@@ -1852,7 +1856,8 @@ BlockDiscoveryResult discoverBlocks(
     block.base = blockStart;
     block.size = 0;
 
-    while (isWithinFunction(addr)) {
+    while (isWithinFunction(addr) || (outOfLineBlock && containingRegion.contains(addr) &&
+                                      (addr == blockStart || !knownFunctions.contains(addr)))) {
       auto* insn = decoded.get(addr);
       if (!insn) {
         REXCODEGEN_TRACE("discoverBlocks: 0x{:08X} no instruction at addr, breaking", entryPoint);
@@ -1873,7 +1878,7 @@ BlockDiscoveryResult discoverBlocks(
         // Uses funcEnd (from pdataSize or region) defined at top of function
         auto isInternalTarget = [&](uint32_t t) -> bool {
           // Must be within function bounds
-          if (t < entryPoint || t >= funcEnd) {
+          if (!isWithinFunction(t) && !(outOfLineBlock && containingRegion.contains(t))) {
             return false;
           }
           // Must not be a known function entry (except our own entry point)
@@ -1916,26 +1921,21 @@ BlockDiscoveryResult discoverBlocks(
           }
           // Do not break: continue scanning the fall-through path.
         } else if (insn->opcode == rex::codegen::ppc::Opcode::bcctr) {
-          // Unconditional bctr - prefer a manually configured table, then try
-          // automatic detection. Manual tables are authoritative because they
-          // are commonly needed when the compiler emits a table without an
-          // adjacent bounds check.
+          // Unconditional bctr. The outer discovery fixpoint supplies only
+          // manual tables or tables already validated by the recovery pass.
           REXCODEGEN_TRACE("discoverBlocks: bctr at 0x{:08X} in func 0x{:08X}, funcEnd=0x{:08X}",
                            addr, entryPoint, funcEnd);
           std::optional<JumpTable> jt;
           bool jtIsManual = false;
-          if (manualSwitchTables) {
-            auto manualIt = manualSwitchTables->find(addr);
-            if (manualIt != manualSwitchTables->end()) {
+          if (activeSwitchTables) {
+            auto manualIt = activeSwitchTables->find(addr);
+            if (manualIt != activeSwitchTables->end()) {
               jt = manualIt->second;
-              jtIsManual = true;
+              jtIsManual = jt->origin == JumpTableOrigin::Manual;
               REXCODEGEN_TRACE(
-                  "discoverBlocks: using manual jump table at bctr 0x{:08X} with {} targets", addr,
-                  jt->targets.size());
+                  "discoverBlocks: using {} jump table at bctr 0x{:08X} with {} targets",
+                  JumpTableOriginName(jt->origin), addr, jt->targets.size());
             }
-          }
-          if (!jt) {
-            jt = detectJumpTable(decoded, addr, containingRegion, entryPoint, funcEnd);
           }
           if (jt) {
             REXCODEGEN_TRACE("discoverBlocks: detected jump table at bctr 0x{:08X} with {} targets",
@@ -1974,6 +1974,8 @@ BlockDiscoveryResult discoverBlocks(
               if (t >= funcEnd && t < containingRegion.end) {
                 funcEnd = t + 4;  // Extend to include this target
               }
+              if (!isWithinFunction(t))
+                outOfLineBlockStarts.insert(t);
               result.labels.insert(t);
               if (!visited.contains(t) && !blockStarts.contains(t)) {
                 blockStarts.insert(t);
@@ -2064,6 +2066,485 @@ BlockDiscoveryResult discoverBlocks(
   REXCODEGEN_TRACE("discoverBlocks: entry=0x{:08X} blocks={} instructions={} labels={}", entryPoint,
                    result.blocks.size(), result.instructions.size(), result.labels.size());
 
+  return result;
+}
+
+BlockDiscoveryResult discoverPreliminaryBlocks(DecodedBinary& decoded, uint32_t entryPoint,
+                                               const CodeRegion& containingRegion,
+                                               const std::unordered_set<uint32_t>& knownFunctions,
+                                               uint32_t pdataSize) {
+  return discoverBlocksPass(decoded, entryPoint, containingRegion, knownFunctions, pdataSize,
+                            nullptr);
+}
+
+BlockDiscoveryResult discoverBlocks(
+    DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
+    const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize,
+    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables,
+    const JumpTableEntryRegisterDomainsBySite* entryRegisterDomainsBySite) {
+  using Clock = std::chrono::steady_clock;
+  const auto functionStarted = Clock::now();
+  auto elapsedMicroseconds = [](Clock::time_point started) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
+  };
+
+  std::unordered_map<uint32_t, JumpTable> selectedTables;
+  if (manualSwitchTables) {
+    for (const auto& [site, configured] : *manualSwitchTables) {
+      JumpTable manual = configured;
+      manual.origin = JumpTableOrigin::Manual;
+      manual.bctrAddress = site;
+      selectedTables.emplace(site, std::move(manual));
+    }
+  }
+
+  JumpTableRecoveryStats aggregate;
+  BlockDiscoveryResult result;
+  std::vector<Block> preliminaryBlocks;
+  std::unordered_set<uint32_t> rejectedAutomaticSites;
+  std::unordered_map<uint32_t, std::vector<JumpTableFailure>> rejectionReasons;
+  std::unordered_map<uint32_t, std::shared_ptr<JumpTableSiteDataflowEvidence>> rejectionDataflow;
+  std::unordered_map<uint32_t, std::vector<JumpTableLoopEvidence>> rejectionLoopEvidence;
+  std::unordered_map<uint32_t, std::optional<JumpTableLimitRetryEvidence>> rejectionLimitRetry;
+  JumpTableRecoveryLimits limits;
+  limits.maxBackwardInstructions = REXCVAR_GET(backward_scan_limit);
+  limits.maxEntries = REXCVAR_GET(max_jump_table_entries);
+  limits.maxPredecessors = REXCVAR_GET(jump_table_max_predecessors);
+  limits.maxStates = REXCVAR_GET(jump_table_max_states);
+  limits.maxCfgTopologyNodes = REXCVAR_GET(jump_table_max_cfg_topology_nodes);
+  limits.maxFixpointIterations = REXCVAR_GET(jump_table_fixpoint_iterations);
+
+  for (uint32_t iteration = 1; iteration <= limits.maxFixpointIterations; ++iteration) {
+    const auto cfgStarted = Clock::now();
+    result = discoverBlocksPass(decoded, entryPoint, containingRegion, knownFunctions, pdataSize,
+                                selectedTables.empty() ? nullptr : &selectedTables);
+    const uint64_t cfgMicroseconds = elapsedMicroseconds(cfgStarted);
+    if (iteration == 1)
+      aggregate.preliminaryCfgMicroseconds += cfgMicroseconds;
+    else
+      aggregate.caseExpansionCfgMicroseconds += cfgMicroseconds;
+    if (iteration == 1)
+      preliminaryBlocks = result.blocks;
+
+    const auto classificationStarted = Clock::now();
+    std::vector<uint32_t> sites;
+    for (const auto* instruction : result.instructions) {
+      if (instruction && instruction->is_indirect_branch())
+        sites.push_back(instruction->address);
+    }
+    std::sort(sites.begin(), sites.end());
+    sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
+    aggregate.indirectSiteClassificationMicroseconds += elapsedMicroseconds(classificationStarted);
+
+    std::vector<IndirectSiteAnalysis> analyses;
+    std::unordered_map<uint32_t, JumpTable> nextTables;
+    if (manualSwitchTables) {
+      for (const auto& [site, configured] : *manualSwitchTables) {
+        JumpTable manual = configured;
+        manual.origin = JumpTableOrigin::Manual;
+        manual.bctrAddress = site;
+        nextTables.emplace(site, std::move(manual));
+      }
+    }
+    JumpTableRecoveryStats iterationStats;
+    struct PendingInlineBootstrap {
+      size_t analysisIndex = 0;
+      uint32_t site = 0;
+      JumpTable candidate;
+    };
+    std::vector<PendingInlineBootstrap> pendingInlineBootstraps;
+
+    for (uint32_t site : sites) {
+      const JumpTable* manual = nullptr;
+      if (manualSwitchTables) {
+        auto manualIt = manualSwitchTables->find(site);
+        if (manualIt != manualSwitchTables->end())
+          manual = &manualIt->second;
+      }
+      JumpTableRecoveryInput input;
+      input.site = site;
+      input.ownerAddress = entryPoint;
+      if (pdataSize != 0 && pdataSize <= std::numeric_limits<uint32_t>::max() - entryPoint)
+        input.trustedOwnerEnd = entryPoint + pdataSize;
+      input.preliminaryBlocks = result.blocks;
+      input.containingRegion = &containingRegion;
+      input.independentlyCallableEntries = &knownFunctions;
+      input.validatedOwnerTables = &selectedTables;
+      if (entryRegisterDomainsBySite) {
+        const auto domains = entryRegisterDomainsBySite->find(site);
+        if (domains != entryRegisterDomainsBySite->end())
+          input.entryRegisterDomains = &domains->second;
+      }
+      auto previous = selectedTables.find(site);
+      if (previous != selectedTables.end() &&
+          previous->second.origin == JumpTableOrigin::Automatic) {
+        input.priorAutomaticTable = &previous->second;
+      }
+      input.manualTable = manual;
+      input.limits = limits;
+      JumpTableRecoveryInput analysisInput = input;
+      if (input.priorAutomaticTable && !input.priorAutomaticTable->boundValueIsFiniteIndexDomain &&
+          input.priorAutomaticTable->boundSemantics ==
+              "self_delimiting_inline_absolute_table_extent") {
+        // The discovery pass has already materialised every currently selected
+        // case block. Revalidating a storage-only table must use that ordinary
+        // CFG without also treating unrelated selected-table edges as an index
+        // domain or multiplying resolver states.
+        analysisInput.validatedOwnerTables = nullptr;
+      }
+      auto analysis =
+          AnalyzeIndirectSiteWithPriorLimitRetry(decoded, analysisInput, &iterationStats);
+
+      // A self-delimiting inline table can describe a state-machine loop whose
+      // backedge is invisible until that same table's case edges are present.
+      // Keep the first-pass candidate report-only, expand only this exact
+      // candidate in an isolated CFG pass, and accept only when ordinary
+      // reanalysis reproduces every table field and proves the case loop.
+      const bool exactBootstrapFailure =
+          analysis.failures.size() == 1 &&
+          (analysis.failures.front() == JumpTableFailure::AmbiguousReachingDefinition ||
+           analysis.failures.front() == JumpTableFailure::AnalysisLimit);
+      const bool resolverStateBudgetExhausted =
+          analysis.dataflow &&
+          std::any_of(analysis.dataflow->exhaustedBudgets.begin(),
+                      analysis.dataflow->exhaustedBudgets.end(),
+                      [](const auto& exhaustion) { return exhaustion.budget == "max_states"; });
+      const bool onlyCompatibleBootstrapBudgets =
+          analysis.dataflow &&
+          std::all_of(analysis.dataflow->exhaustedBudgets.begin(),
+                      analysis.dataflow->exhaustedBudgets.end(),
+                      [](const auto& exhaustion) {
+                        return exhaustion.budget == "max_states" ||
+                               exhaustion.budget == "bound_census_max_states" ||
+                               exhaustion.budget == "bound_recovery_max_states" ||
+                               exhaustion.budget == "bound_census_max_backward_instructions" ||
+                               exhaustion.budget == "bound_recovery_max_backward_instructions";
+                      }) &&
+          exactBootstrapFailure &&
+          (analysis.failures.front() == JumpTableFailure::AmbiguousReachingDefinition ||
+           resolverStateBudgetExhausted);
+      const JumpTable* reportOnlyCandidate =
+          analysis.dataflow && analysis.dataflow->diagnosticProbe.reportOnly &&
+                  analysis.dataflow->diagnosticProbe.hypothesisComplete &&
+                  analysis.dataflow->diagnosticProbe.allTargetsValid &&
+                  analysis.dataflow->diagnosticProbe.candidateTable
+              ? &*analysis.dataflow->diagnosticProbe.candidateTable
+              : nullptr;
+      const bool exactInlineCandidate =
+          reportOnlyCandidate && reportOnlyCandidate->origin == JumpTableOrigin::Automatic &&
+          reportOnlyCandidate->ownerAddress == entryPoint &&
+          reportOnlyCandidate->bctrAddress == site &&
+          reportOnlyCandidate->boundSemantics == "self_delimiting_inline_absolute_table_extent" &&
+          !reportOnlyCandidate->boundValueIsFiniteIndexDomain &&
+          reportOnlyCandidate->caseCount >= 3 &&
+          reportOnlyCandidate->targets.size() == reportOnlyCandidate->caseCount &&
+          reportOnlyCandidate->rawEntries.size() == reportOnlyCandidate->caseCount;
+      if (previous == selectedTables.end() && !analysis.selectedTable && exactBootstrapFailure &&
+          onlyCompatibleBootstrapBudgets && exactInlineCandidate) {
+        const JumpTable candidate = *reportOnlyCandidate;
+        auto provisionalTables = selectedTables;
+        provisionalTables.emplace(site, candidate);
+
+        const auto provisionalCfgStarted = Clock::now();
+        auto provisionalBlocks = discoverBlocksPass(decoded, entryPoint, containingRegion,
+                                                    knownFunctions, pdataSize, &provisionalTables);
+        aggregate.caseExpansionCfgMicroseconds += elapsedMicroseconds(provisionalCfgStarted);
+
+        JumpTableRecoveryInput provisionalInput = input;
+        provisionalInput.preliminaryBlocks = provisionalBlocks.blocks;
+        provisionalInput.priorAutomaticTable = &candidate;
+        JumpTableRecoveryStats provisionalStats;
+        auto provisional =
+            AnalyzeIndirectSiteWithPriorLimitRetry(decoded, provisionalInput, &provisionalStats);
+        iterationStats.elapsedMicroseconds += provisionalStats.elapsedMicroseconds;
+        iterationStats.decodedInstructions += provisionalStats.decodedInstructions;
+        iterationStats.analysisLimitHit =
+            iterationStats.analysisLimitHit || provisionalStats.analysisLimitHit;
+
+        const bool loopProof =
+            provisional.dataflow &&
+            std::any_of(provisional.dataflow->boundCandidates.begin(),
+                        provisional.dataflow->boundCandidates.end(), [](const auto& bound) {
+                          return bound.selfDelimitedInlineTableExtent &&
+                                 bound.inlineCaseLoopCfgVerified;
+                        });
+        const bool exactLimitRetry = provisional.limitRetry && provisional.limitRetry->accepted &&
+                                     provisional.limitRetry->exactPriorTableMatch &&
+                                     provisional.limitRetry->exhaustedBudget == "max_states" &&
+                                     provisional.limitRetry->initialFailures ==
+                                         std::vector{JumpTableFailure::AnalysisLimit} &&
+                                     provisional.limitRetry->retryFailures.empty();
+        const bool accepted =
+            provisional.selectedTable && provisional.automaticTable &&
+            (loopProof || exactLimitRetry) &&
+            JumpTableRecoveryTablesExactlyMatch(*provisional.selectedTable, candidate) &&
+            JumpTableRecoveryTablesExactlyMatch(*provisional.automaticTable, candidate);
+        if (accepted) {
+          if (iterationStats.unresolvedSites > 0)
+            --iterationStats.unresolvedSites;
+          ++iterationStats.recoveredTables;
+          analysis = std::move(provisional);
+        } else if (analysis.dataflow) {
+          std::string failures;
+          for (auto failure : provisional.failures) {
+            if (!failures.empty())
+              failures += '+';
+            failures += JumpTableFailureName(failure);
+          }
+          analysis.dataflow->rejectionEvidence.push_back(
+              "provisional_inline_case_expansion:" +
+              (failures.empty() ? std::string("exact_case_loop_not_proven") : failures));
+          pendingInlineBootstraps.push_back(
+              {.analysisIndex = analyses.size(), .site = site, .candidate = candidate});
+        }
+      }
+      if (!analysis.selectedTable && previous != selectedTables.end() &&
+          previous->second.origin == JumpTableOrigin::Automatic) {
+        // A case-expanded CFG can expose a disconnected prior case root, but
+        // that diagnostic alone is not a proof that every newly reachable path
+        // preserves the table's bound and dataflow semantics. Only the normal
+        // analyzer or its exact-table maxStates retry may retain an automatic
+        // table. Quarantine every failed reanalysis so an incompatible or
+        // unguarded backedge cannot be masked by the prior validation.
+        rejectedAutomaticSites.insert(site);
+        rejectionReasons[site] = analysis.failures;
+        rejectionDataflow[site] = analysis.dataflow;
+        rejectionLoopEvidence[site] = analysis.loopEvidence;
+        rejectionLimitRetry[site] = analysis.limitRetry;
+      }
+      if (rejectedAutomaticSites.contains(site) && analysis.selectedTable &&
+          analysis.selectedTable->origin == JumpTableOrigin::Automatic) {
+        if (analysis.automaticTable) {
+          analysis.automaticTable->confidence = "rejected_after_cfg_expansion";
+          for (auto failure : rejectionReasons[site])
+            analysis.automaticTable->conflicts.push_back(JumpTableFailureName(failure));
+        }
+        analysis.selectedTable.reset();
+        analysis.failures = rejectionReasons[site];
+        analysis.classification = IndirectSiteClassification::ComputedTailBctr;
+        analysis.dataflow = rejectionDataflow[site];
+        analysis.loopEvidence = rejectionLoopEvidence[site];
+        analysis.limitRetry = rejectionLimitRetry[site];
+      }
+      if (analysis.selectedTable) {
+        nextTables[site] = *analysis.selectedTable;
+      }
+      FinalizeJumpTableSiteDisposition(analysis);
+      analyses.push_back(std::move(analysis));
+    }
+
+    // Some compiler-generated owners contain a mutually dependent group of
+    // self-delimiting inline tables: each complete report-only candidate is
+    // needed only to expose blocks that let every member undergo ordinary
+    // exact reanalysis. Bootstrap the complete group together, but make the
+    // group atomic—one failure leaves every candidate report-only. This avoids
+    // a one-target-at-a-time recovery loop without granting authority to any
+    // provisional edge or partial table.
+    if (pendingInlineBootstraps.size() > 1) {
+      auto batchTables = selectedTables;
+      for (const auto& pending : pendingInlineBootstraps)
+        batchTables.emplace(pending.site, pending.candidate);
+
+      const auto batchCfgStarted = Clock::now();
+      auto batchBlocks = discoverBlocksPass(decoded, entryPoint, containingRegion, knownFunctions,
+                                            pdataSize, &batchTables);
+      aggregate.caseExpansionCfgMicroseconds += elapsedMicroseconds(batchCfgStarted);
+
+      std::vector<IndirectSiteAnalysis> batchAnalyses;
+      batchAnalyses.reserve(pendingInlineBootstraps.size());
+      bool batchAccepted = true;
+      for (const auto& pending : pendingInlineBootstraps) {
+        JumpTableRecoveryInput batchInput;
+        batchInput.site = pending.site;
+        batchInput.ownerAddress = entryPoint;
+        if (pdataSize != 0 && pdataSize <= std::numeric_limits<uint32_t>::max() - entryPoint)
+          batchInput.trustedOwnerEnd = entryPoint + pdataSize;
+        batchInput.preliminaryBlocks = batchBlocks.blocks;
+        batchInput.containingRegion = &containingRegion;
+        batchInput.independentlyCallableEntries = &knownFunctions;
+        // The provisional group is authority only for block discovery. The
+        // storage-only revalidation consumes the resulting ordinary CFG, not
+        // synthetic edges from either provisional or previously selected
+        // tables; those edges are runtime-domain evidence only when a separate
+        // inherited-domain proof requests them.
+        batchInput.validatedOwnerTables = nullptr;
+        if (entryRegisterDomainsBySite) {
+          const auto domains = entryRegisterDomainsBySite->find(pending.site);
+          if (domains != entryRegisterDomainsBySite->end())
+            batchInput.entryRegisterDomains = &domains->second;
+        }
+        batchInput.priorAutomaticTable = &pending.candidate;
+        batchInput.limits = limits;
+
+        JumpTableRecoveryStats batchStats;
+        auto batchAnalysis =
+            AnalyzeIndirectSiteWithPriorLimitRetry(decoded, batchInput, &batchStats);
+        iterationStats.elapsedMicroseconds += batchStats.elapsedMicroseconds;
+        iterationStats.decodedInstructions += batchStats.decodedInstructions;
+        iterationStats.analysisLimitHit =
+            iterationStats.analysisLimitHit || batchStats.analysisLimitHit;
+
+        const bool loopProof =
+            batchAnalysis.dataflow &&
+            std::any_of(batchAnalysis.dataflow->boundCandidates.begin(),
+                        batchAnalysis.dataflow->boundCandidates.end(), [](const auto& bound) {
+                          return bound.selfDelimitedInlineTableExtent &&
+                                 bound.inlineCaseLoopCfgVerified;
+                        });
+        const bool exactLimitRetry = batchAnalysis.limitRetry &&
+                                     batchAnalysis.limitRetry->accepted &&
+                                     batchAnalysis.limitRetry->exactPriorTableMatch &&
+                                     batchAnalysis.limitRetry->exhaustedBudget == "max_states" &&
+                                     batchAnalysis.limitRetry->initialFailures ==
+                                         std::vector{JumpTableFailure::AnalysisLimit} &&
+                                     batchAnalysis.limitRetry->retryFailures.empty();
+        const bool exact =
+            batchAnalysis.selectedTable && batchAnalysis.automaticTable &&
+            (loopProof || exactLimitRetry) &&
+            JumpTableRecoveryTablesExactlyMatch(*batchAnalysis.selectedTable, pending.candidate) &&
+            JumpTableRecoveryTablesExactlyMatch(*batchAnalysis.automaticTable, pending.candidate);
+        batchAccepted = batchAccepted && exact;
+        batchAnalyses.push_back(std::move(batchAnalysis));
+      }
+
+      if (batchAccepted) {
+        for (size_t index = 0; index < pendingInlineBootstraps.size(); ++index) {
+          const auto& pending = pendingInlineBootstraps[index];
+          if (iterationStats.unresolvedSites > 0)
+            --iterationStats.unresolvedSites;
+          ++iterationStats.recoveredTables;
+          nextTables[pending.site] = *batchAnalyses[index].selectedTable;
+          analyses[pending.analysisIndex] = std::move(batchAnalyses[index]);
+          rejectedAutomaticSites.erase(pending.site);
+          rejectionReasons.erase(pending.site);
+          rejectionDataflow.erase(pending.site);
+          rejectionLoopEvidence.erase(pending.site);
+          rejectionLimitRetry.erase(pending.site);
+          FinalizeJumpTableSiteDisposition(analyses[pending.analysisIndex]);
+        }
+      } else {
+        for (size_t index = 0; index < pendingInlineBootstraps.size(); ++index) {
+          auto& original = analyses[pendingInlineBootstraps[index].analysisIndex];
+          if (!original.dataflow)
+            continue;
+          std::string failures;
+          for (auto failure : batchAnalyses[index].failures) {
+            if (!failures.empty())
+              failures += '+';
+            failures += JumpTableFailureName(failure);
+          }
+          std::string budgets;
+          if (batchAnalyses[index].dataflow) {
+            for (const auto& exhausted : batchAnalyses[index].dataflow->exhaustedBudgets) {
+              if (!budgets.empty())
+                budgets += '+';
+              budgets += exhausted.budget + ':' + std::to_string(exhausted.limit) + ':' +
+                         std::to_string(exhausted.observed);
+            }
+          }
+          std::string retry;
+          if (batchAnalyses[index].limitRetry) {
+            retry =
+                ":retry=" + std::to_string(batchAnalyses[index].limitRetry->initialBudgetValue) +
+                "->" + std::to_string(batchAnalyses[index].limitRetry->retryBudgetValue) +
+                ":accepted=" + std::to_string(batchAnalyses[index].limitRetry->accepted) +
+                ":exact=" + std::to_string(batchAnalyses[index].limitRetry->exactPriorTableMatch) +
+                ":retry_failures=";
+            for (auto failure : batchAnalyses[index].limitRetry->retryFailures) {
+              if (!retry.ends_with('='))
+                retry += '+';
+              retry += JumpTableFailureName(failure);
+            }
+            retry += ":retry_exhausted=";
+            bool firstRetryBudget = true;
+            for (const auto& exhausted : batchAnalyses[index].limitRetry->retryExhaustedBudgets) {
+              if (!firstRetryBudget)
+                retry += '+';
+              firstRetryBudget = false;
+              retry += exhausted.budget + ':' + std::to_string(exhausted.limit) + ':' +
+                       std::to_string(exhausted.observed);
+            }
+          }
+          original.dataflow->rejectionEvidence.push_back(
+              "provisional_inline_batch_expansion:" +
+              (failures.empty() ? std::string("group_not_exact") : failures) +
+              (budgets.empty() ? std::string() : ":budgets=" + budgets) + retry);
+          FinalizeJumpTableSiteDisposition(original);
+        }
+      }
+    }
+
+    const auto fixpointOverheadStarted = Clock::now();
+    aggregate.elapsedMicroseconds += iterationStats.elapsedMicroseconds;
+    aggregate.decodedInstructions += iterationStats.decodedInstructions;
+    aggregate.analysisLimitHit = aggregate.analysisLimitHit || iterationStats.analysisLimitHit;
+    aggregate.fixpointIterations = iteration;
+    result.indirectSites = std::move(analyses);
+    bool changed = selectedTables.size() != nextTables.size();
+    if (!changed) {
+      for (const auto& [site, table] : selectedTables) {
+        auto next = nextTables.find(site);
+        if (next == nextTables.end() || next->second.targets != table.targets ||
+            next->second.tableAddress != table.tableAddress ||
+            next->second.origin != table.origin) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    selectedTables = std::move(nextTables);
+    aggregate.fixpointOverheadMicroseconds += elapsedMicroseconds(fixpointOverheadStarted);
+
+    if (!changed) {
+      aggregate.indirectSites = static_cast<uint32_t>(result.indirectSites.size());
+      aggregate.recoveredTables = static_cast<uint32_t>(std::count_if(
+          result.indirectSites.begin(), result.indirectSites.end(), [](const auto& site) {
+            return site.selectedTable && site.selectedTable->origin == JumpTableOrigin::Automatic;
+          }));
+      aggregate.manualTables = static_cast<uint32_t>(std::count_if(
+          result.indirectSites.begin(), result.indirectSites.end(), [](const auto& site) {
+            return site.selectedTable && site.selectedTable->origin == JumpTableOrigin::Manual;
+          }));
+      aggregate.unresolvedSites = static_cast<uint32_t>(std::count_if(
+          result.indirectSites.begin(), result.indirectSites.end(), [](const auto& site) {
+            return site.usesCtr && !site.link && !site.selectedTable.has_value();
+          }));
+      aggregate.functionFixpointMicroseconds = elapsedMicroseconds(functionStarted);
+      result.jumpTableRecovery = aggregate;
+      result.jumpTableLimits = limits;
+      result.preliminaryBlocks = std::move(preliminaryBlocks);
+      return result;
+    }
+  }
+
+  aggregate.analysisLimitHit = true;
+  aggregate.functionFixpointMicroseconds = elapsedMicroseconds(functionStarted);
+  result.jumpTableRecovery = aggregate;
+  result.jumpTableLimits = limits;
+  result.preliminaryBlocks = std::move(preliminaryBlocks);
+  for (auto& site : result.indirectSites) {
+    if (site.dataflow) {
+      const JumpTableBudgetExhaustionEvidence exhaustion{"function_fixpoint_iterations",
+                                                         limits.maxFixpointIterations,
+                                                         limits.maxFixpointIterations + 1};
+      const auto existing = std::find_if(
+          site.dataflow->exhaustedBudgets.begin(), site.dataflow->exhaustedBudgets.end(),
+          [&](const auto& candidate) { return candidate.budget == exhaustion.budget; });
+      if (existing == site.dataflow->exhaustedBudgets.end())
+        site.dataflow->exhaustedBudgets.push_back(exhaustion);
+      if (std::find(site.dataflow->rejectionEvidence.begin(),
+                    site.dataflow->rejectionEvidence.end(),
+                    "function_fixpoint_limit") == site.dataflow->rejectionEvidence.end()) {
+        site.dataflow->rejectionEvidence.push_back("function_fixpoint_limit");
+      }
+    }
+    if (std::find(site.failures.begin(), site.failures.end(), JumpTableFailure::AnalysisLimit) ==
+        site.failures.end()) {
+      site.failures.push_back(JumpTableFailure::AnalysisLimit);
+    }
+    FinalizeJumpTableSiteDisposition(site);
+  }
   return result;
 }
 

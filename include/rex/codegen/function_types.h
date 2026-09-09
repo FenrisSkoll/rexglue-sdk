@@ -243,11 +243,372 @@ struct Block {
 // Jump Table
 //=============================================================================
 
+enum class IndirectSiteClassification : uint8_t {
+  SwitchBctr,
+  ComputedTailBctr,
+  VirtualOrCallbackBctrl,
+  IndirectTailBctrlOrBctr,
+  OrdinaryBlrReturn,
+  NonstandardBclr,
+  OpaqueIndirectTransfer,
+};
+
+enum class JumpTableFailure : uint8_t {
+  None,
+  MissingBound,
+  AmbiguousBound,
+  UnknownTableBase,
+  UnknownIndex,
+  AmbiguousReachingDefinition,
+  UnsupportedRelativeForm,
+  InvalidElementWidth,
+  TargetOutOfRange,
+  TargetUnaligned,
+  MixedValidityTargets,
+  AnalysisLimit,
+  NonSwitchIndirect,
+};
+
+enum class JumpTableKind : uint8_t {
+  Unknown,
+  AbsolutePointer,
+  RelativeOffset,
+};
+
+enum class JumpTableOrigin : uint8_t {
+  Automatic,
+  Manual,
+};
+
+enum class JumpTableSwitchLikelihood : uint8_t {
+  ResolvedSwitch,
+  ConfirmedSwitchMiss,
+  ProbableSwitchMiss,
+  PlausibleSwitchCandidate,
+  VirtualOrCallbackDispatch,
+  ComputedTailDispatch,
+  OpaqueNonTableDispatch,
+  InsufficientStaticEvidence,
+  RejectedFalsePositive,
+};
+
+enum class JumpTableManualComparison : uint8_t {
+  None,
+  ExactEquivalent,
+  AutomaticSuperset,
+  AutomaticSubset,
+  ConflictingTargets,
+  ConflictingBounds,
+  UnsupportedManualForm,
+  NewAutomaticTable,
+};
+
+const char* IndirectSiteClassificationName(IndirectSiteClassification classification);
+const char* JumpTableFailureName(JumpTableFailure failure);
+const char* JumpTableKindName(JumpTableKind kind);
+const char* JumpTableOriginName(JumpTableOrigin origin);
+const char* JumpTableManualComparisonName(JumpTableManualComparison comparison);
+const char* JumpTableSwitchLikelihoodName(JumpTableSwitchLikelihood classification);
+
+struct JumpTableRawEntry {
+  uint32_t storageAddress = 0;
+  uint32_t rawValue = 0;
+  uint32_t target = 0;
+
+  bool operator==(const JumpTableRawEntry&) const = default;
+};
+
+struct JumpTableInstructionEvidence {
+  uint32_t address = 0;
+  uint32_t rawInstruction = 0;
+  std::string role;
+  std::string instruction;
+};
+
 struct JumpTable {
-  uint32_t bctrAddress;           // Address of bctr instruction
-  uint32_t tableAddress;          // Address of jump table data
-  uint8_t indexRegister;          // Register holding switch index
+  uint32_t bctrAddress = 0;       // Address of bctr instruction
+  uint32_t tableAddress = 0;      // Address of jump table data
+  uint8_t indexRegister = 0xFF;   // Register holding unscaled switch index
   std::vector<uint32_t> targets;  // Resolved case targets (internal labels)
+
+  // Recovery evidence. Manual tables need only the compatibility fields above;
+  // automatic tables fill the complete model before they can affect ownership.
+  JumpTableKind kind = JumpTableKind::Unknown;
+  JumpTableOrigin origin = JumpTableOrigin::Automatic;
+  JumpTableManualComparison manualComparison = JumpTableManualComparison::None;
+  uint32_t ownerAddress = 0;
+  uint32_t storageEnd = 0;
+  uint32_t boundValue = 0;
+  // False when boundValue describes only a finite storage extent. Consumers
+  // must not turn that value into a runtime index-domain proof.
+  bool boundValueIsFiniteIndexDomain = true;
+  uint32_t caseCount = 0;
+  uint32_t defaultTarget = 0;
+  uint32_t anchorAddress = 0;
+  uint32_t targetScale = 1;
+  uint8_t elementWidth = 0;
+  bool elementSigned = false;
+  bool boundInclusive = false;
+  bool defaultIsReturn = false;
+  bool tableInExecutableSection = false;
+  std::string boundSemantics;
+  std::string confidence;
+  std::vector<JumpTableRawEntry> rawEntries;
+  std::vector<JumpTableInstructionEvidence> evidence;
+  std::vector<std::string> conflicts;
+};
+
+struct JumpTableBudgetExhaustionEvidence {
+  std::string budget;
+  uint32_t limit = 0;
+  uint32_t observed = 0;
+};
+
+struct JumpTableLimitRetryEvidence {
+  std::string exhaustedBudget;
+  uint32_t initialBudgetValue = 0;
+  uint32_t retryBudgetValue = 0;
+  std::vector<JumpTableFailure> initialFailures;
+  std::vector<JumpTableFailure> retryFailures;
+  std::vector<JumpTableBudgetExhaustionEvidence> initialExhaustedBudgets;
+  std::vector<JumpTableBudgetExhaustionEvidence> retryExhaustedBudgets;
+  bool exactPriorTableMatch = false;
+  bool accepted = false;
+};
+
+struct JumpTableLoopEvidence {
+  uint8_t registerIndex = 0xFF;
+  uint32_t headerAddress = 0;
+  std::vector<uint32_t> entryDefinitionAddresses;
+  std::vector<uint32_t> backedgeDefinitionAddresses;
+  std::vector<uint32_t> entryValues;
+  std::vector<uint32_t> backedgeValues;
+  std::vector<uint32_t> finiteValues;
+  bool identityBackedge = false;
+  bool finiteEntryDomain = false;
+  bool converged = false;
+};
+
+struct JumpTableCfgEdgeEvidence {
+  uint32_t source = 0;
+  uint32_t target = 0;
+
+  bool operator==(const JumpTableCfgEdgeEvidence&) const = default;
+};
+
+// A finite argument-domain proof at one direct callsite. This is deliberately
+// separate from callable-entry discovery: it constrains a register value at an
+// already trusted function entry and never makes an address callable.
+struct JumpTableEntryCallsiteDomainEvidence {
+  uint32_t callerAddress = 0;
+  uint32_t callAddress = 0;
+  uint32_t targetAddress = 0;
+  uint32_t compareAddress = 0;
+  uint32_t guardAddress = 0;
+  uint8_t registerIndex = 0xFF;
+  std::vector<uint32_t> definitionAddresses;
+  std::vector<uint32_t> finiteValues;
+  // The caller CFG supplied to the proof may include only ordinary entry
+  // reachability or additional edges from independently validated local jump
+  // tables. This provenance never makes a target callable and never replaces
+  // the complete inbound-reference/domain checks below.
+  std::string callerCfgKind;
+  std::vector<uint32_t> callerCfgJumpTableSites;
+  bool reachableOnlyAfterCaseExpansion = false;
+  std::string proofKind;
+  std::vector<std::string> rejections;
+  std::string exhaustedBudget;
+  uint32_t budgetLimit = 0;
+  uint32_t budgetObserved = 0;
+  bool complete = false;
+  bool limitHit = false;
+};
+
+// Whole-image evidence that every supported static inbound reference to an
+// existing trusted entry is accounted for and supplies a finite register
+// domain. A production switch may consume this only after the union is proven
+// dense and the register is preserved from entry to dispatch.
+struct JumpTableEntryRegisterDomainEvidence {
+  uint32_t entryAddress = 0;
+  uint8_t registerIndex = 0xFF;
+  std::vector<uint32_t> finiteValues;
+  std::vector<uint32_t> directCallSites;
+  std::vector<uint32_t> rejectedReferenceSites;
+  std::vector<std::string> referenceRejections;
+  std::vector<JumpTableEntryCallsiteDomainEvidence> callsites;
+  bool allReferencesDirectCalls = false;
+  bool finiteDenseDomain = false;
+  std::string rejection;
+};
+
+using JumpTableEntryRegisterDomainMap =
+    std::unordered_map<uint8_t, JumpTableEntryRegisterDomainEvidence>;
+using JumpTableEntryRegisterDomainsBySite =
+    std::unordered_map<uint32_t, JumpTableEntryRegisterDomainMap>;
+
+struct JumpTableBoundCandidateEvidence {
+  uint32_t compareAddress = 0;
+  uint32_t guardAddress = 0;
+  uint32_t domainOriginAddress = 0;
+  uint32_t value = 0;
+  uint32_t caseCount = 0;
+  uint32_t defaultTarget = 0;
+  uint8_t indexRegister = 0xFF;
+  bool inclusive = false;
+  bool signedCompare = false;
+  bool defaultIsReturn = false;
+  bool dominatesDispatch = false;
+  bool finiteDenseDomain = false;
+  bool priorExactRevalidation = false;
+  bool priorDirectBoundedIndexRevalidation = false;
+  bool inheritedCaseEdgeProof = false;
+  // Exact finite values carried by validated upstream switch edges into this
+  // downstream dispatch. This is control-flow evidence, not runtime-derived
+  // table-length evidence and never makes a case target callable.
+  bool inheritedFiniteCaseDomain = false;
+  bool finiteCfgDomain = false;
+  bool interproceduralEntryDomain = false;
+  // A static table-extent proof, deliberately distinct from a runtime index
+  // domain. For the supported compiler idiom the absolute word table starts
+  // immediately after a non-fallthrough bctr and ends exactly at its earliest
+  // validated case block. This never claims that an observed runtime edge or
+  // the first invalid word bounds the table.
+  bool selfDelimitedInlineTableExtent = false;
+  uint32_t tableStorageStart = 0;
+  uint32_t tableStorageEnd = 0;
+  bool inlineBoundaryCfgVerified = false;
+  uint32_t inlineBoundaryBlockStart = 0;
+  uint32_t inlineBoundaryBlockEnd = 0;
+  uint32_t inlineBoundaryTerminator = 0;
+  // A report-only self-delimited candidate may be used once to expose its
+  // own case blocks. Recovery is authoritative only when one of those case
+  // blocks has an ordinary CFG path back to the dispatch and reanalysis
+  // reproduces the complete candidate exactly. This proves state-machine
+  // topology; it deliberately does not prove a finite runtime index domain.
+  bool inlineCaseLoopCfgVerified = false;
+  uint32_t inlineCaseLoopTarget = 0;
+  uint32_t inlineCaseLoopHeader = 0;
+  std::vector<uint32_t> finiteValues;
+  std::vector<uint32_t> normalizedFiniteValues;
+  std::vector<JumpTableCfgEdgeEvidence> inheritedCaseEdges;
+  uint32_t stackSpillAddress = 0;
+  uint32_t stackReloadAddress = 0;
+  int32_t stackSlotOffset = 0;
+  uint8_t stackSlotWidth = 0;
+  std::string rejection;
+};
+
+struct JumpTableReachingDefinitionPathEvidence {
+  uint8_t registerIndex = 0xFF;
+  uint32_t mergeAddress = 0;
+  uint32_t predecessor = 0;
+  uint32_t loopHeader = 0;
+  bool backedge = false;
+  bool limitHit = false;
+  std::string expression;
+  std::string normalizedExpression;
+  std::string disposition;
+};
+
+struct JumpTableDiagnosticProbe {
+  bool attempted = false;
+  bool reportOnly = true;
+  bool hypothesisComplete = false;
+  bool allTargetsValid = false;
+  bool mixedValidity = false;
+  uint32_t decodedEntries = 0;
+  uint32_t alignedExecutableTargets = 0;
+  std::vector<std::string> assumptions;
+  std::vector<std::string> rejections;
+  std::optional<JumpTable> candidateTable;
+};
+
+struct JumpTableSiteDataflowEvidence {
+  uint32_t preliminaryBlockStart = 0;
+  uint32_t preliminaryBlockEnd = 0;
+  std::vector<uint32_t> predecessors;
+  bool caseExpandedCfg = false;
+  std::vector<JumpTableCfgEdgeEvidence> caseExpansionEdges;
+  bool sourceInScc = false;
+  bool reachingDefinitionInScc = false;
+  std::vector<uint32_t> loopHeaders;
+  std::vector<JumpTableCfgEdgeEvidence> backedges;
+  std::vector<uint8_t> loopCarriedRegisters;
+  uint8_t ctrSourceRegister = 0xFF;
+  std::string targetExpression;
+  std::string normalizedTargetExpression;
+  std::vector<std::string> reachingDefinitionAlternatives;
+  std::vector<std::string> normalizedReachingDefinitions;
+  std::vector<JumpTableReachingDefinitionPathEvidence> reachingDefinitionPaths;
+  std::vector<uint32_t> tableBaseCandidates;
+  std::vector<uint32_t> anchorCandidates;
+  uint8_t indexRegister = 0xFF;
+  // ABI input registers that occur in the primary table load's address
+  // expression. This is distinct from indexRegister, which may be the PPC
+  // load's already-scaled RB scratch register.
+  std::vector<uint8_t> tableLoadInputRegisters;
+  std::vector<std::string> indexTransformChain;
+  uint8_t elementWidth = 0;
+  std::string elementSignedness = "unknown";
+  uint32_t targetScale = 0;
+  std::vector<JumpTableBoundCandidateEvidence> boundCandidates;
+  std::vector<JumpTableEntryRegisterDomainEvidence> entryRegisterDomains;
+  std::string tableKindHypothesis = "unknown";
+  std::string tableBaseConstruction = "unknown";
+  std::string mergeShape = "unknown";
+  std::string failureStage = "none";
+  std::string dispatchKind = "other";
+  std::string clusterId;
+  JumpTableSwitchLikelihood switchLikelihood =
+      JumpTableSwitchLikelihood::InsufficientStaticEvidence;
+  std::vector<std::string> rejectionEvidence;
+  std::vector<JumpTableBudgetExhaustionEvidence> exhaustedBudgets;
+  JumpTableDiagnosticProbe diagnosticProbe;
+};
+
+struct IndirectSiteAnalysis {
+  uint32_t site = 0;
+  uint32_t ownerAddress = 0;
+  bool link = false;
+  bool conditional = false;
+  bool usesCtr = false;
+  IndirectSiteClassification classification = IndirectSiteClassification::OpaqueIndirectTransfer;
+  std::vector<JumpTableFailure> failures;
+  std::vector<JumpTableInstructionEvidence> evidence;
+  std::optional<JumpTable> automaticTable;
+  std::optional<JumpTable> selectedTable;
+  std::optional<JumpTableLimitRetryEvidence> limitRetry;
+  std::vector<JumpTableLoopEvidence> loopEvidence;
+  // Whole-image census evidence is only needed for non-link CTR transfers.
+  // Keep it out of the hot, frequently moved record for ordinary returns and
+  // share it across the graph-to-report copy made by entrypoint closure.
+  std::shared_ptr<JumpTableSiteDataflowEvidence> dataflow;
+  bool incompleteCaseEntryPaths = false;
+};
+
+struct JumpTableRecoveryLimits {
+  uint32_t maxBackwardInstructions = 96;
+  uint32_t maxPredecessors = 64;
+  uint32_t maxStates = 128;
+  uint32_t maxCfgTopologyNodes = 65536;
+  uint32_t maxEntries = 4096;
+  uint32_t maxFixpointIterations = 16;
+};
+
+struct JumpTableRecoveryStats {
+  uint64_t elapsedMicroseconds = 0;
+  uint64_t preliminaryCfgMicroseconds = 0;
+  uint64_t caseExpansionCfgMicroseconds = 0;
+  uint64_t indirectSiteClassificationMicroseconds = 0;
+  uint64_t fixpointOverheadMicroseconds = 0;
+  uint64_t functionFixpointMicroseconds = 0;
+  uint64_t decodedInstructions = 0;
+  uint32_t fixpointIterations = 0;
+  uint32_t indirectSites = 0;
+  uint32_t recoveredTables = 0;
+  uint32_t manualTables = 0;
+  uint32_t unresolvedSites = 0;
+  bool analysisLimitHit = false;
 };
 
 //=============================================================================

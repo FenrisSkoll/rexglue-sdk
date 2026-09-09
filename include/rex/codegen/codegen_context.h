@@ -45,6 +45,16 @@ struct FunctionConfig;
  * Separates analysis state from user-provided config.
  */
 struct AnalysisState {
+  struct StageTimings {
+    uint64_t decodeMicroseconds = 0;
+    uint64_t registerMicroseconds = 0;
+    uint64_t scanMicroseconds = 0;
+    uint64_t discoverMicroseconds = 0;
+    uint64_t gapFillMicroseconds = 0;
+    uint64_t mergeMicroseconds = 0;
+    uint64_t validateMicroseconds = 0;
+  } stageTimings;
+
   // Binary-derived (set once from BinaryView)
   std::string format;        ///< "xex" or "elf"
   uint64_t loadAddress = 0;  ///< Image base address
@@ -71,6 +81,12 @@ struct AnalysisState {
   std::unordered_set<uint32_t> knownIndirectCalls;             ///< bctr addresses
   std::vector<uint32_t> exceptionHandlerFuncs;                 ///< Handler addresses
   std::vector<uint32_t> ehDiscoveredFuncs;                     ///< EH-discovered function addresses
+
+  // Production jump-table pass measurements and safety status. The detailed,
+  // per-site evidence is owned by FunctionNode so codegen and report-only
+  // consumers see the same decisions.
+  JumpTableRecoveryStats jumpTableRecovery;
+  JumpTableRecoveryLimits jumpTableLimits;
 };
 
 /**

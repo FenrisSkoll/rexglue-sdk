@@ -13,9 +13,11 @@ set(CODEGEN_CORE_SOURCES
     config.cpp
     function_graph.cpp
     function_scanner.cpp
+    jump_table_recovery.cpp
     sig_scanner.cpp
     vtable_scanner.cpp
     binary_view.cpp
+    entrypoint_closure.cpp
     instruction_dispatch.cpp
     test_support.cpp
     codegen_context.cpp
@@ -114,4 +116,3 @@ target_link_libraries(rexcodegen
         xxHash::xxhash
         simde
 )
-

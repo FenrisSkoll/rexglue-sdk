@@ -12,9 +12,17 @@
 #include "codegen_flags.h"
 #include "decoded_binary.h"
 #include <rex/codegen/function_scanner.h>
+#include <rex/codegen/jump_table_recovery.h>
 
+#include <algorithm>
 #include <array>
 #include <bitset>
+#include <chrono>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <rex/codegen/phases.h>
@@ -35,12 +43,317 @@ namespace rex::codegen {
 
 namespace {
 
+struct EntryReferenceSet {
+  std::vector<uint32_t> directCallSites;
+  std::vector<uint32_t> rejectedReferenceSites;
+  std::vector<std::string> referenceRejections;
+};
+
+struct CallerCfgEvidence {
+  std::vector<Block> preliminaryBlocks;
+  std::vector<Block> expandedBlocks;
+  std::vector<uint32_t> jumpTableSites;
+  bool expansionAttempted = false;
+};
+
+bool BlocksContain(std::span<const Block> blocks, uint32_t address) {
+  return std::any_of(blocks.begin(), blocks.end(),
+                     [address](const Block& block) { return block.contains(address); });
+}
+
+bool SupportsEntryRegisterDomain(FunctionAuthority authority) {
+  return authority == FunctionAuthority::PDATA || authority == FunctionAuthority::CONFIG ||
+         authority == FunctionAuthority::DISCOVERED;
+}
+
+bool IsDenseZeroBased(const std::vector<uint32_t>& values) {
+  if (values.empty())
+    return false;
+  for (size_t index = 0; index < values.size(); ++index) {
+    if (values[index] != index)
+      return false;
+  }
+  return true;
+}
+
+class EntryRegisterDomainAnalyzer {
+ public:
+  EntryRegisterDomainAnalyzer(CodegenContext& ctx,
+                              const std::unordered_set<uint32_t>& knownFunctions)
+      : ctx_(ctx), knownFunctions_(knownFunctions) {
+    BuildReferenceIndex();
+  }
+
+  JumpTableEntryRegisterDomainEvidence Analyze(uint32_t entryAddress, uint8_t registerIndex,
+                                               const JumpTableRecoveryLimits& limits) {
+    JumpTableEntryRegisterDomainEvidence output;
+    output.entryAddress = entryAddress;
+    output.registerIndex = registerIndex;
+    const auto reject = [&](std::string reason) {
+      if (output.rejection.empty())
+        output.rejection = std::move(reason);
+    };
+
+    const auto* entry = ctx_.graph.getFunction(entryAddress);
+    if (!entry || !SupportsEntryRegisterDomain(entry->authority())) {
+      reject("entry_is_not_trusted_immutable_callable");
+      return output;
+    }
+    if (entryAddress == ctx_.binary().entryPoint()) {
+      reject("entry_is_image_entrypoint");
+      return output;
+    }
+
+    const auto found = references_.find(entryAddress);
+    if (found == references_.end()) {
+      reject("entry_has_no_static_inbound_references");
+      return output;
+    }
+    const auto& references = found->second;
+    output.directCallSites = references.directCallSites;
+    output.rejectedReferenceSites = references.rejectedReferenceSites;
+    output.referenceRejections = references.referenceRejections;
+    if (references.directCallSites.empty()) {
+      reject(references.rejectedReferenceSites.empty()
+                 ? "entry_has_no_direct_call_references"
+                 : "entry_has_only_non_call_or_address_escape_references");
+      return output;
+    }
+    if (!references.rejectedReferenceSites.empty()) {
+      reject("entry_has_non_call_or_address_escape_reference");
+      return output;
+    }
+    output.allReferencesDirectCalls = true;
+
+    std::set<uint32_t> finiteValues;
+    bool allCallsitesComplete = true;
+    for (uint32_t callAddress : references.directCallSites) {
+      const auto* caller = ctx_.graph.getFunctionContaining(callAddress);
+      JumpTableEntryCallsiteDomainEvidence callsite;
+      callsite.callAddress = callAddress;
+      callsite.targetAddress = entryAddress;
+      callsite.registerIndex = registerIndex;
+      if (!caller || caller->authority() != FunctionAuthority::PDATA) {
+        callsite.rejections.push_back("caller_is_not_trusted_pdata");
+        output.callsites.push_back(std::move(callsite));
+        allCallsitesComplete = false;
+        continue;
+      }
+      callsite.callerAddress = caller->base();
+      const auto* callerCfg = CallerCfg(*caller, callAddress);
+      if (!callerCfg) {
+        callsite.rejections.push_back("caller_cfg_unavailable");
+        output.callsites.push_back(std::move(callsite));
+        allCallsitesComplete = false;
+        continue;
+      }
+      const bool preliminaryReachable = BlocksContain(callerCfg->preliminaryBlocks, callAddress);
+      const bool useExpanded = !preliminaryReachable && !callerCfg->expandedBlocks.empty();
+      const auto& analysisBlocks =
+          useExpanded ? callerCfg->expandedBlocks : callerCfg->preliminaryBlocks;
+      callsite = AnalyzeDirectCallArgumentDomain(ctx_.decoded(), analysisBlocks, caller->base(),
+                                                 callAddress, entryAddress, registerIndex, limits);
+      const bool caseExpanded = useExpanded && !callerCfg->jumpTableSites.empty();
+      callsite.callerCfgKind = caseExpanded ? "validated_case_expanded" : "preliminary";
+      if (caseExpanded)
+        callsite.callerCfgJumpTableSites = callerCfg->jumpTableSites;
+      callsite.reachableOnlyAfterCaseExpansion =
+          caseExpanded && BlocksContain(callerCfg->expandedBlocks, callAddress);
+      if (!callsite.complete && caseExpanded) {
+        for (auto& rejection : callsite.rejections) {
+          if (rejection == "callsite_not_reachable_in_preliminary_cfg")
+            rejection = "callsite_not_reachable_in_validated_case_expanded_cfg";
+        }
+      }
+      if (!callsite.complete) {
+        allCallsitesComplete = false;
+      } else {
+        finiteValues.insert(callsite.finiteValues.begin(), callsite.finiteValues.end());
+      }
+      output.callsites.push_back(std::move(callsite));
+    }
+
+    output.finiteValues.assign(finiteValues.begin(), finiteValues.end());
+    if (!allCallsitesComplete) {
+      reject("one_or_more_callsite_domains_incomplete");
+      return output;
+    }
+    if (output.finiteValues.size() > limits.maxEntries) {
+      reject("entry_domain_exceeds_entry_limit");
+      return output;
+    }
+    if (!IsDenseZeroBased(output.finiteValues)) {
+      reject("entry_domain_not_dense_zero_based");
+      return output;
+    }
+    output.finiteDenseDomain = true;
+    return output;
+  }
+
+ private:
+  void AddRejectedReference(uint32_t target, uint32_t site, std::string reason) {
+    auto& references = references_[target];
+    for (size_t index = 0; index < references.rejectedReferenceSites.size(); ++index) {
+      if (references.rejectedReferenceSites[index] == site &&
+          references.referenceRejections[index] == reason) {
+        return;
+      }
+    }
+    references.rejectedReferenceSites.push_back(site);
+    references.referenceRejections.push_back(std::move(reason));
+  }
+
+  bool IsPdataMetadataSlot(uint32_t storage) const {
+    const uint32_t start = ctx_.binary().exceptionDirectoryAddr();
+    const uint32_t size = ctx_.binary().exceptionDirectorySize();
+    return start != 0 && size >= 8 && storage >= start && storage < start + size &&
+           ((storage - start) % 8) == 0;
+  }
+
+  void BuildReferenceIndex() {
+    constexpr uint32_t kMaterializationWindow = 8;
+    for (const auto& section : ctx_.binary().sections()) {
+      if (!section.readable && !section.executable)
+        continue;
+      for (uint32_t offset = 0; offset + 4 <= section.size; offset += 4) {
+        const uint32_t address = section.baseAddress + offset;
+        if (section.readable) {
+          const uint32_t target = load_and_swap<uint32_t>(section.data + offset);
+          if (ctx_.binary().isExecutable(target) && !IsPdataMetadataSlot(address)) {
+            AddRejectedReference(target, address, "aligned_static_code_pointer_reference");
+          }
+        }
+        if (!section.executable)
+          continue;
+        const auto* instruction = ctx_.decoded().get(address);
+        if (!instruction)
+          continue;
+        if (instruction->branch_target && ctx_.binary().isExecutable(*instruction->branch_target)) {
+          auto& references = references_[*instruction->branch_target];
+          if (instruction->opcode == Opcode::bl) {
+            references.directCallSites.push_back(address);
+          } else {
+            AddRejectedReference(*instruction->branch_target, address, "non_call_branch_reference");
+          }
+        }
+        if (instruction->opcode != Opcode::lis)
+          continue;
+
+        const uint32_t highRaw = static_cast<uint32_t>(instruction->code);
+        const uint8_t highRegister = static_cast<uint8_t>((highRaw >> 21) & 0x1F);
+        const uint32_t highValue = (highRaw & 0xFFFF) << 16;
+        for (uint32_t distance = 1; distance <= kMaterializationWindow; ++distance) {
+          const uint32_t lowAddress = address + distance * 4;
+          if (lowAddress + 4 > section.end())
+            break;
+          const auto* low = ctx_.decoded().get(lowAddress);
+          if (!low)
+            break;
+          const uint32_t raw = static_cast<uint32_t>(low->code);
+          std::optional<uint32_t> value;
+          if (low->opcode == Opcode::addi && ((raw >> 16) & 0x1F) == highRegister) {
+            value = highValue + static_cast<int16_t>(raw & 0xFFFF);
+          } else if (low->opcode == Opcode::ori && ((raw >> 21) & 0x1F) == highRegister) {
+            value = highValue | (raw & 0xFFFF);
+          }
+          if (value && ctx_.binary().isExecutable(*value)) {
+            AddRejectedReference(*value, address, "bounded_code_address_materialization");
+          }
+          const auto writes = low->get_register_writes();
+          if (std::find(writes.begin(), writes.end(), highRegister) != writes.end())
+            break;
+        }
+      }
+    }
+
+    for (auto& [unused, references] : references_) {
+      std::sort(references.directCallSites.begin(), references.directCallSites.end());
+      references.directCallSites.erase(
+          std::unique(references.directCallSites.begin(), references.directCallSites.end()),
+          references.directCallSites.end());
+      std::vector<std::pair<uint32_t, std::string>> rejected;
+      for (size_t index = 0; index < references.rejectedReferenceSites.size(); ++index) {
+        rejected.emplace_back(references.rejectedReferenceSites[index],
+                              references.referenceRejections[index]);
+      }
+      std::sort(rejected.begin(), rejected.end());
+      references.rejectedReferenceSites.clear();
+      references.referenceRejections.clear();
+      for (auto& [site, reason] : rejected) {
+        references.rejectedReferenceSites.push_back(site);
+        references.referenceRejections.push_back(std::move(reason));
+      }
+    }
+  }
+
+  const CallerCfgEvidence* CallerCfg(const FunctionNode& caller, uint32_t callAddress) {
+    auto existing = callerBlocks_.find(caller.base());
+    if (existing == callerBlocks_.end()) {
+      CallerCfgEvidence evidence;
+      if (!caller.jumpTablePreliminaryBlocks().empty()) {
+        evidence.preliminaryBlocks = caller.jumpTablePreliminaryBlocks();
+      } else {
+        const auto size = ctx_.scan.pdataSizes.find(caller.base());
+        if (size == ctx_.scan.pdataSizes.end())
+          return nullptr;
+        const CodeRegion* region = nullptr;
+        for (const auto& candidate : ctx_.scan.codeRegions) {
+          if (candidate.contains(caller.base())) {
+            region = &candidate;
+            break;
+          }
+        }
+        if (!region)
+          return nullptr;
+
+        auto preliminary = discoverPreliminaryBlocks(ctx_.decoded(), caller.base(), *region,
+                                                     knownFunctions_, size->second);
+        if (preliminary.blocks.empty())
+          return nullptr;
+        evidence.preliminaryBlocks = std::move(preliminary.blocks);
+      }
+      existing = callerBlocks_.emplace(caller.base(), std::move(evidence)).first;
+    }
+
+    auto& evidence = existing->second;
+    if (BlocksContain(evidence.preliminaryBlocks, callAddress) || evidence.expansionAttempted)
+      return &evidence;
+
+    evidence.expansionAttempted = true;
+    const auto size = ctx_.scan.pdataSizes.find(caller.base());
+    const auto* region = ctx_.decoded().regionContaining(caller.base());
+    if (size == ctx_.scan.pdataSizes.end() || !region)
+      return &evidence;
+
+    // Analyze the caller locally through the ordinary jump-table fixpoint so a
+    // direct call reached only from an independently validated case edge is
+    // not mistaken for unreachable code. Do this even when the graph already
+    // contains a final caller CFG: that CFG could itself include a table whose
+    // proof consumed an interprocedural entry domain. No entry domains are
+    // supplied here, so caller expansion stands entirely on local/manual table
+    // evidence and cannot form a circular domain proof.
+    auto expanded = discoverBlocks(ctx_.decoded(), caller.base(), *region, knownFunctions_,
+                                   size->second, &ctx_.Config().switchTables);
+    evidence.expandedBlocks = std::move(expanded.blocks);
+    for (const auto& table : expanded.jumpTables)
+      evidence.jumpTableSites.push_back(table.bctrAddress);
+    std::sort(evidence.jumpTableSites.begin(), evidence.jumpTableSites.end());
+    return &evidence;
+  }
+
+  CodegenContext& ctx_;
+  std::unordered_set<uint32_t> knownFunctions_;
+  std::unordered_map<uint32_t, EntryReferenceSet> references_;
+  std::unordered_map<uint32_t, CallerCfgEvidence> callerBlocks_;
+};
+
 //=============================================================================
 // Discover Phase: iterative function block discovery
 //=============================================================================
 
 void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
-                      const std::unordered_set<uint32_t>& knownFunctions) {
+                      const std::unordered_set<uint32_t>& knownFunctions,
+                      EntryRegisterDomainAnalyzer* entryDomainAnalyzer) {
   auto& graph = ctx.graph;
   auto& binary = ctx.binary();
   auto& decoded = ctx.decoded();
@@ -98,14 +411,108 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
   auto result = discoverBlocks(decoded, funcAddr, *region, knownFunctions, pdataSize,
                                &ctx.Config().switchTables);
 
+  if (entryDomainAnalyzer && SupportsEntryRegisterDomain(node->authority())) {
+    std::set<uint8_t> candidateRegisters;
+    for (const auto& site : result.indirectSites) {
+      if (!site.dataflow || site.dataflow->tableBaseCandidates.size() != 1 ||
+          site.dataflow->tableLoadInputRegisters.size() != 1) {
+        continue;
+      }
+      if (std::find(site.failures.begin(), site.failures.end(), JumpTableFailure::MissingBound) !=
+          site.failures.end()) {
+        const uint8_t reg = site.dataflow->tableLoadInputRegisters.front();
+        if (reg >= 3 && reg <= 10)
+          candidateRegisters.insert(reg);
+      }
+    }
+    if (!candidateRegisters.empty()) {
+      JumpTableEntryRegisterDomainMap domainsByRegister;
+      for (uint8_t reg : candidateRegisters) {
+        domainsByRegister.emplace(
+            reg, entryDomainAnalyzer->Analyze(funcAddr, reg, result.jumpTableLimits));
+      }
+
+      JumpTableEntryRegisterDomainsBySite domainsBySite;
+      bool hasFiniteDomain = false;
+      for (const auto& site : result.indirectSites) {
+        if (!site.dataflow || site.dataflow->tableLoadInputRegisters.size() != 1 ||
+            std::find(site.failures.begin(), site.failures.end(), JumpTableFailure::MissingBound) ==
+                site.failures.end()) {
+          continue;
+        }
+        const uint8_t reg = site.dataflow->tableLoadInputRegisters.front();
+        const auto domain = domainsByRegister.find(reg);
+        if (domain == domainsByRegister.end())
+          continue;
+        domainsBySite[site.site].emplace(reg, domain->second);
+        hasFiniteDomain = hasFiniteDomain || domain->second.finiteDenseDomain;
+      }
+
+      if (hasFiniteDomain) {
+        auto initialStats = result.jumpTableRecovery;
+        result = discoverBlocks(decoded, funcAddr, *region, knownFunctions, pdataSize,
+                                &ctx.Config().switchTables, &domainsBySite);
+        // The second pass supplies the final census. Retain only work/timing
+        // from the diagnostic first pass so counts describe final site state.
+        result.jumpTableRecovery.elapsedMicroseconds += initialStats.elapsedMicroseconds;
+        result.jumpTableRecovery.preliminaryCfgMicroseconds +=
+            initialStats.preliminaryCfgMicroseconds;
+        result.jumpTableRecovery.caseExpansionCfgMicroseconds +=
+            initialStats.caseExpansionCfgMicroseconds;
+        result.jumpTableRecovery.indirectSiteClassificationMicroseconds +=
+            initialStats.indirectSiteClassificationMicroseconds;
+        result.jumpTableRecovery.fixpointOverheadMicroseconds +=
+            initialStats.fixpointOverheadMicroseconds;
+        result.jumpTableRecovery.functionFixpointMicroseconds +=
+            initialStats.functionFixpointMicroseconds;
+        result.jumpTableRecovery.decodedInstructions += initialStats.decodedInstructions;
+        result.jumpTableRecovery.analysisLimitHit =
+            result.jumpTableRecovery.analysisLimitHit || initialStats.analysisLimitHit;
+      } else {
+        // Rejected domains are report evidence only. Attaching them to their
+        // exact candidate sites avoids repeating CFG/recovery work that cannot
+        // change acceptance, while retaining the full failure vector.
+        for (auto& site : result.indirectSites) {
+          const auto siteDomains = domainsBySite.find(site.site);
+          if (siteDomains == domainsBySite.end() || !site.dataflow)
+            continue;
+          for (const auto& domain : siteDomains->second)
+            site.dataflow->entryRegisterDomains.push_back(domain.second);
+          FinalizeJumpTableSiteDisposition(site);
+        }
+      }
+    }
+  }
+
   if (result.blocks.empty()) {
     REXCODEGEN_WARN("Analyze: no blocks found for function 0x{:08X}", funcAddr);
     return;
   }
 
+  graph.setJumpTableRecoveryForFunction(funcAddr, std::move(result.indirectSites),
+                                        std::move(result.preliminaryBlocks));
+
   // snooper the function with the discovered blocks and instructions
   node->discover(std::move(result.blocks), std::move(result.instructions),
                  std::move(result.labels));
+  auto& recovery = ctx.analysisState().jumpTableRecovery;
+  ctx.analysisState().jumpTableLimits = result.jumpTableLimits;
+  recovery.elapsedMicroseconds += result.jumpTableRecovery.elapsedMicroseconds;
+  recovery.preliminaryCfgMicroseconds += result.jumpTableRecovery.preliminaryCfgMicroseconds;
+  recovery.caseExpansionCfgMicroseconds += result.jumpTableRecovery.caseExpansionCfgMicroseconds;
+  recovery.indirectSiteClassificationMicroseconds +=
+      result.jumpTableRecovery.indirectSiteClassificationMicroseconds;
+  recovery.fixpointOverheadMicroseconds += result.jumpTableRecovery.fixpointOverheadMicroseconds;
+  recovery.functionFixpointMicroseconds += result.jumpTableRecovery.functionFixpointMicroseconds;
+  recovery.decodedInstructions += result.jumpTableRecovery.decodedInstructions;
+  recovery.fixpointIterations =
+      std::max(recovery.fixpointIterations, result.jumpTableRecovery.fixpointIterations);
+  recovery.indirectSites += result.jumpTableRecovery.indirectSites;
+  recovery.recoveredTables += result.jumpTableRecovery.recoveredTables;
+  recovery.manualTables += result.jumpTableRecovery.manualTables;
+  recovery.unresolvedSites += result.jumpTableRecovery.unresolvedSites;
+  recovery.analysisLimitHit =
+      recovery.analysisLimitHit || result.jumpTableRecovery.analysisLimitHit;
 
   // Add jump tables (targets become labels in the function)
   for (const auto& jt : result.jumpTables) {
@@ -190,11 +597,17 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
   }
 }
 
+size_t DiscoverPendingFunctions(CodegenContext& ctx,
+                                const std::unordered_set<uint32_t>& knownFunctions,
+                                EntryRegisterDomainAnalyzer* entryDomainAnalyzer);
+
 void discoverAllFunctions(CodegenContext& ctx) {
   REXCODEGEN_TRACE("Analyze: starting iterative discovery...");
 
   auto& graph = ctx.graph;
   auto& binary = ctx.binary();
+  const auto initialKnownFunctions = buildKnownFunctions(graph);
+  EntryRegisterDomainAnalyzer entryDomainAnalyzer(ctx, initialKnownFunctions);
 
   // Iterative discovery
   size_t iteration = 0;
@@ -214,7 +627,7 @@ void discoverAllFunctions(CodegenContext& ctx) {
     lastFunctionCount = currentFunctionCount;
 
     auto knownFunctions = buildKnownFunctions(graph);
-    if (discoverPendingFunctions(ctx, knownFunctions) == 0) {
+    if (DiscoverPendingFunctions(ctx, knownFunctions, &entryDomainAnalyzer) == 0) {
       break;
     }
   }
@@ -254,7 +667,7 @@ void discoverAllFunctions(CodegenContext& ctx) {
         vtableIteration++;
 
         auto knownFunctions = buildKnownFunctions(graph);
-        if (discoverPendingFunctions(ctx, knownFunctions) == 0)
+        if (DiscoverPendingFunctions(ctx, knownFunctions, &entryDomainAnalyzer) == 0)
           break;
 
         if (graph.functionCount() == lastFunctionCount)
@@ -402,21 +815,25 @@ void functionPointerScan(CodegenContext& ctx) {
   REXCODEGEN_TRACE("functionPointerScan: found {} new function pointer targets", foundCount);
 }
 
+size_t DiscoverPendingFunctions(CodegenContext& ctx,
+                                const std::unordered_set<uint32_t>& knownFunctions,
+                                EntryRegisterDomainAnalyzer* entryDomainAnalyzer) {
+  std::vector<uint32_t> pending;
+  for (const auto& [addr, node] : ctx.graph.functions()) {
+    if (node->canDiscover())
+      pending.push_back(addr);
+  }
+  for (uint32_t funcAddr : pending)
+    discoverFunction(ctx, funcAddr, knownFunctions, entryDomainAnalyzer);
+  return pending.size();
+}
+
 }  // anonymous namespace
 
 /// Discover blocks for all pending functions (shared helper, declared in phase_helpers.h).
 size_t discoverPendingFunctions(CodegenContext& ctx,
                                 const std::unordered_set<uint32_t>& knownFunctions) {
-  std::vector<uint32_t> pending;
-  for (const auto& [addr, node] : ctx.graph.functions()) {
-    if (node->canDiscover()) {
-      pending.push_back(addr);
-    }
-  }
-  for (uint32_t funcAddr : pending) {
-    discoverFunction(ctx, funcAddr, knownFunctions);
-  }
-  return pending.size();
+  return DiscoverPendingFunctions(ctx, knownFunctions, nullptr);
 }
 
 namespace phases {

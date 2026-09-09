@@ -57,12 +57,19 @@ bool Instruction::is_return() const {
 }
 
 bool Instruction::is_indirect_branch() const {
-  return opcode == Opcode::bclr || opcode == Opcode::bcctr;
+  return opcode == Opcode::bclr || opcode == Opcode::bclrl || opcode == Opcode::bcctr ||
+         opcode == Opcode::bcctrl;
 }
 
 bool Instruction::is_record_form() const {
   switch (format) {
     case InstrFormat::kX:
+      // VMX128 uses X-form field aliases for encodings whose low bit is part
+      // of the extended vector opcode/register selection, not the scalar Rc
+      // bit. Treating that bit as Rc makes ordinary vector loads/stores look
+      // like condition-register definitions.
+      if (get_opcode_info(opcode).group == OpcodeGroup::kVector)
+        return false;
       return X.Rc != 0;
     case InstrFormat::kXO:
       return XO.Rc != 0;
@@ -171,6 +178,7 @@ Instruction::Semantics Instruction::get_semantics() const {
       case Opcode::lwzu:
       case Opcode::ld:
       case Opcode::ldu:
+      case Opcode::lwa:
         sem.reads_memory = true;
         break;
       case Opcode::stb:

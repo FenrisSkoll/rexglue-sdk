@@ -15,6 +15,7 @@
 
 #include <rex/assert.h>
 #include <rex/dbg.h>
+#include <rex/fault_walk.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/memory.h>
@@ -35,8 +36,14 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+  if (rex::diagnostics::FaultWalkHandleInvalidFunction(ctx)) {
+    return;
+  }
+  const uint32_t guest_lr = static_cast<uint32_t>(ctx.lr);
+  REX_FATAL(
+      "Call to invalid or unregistered function: target=0x{:08X}, ctx.lr=0x{:08X}, "
+      "probable caller=0x{:08X}, ctx.ctr=0x{:08X}",
+      ctx.last_indirect_target, guest_lr, guest_lr - 4, ctx.ctr.u32);
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {

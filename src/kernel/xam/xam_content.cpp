@@ -10,6 +10,7 @@
  */
 
 #include <rex/cvar.h>
+#include <fmt/format.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -17,6 +18,7 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/save_trace.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xtypes.h>
@@ -76,6 +78,19 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
   }
 
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+  const bool save_trace = content_type == uint32_t(XContentType::kSavedGame) &&
+                          SaveTrace::Get().enabled();
+  uint64_t trace_request = 0;
+  if (save_trace) {
+    trace_request = SaveTrace::Get().Record(
+        "XamContentCreateEnumerator", "request",
+        {{"user_index", uint64_t(user_index)},
+         {"device_id", uint64_t(device_id)},
+         {"content_type", uint64_t(content_type)},
+         {"content_flags", uint64_t(content_flags)},
+         {"items_per_enumerate", uint64_t(items_per_enumerate)},
+         {"profile_xuid", fmt::format("{:016X}", xuid)}});
+  }
 
   auto e = make_object<XStaticEnumerator<XCONTENT_DATA>>(REX_KERNEL_STATE(), items_per_enumerate);
   auto result = e->Initialize(0xFF, 0xFE, 0x20005, 0x20007, 0);
@@ -110,6 +125,13 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
   REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
 
   *handle_out = e->handle();
+  if (save_trace) {
+    SaveTrace::Get().Record("XamContentCreateEnumerator", "result",
+                            {{"request_sequence", trace_request},
+                             {"handle", uint64_t(e->handle())},
+                             {"item_count", uint64_t(e->item_count())},
+                             {"result", uint64_t(X_ERROR_SUCCESS)}});
+  }
   return X_ERROR_SUCCESS;
 }
 
@@ -136,14 +158,38 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
   }
 
   auto content_manager = REX_KERNEL_STATE()->content_manager();
+  const bool save_trace = content_data.content_type == XContentType::kSavedGame &&
+                          SaveTrace::Get().enabled();
+  const uint32_t overlapped_address = overlapped_ptr.guest_address();
+  uint64_t trace_request = 0;
+  if (save_trace) {
+    trace_request = SaveTrace::Get().Record(
+        "XamContentCreate", "request",
+        {{"user_index", uint64_t(user_index)},
+         {"root_name", root_name.value()},
+         {"device_id", uint64_t(content_data.device_id)},
+         {"content_type",
+          uint64_t(static_cast<XContentType>(content_data.content_type))},
+         {"title_id", uint64_t(content_data.title_id)},
+         {"content_xuid", fmt::format("{:016X}", uint64_t(content_data.xuid))},
+         {"profile_xuid", fmt::format("{:016X}", xuid)},
+         {"file_name", content_data.file_name()},
+         {"flags", uint64_t(flags)},
+         {"cache_size", uint64_t(cache_size)},
+         {"content_size", uint64_t(content_size)},
+         {"overlapped", uint64_t(overlapped_address)}});
+    if (overlapped_address) {
+      SaveTrace::Get().TrackOverlapped(overlapped_address, "XamContentCreate", trace_request);
+    }
+  }
 
   if (overlapped_ptr && disposition_ptr) {
     *disposition_ptr = 0;
   }
 
   auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
-              disposition_ptr,
-              license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+              disposition_ptr, license_mask_ptr, save_trace,
+              trace_request](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
     switch (flags & 0xF) {
@@ -226,6 +272,17 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);
+    if (save_trace) {
+      SaveTrace::Get().Record(
+          "XamContentCreate", "operation_result",
+          {{"request_sequence", trace_request},
+           {"root_name", root_name},
+           {"host_path", rex::path_to_utf8(content_manager->GetOpenPackagePath(root_name))},
+           {"disposition", uint64_t(disposition)},
+           {"result", uint64_t(result)},
+           {"extended_error", uint64_t(extended_error)},
+           {"length", uint64_t(length)}});
+    }
     return result;
   };
 
@@ -234,6 +291,11 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     return run(extended_error, length);
   } else {
     REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, overlapped_ptr.guest_address());
+    if (save_trace) {
+      SaveTrace::Get().Record("XamContentCreate", "immediate_result",
+                              {{"request_sequence", trace_request},
+                               {"result", uint64_t(X_ERROR_IO_PENDING)}});
+    }
     return X_ERROR_IO_PENDING;
   }
 }
@@ -269,7 +331,23 @@ u32 XamContentOpenFile_entry(u32 user_index, mapped_string root_name, mapped_str
 }
 
 u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
-  X_RESULT result = X_ERROR_SUCCESS;
+  const auto root = root_name.value();
+  const bool save_trace = SaveTrace::Get().enabled();
+  const uint32_t overlapped_address = overlapped_ptr.guest_address();
+  const uint64_t trace_request =
+      save_trace
+          ? SaveTrace::Get().Record("XamContentFlush", "request",
+                                    {{"root_name", root},
+                                     {"overlapped", uint64_t(overlapped_address)}})
+          : 0;
+  if (save_trace && overlapped_address) {
+    SaveTrace::Get().TrackOverlapped(overlapped_address, "XamContentFlush", trace_request);
+  }
+  X_RESULT result = REX_KERNEL_STATE()->content_manager()->FlushContent(root);
+  if (save_trace) {
+    SaveTrace::Get().Record("XamContentFlush", "operation_result",
+                            {{"request_sequence", trace_request}, {"result", uint64_t(result)}});
+  }
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
     return X_ERROR_IO_PENDING;
@@ -280,7 +358,26 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
-  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+  const auto root = root_name.value();
+  const bool save_trace = SaveTrace::Get().enabled();
+  const uint32_t overlapped_address = overlapped_ptr.guest_address();
+  const auto host_path =
+      rex::path_to_utf8(REX_KERNEL_STATE()->content_manager()->GetOpenPackagePath(root));
+  const uint64_t trace_request =
+      save_trace
+          ? SaveTrace::Get().Record("XamContentClose", "request",
+                                    {{"root_name", root},
+                                     {"host_path", host_path},
+                                     {"overlapped", uint64_t(overlapped_address)}})
+          : 0;
+  if (save_trace && overlapped_address) {
+    SaveTrace::Get().TrackOverlapped(overlapped_address, "XamContentClose", trace_request);
+  }
+  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root);
+  if (save_trace) {
+    SaveTrace::Get().Record("XamContentClose", "operation_result",
+                            {{"request_sequence", trace_request}, {"result", uint64_t(result)}});
+  }
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);

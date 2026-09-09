@@ -290,6 +290,11 @@ X_STATUS XFile::SetLength(size_t length) {
   return file_->SetLength(length);
 }
 
+X_STATUS XFile::Flush() {
+  std::lock_guard<std::mutex> lock(file_lock_);
+  return file_->Flush();
+}
+
 X_STATUS XFile::Rename(const std::filesystem::path& file_path) {
   std::lock_guard<std::mutex> lock(file_lock_);
   return entry()->Rename(file_path);

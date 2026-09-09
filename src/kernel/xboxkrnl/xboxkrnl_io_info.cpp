@@ -21,6 +21,7 @@
 #include <rex/system/info/file.h>
 #include <rex/system/info/volume.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/save_trace.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xfile.h>
@@ -247,6 +248,19 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     return X_STATUS_INVALID_HANDLE;
   }
 
+  const bool save_trace =
+      IsSaveGuestPath(file->entry()->absolute_path()) && SaveTrace::Get().enabled();
+  const uint64_t trace_request =
+      save_trace
+          ? SaveTrace::Get().Record(
+                "NtSetInformationFile", "request",
+                {{"guest_path", file->entry()->absolute_path()},
+                 {"host_path", SaveTraceHostPath(file->file())},
+                 {"handle", uint64_t(file_handle)},
+                 {"information_class", uint64_t(info_class)},
+                 {"information_length", uint64_t(info_length)}})
+          : 0;
+
   X_STATUS result = X_STATUS_SUCCESS;
   uint32_t out_length;
 
@@ -293,6 +307,11 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     case XFileRenameInformation: {
       auto info = info_ptr.as<X_FILE_RENAME_INFORMATION*>();
       auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), &info->ansi_string);
+      if (save_trace) {
+        SaveTrace::Get().Record("NtSetInformationFile", "rename_target",
+                                {{"request_sequence", trace_request},
+                                 {"target_guest_path", target_path}});
+      }
       if (!IsValidPath(target_path, false)) {
         return X_STATUS_OBJECT_NAME_INVALID;
       }
@@ -308,6 +327,11 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     }
     case XFileAllocationInformation: {
       auto info = info_ptr.as<X_FILE_ALLOCATION_INFORMATION*>();
+      if (save_trace) {
+        SaveTrace::Get().Record("NtSetInformationFile", "set_length",
+                                {{"request_sequence", trace_request},
+                                 {"length", uint64_t(info->allocation_size)}});
+      }
       result = file->SetLength(info->allocation_size);
       out_length = sizeof(*info);
 
@@ -317,6 +341,11 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     }
     case XFileEndOfFileInformation: {
       auto info = info_ptr.as<X_FILE_END_OF_FILE_INFORMATION*>();
+      if (save_trace) {
+        SaveTrace::Get().Record("NtSetInformationFile", "set_length",
+                                {{"request_sequence", trace_request},
+                                 {"length", uint64_t(info->end_of_file)}});
+      }
       result = file->SetLength(info->end_of_file);
       out_length = sizeof(*info);
 
@@ -348,6 +377,14 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
   if (io_status_block) {
     io_status_block->status = result;
     io_status_block->information = out_length;
+  }
+
+  if (save_trace) {
+    SaveTrace::Get().Record("NtSetInformationFile", "result",
+                            {{"request_sequence", trace_request},
+                             {"information_class", uint64_t(info_class)},
+                             {"result", uint64_t(result)},
+                             {"information", uint64_t(out_length)}});
   }
 
   return result;

@@ -102,7 +102,7 @@ class FileHandle {
   virtual bool SetLength(size_t length) = 0;
 
   // Flushes any pending write buffers to the underlying filesystem.
-  virtual void Flush() = 0;
+  virtual bool Flush() = 0;
 
  protected:
   explicit FileHandle(const std::filesystem::path& path) : path_(path) {}

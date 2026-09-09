@@ -166,7 +166,7 @@ class Win32FileHandle : public FileHandle {
     }
     return true;
   }
-  void Flush() override { FlushFileBuffers(handle_); }
+  bool Flush() override { return FlushFileBuffers(handle_) != FALSE; }
 
  private:
   HANDLE handle_ = nullptr;

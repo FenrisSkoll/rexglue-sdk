@@ -14,6 +14,7 @@
 #include <rex/string.h>
 #include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/save_trace.h>
 
 #include <imgui.h>
 
@@ -507,13 +508,42 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
                 uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
                 uint64_t(total_requested), device_id_ptr.guest_address(),
                 overlapped.guest_address());
-  return xeXamDispatchHeadless(
-      [device_id_ptr]() -> X_RESULT {
+  const bool save_trace = content_type == uint32_t(XContentType::kSavedGame) &&
+                          SaveTrace::Get().enabled();
+  const uint32_t overlapped_address = overlapped.guest_address();
+  const uint64_t trace_request =
+      save_trace
+          ? SaveTrace::Get().Record(
+                "XamShowDeviceSelectorUI", "request",
+                {{"user_index", uint64_t(user_index)},
+                 {"content_type", uint64_t(content_type)},
+                 {"content_flags", uint64_t(content_flags)},
+                 {"total_requested", uint64_t(total_requested)},
+                 {"overlapped", uint64_t(overlapped_address)}})
+          : 0;
+  if (save_trace && overlapped_address) {
+    SaveTrace::Get().TrackOverlapped(overlapped_address, "XamShowDeviceSelectorUI",
+                                     trace_request);
+  }
+  const auto result = xeXamDispatchHeadless(
+      [device_id_ptr, save_trace, trace_request]() -> X_RESULT {
         // NOTE: 0x00000001 is our dummy device ID from xam_content.cc
         *device_id_ptr = 0x00000001;
+        if (save_trace) {
+          SaveTrace::Get().Record("XamShowDeviceSelectorUI", "operation_result",
+                                  {{"request_sequence", trace_request},
+                                   {"device_id", uint64_t(1)},
+                                   {"result", uint64_t(X_ERROR_SUCCESS)}});
+        }
         return X_ERROR_SUCCESS;
       },
-      overlapped.guest_address());
+      overlapped_address);
+  if (save_trace) {
+    SaveTrace::Get().Record("XamShowDeviceSelectorUI", "immediate_result",
+                            {{"request_sequence", trace_request},
+                             {"result", uint64_t(result)}});
+  }
+  return result;
 }
 
 void XamShowDirtyDiscErrorUI_entry(u32 user_index) {

@@ -12,6 +12,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/filesystem.h>
+#include <rex/platform.h>
+
+#if REX_PLATFORM_WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 using rex::filesystem::FileAccess;
 using rex::filesystem::FileHandle;
@@ -20,11 +27,20 @@ namespace {
 
 constexpr std::string_view kPayload = "rexglue";
 
+int CurrentProcessId() {
+#if REX_PLATFORM_WIN32
+  return _getpid();
+#else
+  return getpid();
+#endif
+}
+
 class ScopedTempFile {
  public:
   ScopedTempFile() {
     path_ = std::filesystem::temp_directory_path() /
-            ("rexglue_filesystem_test_" + std::to_string(counter_++) + ".bin");
+            ("rexglue_filesystem_test_" + std::to_string(CurrentProcessId()) + "_" +
+             std::to_string(counter_++) + ".bin");
     FILE* file = rex::filesystem::OpenFile(path_, "wb");
     REQUIRE(file != nullptr);
     fwrite(kPayload.data(), 1, kPayload.size(), file);
@@ -103,7 +119,7 @@ TEST_CASE("OpenExisting write-only handle writes at the requested offset", "[fil
   size_t bytes_written = 0;
   REQUIRE(handle->Write(1, &patch, 1, &bytes_written));
   CHECK(bytes_written == 1);
-  handle->Flush();
+  REQUIRE(handle->Flush());
   handle.reset();
 
   auto reader = FileHandle::OpenExisting(temp.path(), FileAccess::kGenericRead);
@@ -124,4 +140,47 @@ TEST_CASE("OpenExisting failed read reports zero bytes", "[filesystem]") {
   size_t bytes_read = 0xDEAD;
   CHECK_FALSE(handle->Read(0, buffer.data(), buffer.size(), &bytes_read));
   CHECK(bytes_read == 0);
+}
+
+TEST_CASE("OpenExisting write handle truncates and flushes durably", "[filesystem]") {
+  ScopedTempFile temp;
+  auto handle =
+      FileHandle::OpenExisting(temp.path(), FileAccess::kGenericWrite | FileAccess::kFileWriteData);
+  REQUIRE(handle != nullptr);
+
+  REQUIRE(handle->SetLength(3));
+  REQUIRE(handle->Flush());
+  handle.reset();
+
+  CHECK(std::filesystem::file_size(temp.path()) == 3);
+  auto reader = FileHandle::OpenExisting(temp.path(), FileAccess::kGenericRead);
+  REQUIRE(reader != nullptr);
+  std::array<uint8_t, 8> buffer{};
+  size_t bytes_read = 0;
+  REQUIRE(reader->Read(0, buffer.data(), 3, &bytes_read));
+  CHECK(bytes_read == 3);
+  CHECK(std::string_view(reinterpret_cast<char*>(buffer.data()), bytes_read) == "rex");
+}
+
+TEST_CASE("OpenExisting supports extending after an explicit-offset write", "[filesystem]") {
+  ScopedTempFile temp;
+  auto handle =
+      FileHandle::OpenExisting(temp.path(), FileAccess::kGenericWrite | FileAccess::kFileWriteData);
+  REQUIRE(handle != nullptr);
+
+  const std::array<uint8_t, 3> suffix{'e', 'n', 'd'};
+  size_t bytes_written = 0;
+  REQUIRE(handle->Write(16, suffix.data(), suffix.size(), &bytes_written));
+  REQUIRE(bytes_written == suffix.size());
+  REQUIRE(handle->Flush());
+  handle.reset();
+
+  CHECK(std::filesystem::file_size(temp.path()) == 19);
+  auto reader = FileHandle::OpenExisting(temp.path(), FileAccess::kGenericRead);
+  REQUIRE(reader != nullptr);
+  std::array<uint8_t, 3> buffer{};
+  size_t bytes_read = 0;
+  REQUIRE(reader->Read(16, buffer.data(), buffer.size(), &bytes_read));
+  CHECK(bytes_read == suffix.size());
+  CHECK(buffer == suffix);
 }

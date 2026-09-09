@@ -69,6 +69,7 @@ enum class Opcode : uint16_t {
   lwzx,  // Load word and zero indexed
   ld,    // Load double-word
   ldu,   // Load double-word with update
+  lwa,   // Load word algebraic
   ldx,   // Load double-word indexed
 
   // Store instructions
@@ -124,6 +125,7 @@ enum class Opcode : uint16_t {
   srw,     // Shift right word
   sraw,    // Shift right algebraic word
   srawi,   // Shift right algebraic word immediate
+  rlwimi,  // Rotate left word immediate then mask insert
   rlwinm,  // Rotate left word immediate then AND with mask
   rlwnm,   // Rotate left word then AND with mask
   cntlzw,  // Count leading zeros word
@@ -131,6 +133,7 @@ enum class Opcode : uint16_t {
   // Sign/zero extension
   extsb,  // Extend sign byte
   extsh,  // Extend sign halfword
+  extsw,  // Extend sign word
 
   // Comparison
   cmp,    // Compare
