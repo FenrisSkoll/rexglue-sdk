@@ -53,6 +53,7 @@ struct Scratch {
 TEST_CASE("Loaded codegen implementation paths are real files", "[output_stamp]") {
   auto inputs = CodegenImplementationPaths();
   REQUIRE(inputs.size() == 2);
+  CHECK_FALSE(fs::equivalent(inputs[0], inputs[1]));
   for (const auto& input : inputs)
     CHECK(fs::is_regular_file(input));
   CHECK_FALSE(ComputeInputFingerprint(inputs, "sdk", {}).empty());

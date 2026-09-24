@@ -88,6 +88,8 @@ add_library(rexcodegen STATIC
     ${CODEGEN_BUILDER_SOURCES}
 )
 add_library(rex::codegen ALIAS rexcodegen)
+target_compile_definitions(rexcodegen PRIVATE
+    REXGLUE_RUNTIME_FILENAME="$<TARGET_FILE_NAME:rexruntime>")
 add_dependencies(rexcodegen embed_templates)
 
 rex_target_pch(rexcodegen <rex/codegen/function_types.h>)

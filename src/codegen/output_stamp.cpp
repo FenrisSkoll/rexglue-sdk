@@ -19,6 +19,7 @@
 
 #include <rex/hash.h>
 #include <rex/filesystem.h>
+#include <rex/system/xex_module.h>
 #if REX_PLATFORM_WIN32
 #include <windows.h>
 #else
@@ -35,10 +36,12 @@ std::vector<std::filesystem::path> CodegenImplementationPaths() {
   // _get_wpgmptr in a DLL's static CRT may be uninitialized. Ask the loader.
   wchar_t executable[32768]{};
   wchar_t library[32768]{};
-  HMODULE module = nullptr;
-  if (!GetModuleHandleExW(
-          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-          reinterpret_cast<LPCWSTR>(&rex::hash_bytes), &module))
+  // A function address may name a static core copy or an import thunk in the
+  // EXE. Identify the loaded DLL by the actual CMake target filename (including
+  // configuration postfix), then ask the loader for its full path.
+  const auto runtimeName = std::filesystem::path(REXGLUE_RUNTIME_FILENAME).wstring();
+  const auto module = GetModuleHandleW(runtimeName.c_str());
+  if (!module || module == GetModuleHandleW(nullptr))
     return {};
   const auto exeSize = GetModuleFileNameW(nullptr, executable, 32768);
   const auto libSize = GetModuleFileNameW(module, library, 32768);
@@ -48,7 +51,8 @@ std::vector<std::filesystem::path> CodegenImplementationPaths() {
 #else
   Dl_info info{};
   auto executable = rex::filesystem::GetExecutablePath();
-  if (executable.empty() || !dladdr(reinterpret_cast<void*>(&rex::hash_bytes), &info) ||
+  if (executable.empty() ||
+      !dladdr(reinterpret_cast<void*>(&rex::runtime::XexModule::GetSecurityInfo), &info) ||
       !info.dli_fname)
     return {};
   return {executable, std::filesystem::canonical(info.dli_fname)};
