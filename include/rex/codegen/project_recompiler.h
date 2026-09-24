@@ -29,8 +29,7 @@ struct ProjectRecompilerOptions {
   /// Bypass the stamp gate and regenerate every targeted module.
   bool ignoreStamp = false;
 
-  /// Folded into the input fingerprint. Must be stable across commits
-  /// ("0.10.0-dev") or every SDK rebuild forces a full re-analysis.
+  /// Folded into the input fingerprint in addition to executable content identity.
   std::string sdkVersion;
 };
 

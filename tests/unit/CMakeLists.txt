@@ -25,6 +25,16 @@ add_executable(unit_tests
     codegen/output_stamp_test.cpp
 )
 
+add_executable(codegen_dependency_fixture codegen/dependency_fixture.cpp)
+target_link_libraries(codegen_dependency_fixture PRIVATE rexcodegen)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME codegen_dependency_scheduler
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/codegen/dependency_scheduler_test.py
+            $<TARGET_FILE:codegen_dependency_fixture>)
+endif()
+
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp

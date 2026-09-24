@@ -12,12 +12,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <algorithm>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <vector>
 
 #include <rex/codegen/config.h>
+#include <rex/codegen/manifest.h>
 #include <rex/codegen/output_stamp.h>
 
 namespace fs = std::filesystem;
@@ -47,6 +49,82 @@ struct Scratch {
 };
 
 }  // namespace
+
+TEST_CASE("Loaded codegen implementation paths are real files", "[output_stamp]") {
+  auto inputs = CodegenImplementationPaths();
+  REQUIRE(inputs.size() == 2);
+  for (const auto& input : inputs)
+    CHECK(fs::is_regular_file(input));
+  CHECK_FALSE(ComputeInputFingerprint(inputs, "sdk", {}).empty());
+}
+
+TEST_CASE("Optional sibling delta participates in executable identity", "[output_stamp]") {
+  Scratch scratch("delta_identity");
+  auto binary = scratch.WriteFile("module.xex", "unchanged base");
+  auto inputs = ExecutableInputPaths(binary);
+  auto patch = scratch.root / "module.xexp";
+  REQUIRE(std::find(inputs.begin(), inputs.end(), patch) != inputs.end());
+  const auto absent = ComputeInputFingerprint(inputs, "sdk", {});
+  scratch.WriteFile("module.xexp", "delta one");
+  const auto first = ComputeInputFingerprint(inputs, "sdk", {});
+  CHECK(first != absent);
+  scratch.WriteFile("module.xexp", "delta two");
+  const auto second = ComputeInputFingerprint(inputs, "sdk", {});
+  CHECK(second != first);
+  CHECK(second == ComputeInputFingerprint(inputs, "sdk", {}));
+  fs::remove(patch);
+  CHECK(absent == ComputeInputFingerprint(inputs, "sdk", {}));
+}
+
+TEST_CASE("Absent delta has an existence watch without a perpetually missing dependency",
+          "[output_stamp]") {
+  Scratch scratch("delta_schedule");
+  auto binary = scratch.WriteFile("other.xex", "base");
+  auto inputs = ExecutableInputPaths(binary);
+  auto deps = ExistingInputDependencies(inputs);
+  auto patch = scratch.root / "other.xexp";
+  CHECK(std::find(deps.begin(), deps.end(), patch) == deps.end());
+  CHECK(std::find(deps.begin(), deps.end(), scratch.root) == deps.end());
+  auto cmake = scratch.root / "codegen.inputs.cmake";
+  REQUIRE(WriteInputDependencies(cmake, inputs));
+  std::ifstream in(cmake);
+  const std::string content(std::istreambuf_iterator<char>(in), {});
+  CHECK(content.find("CONFIGURE_DEPENDS") != std::string::npos);
+  CHECK(content.find(patch.generic_string()) != std::string::npos);
+  scratch.WriteFile("other.xexp", "patch");
+  deps = ExistingInputDependencies(inputs);
+  CHECK(std::find(deps.begin(), deps.end(), patch) != deps.end());
+  CHECK(std::find(deps.begin(), deps.end(), scratch.root) == deps.end());
+}
+
+TEST_CASE("Tool content participates independently of SDK version", "[output_stamp]") {
+  Scratch scratch("tool_identity");
+  auto binary = scratch.WriteFile("game.xex", "base");
+  auto tool = scratch.WriteFile("tool.exe", "implementation one");
+  auto inputs = ExecutableInputPaths(binary);
+  inputs.push_back(tool);
+  const auto first = ComputeInputFingerprint(inputs, "same-version", {});
+  scratch.WriteFile("tool.exe", "implementation two");
+  CHECK(first != ComputeInputFingerprint(inputs, "same-version", {}));
+}
+
+TEST_CASE("Ambiguous input identity cannot reuse outputs", "[output_stamp]") {
+  Scratch scratch("ambiguous_identity");
+  scratch.WriteFile("generated.cpp", "output");
+  OutputStamp stamp{"", {"generated.cpp"}};
+  CHECK_FALSE(OutputsAreUpToDate(stamp, "", scratch.root));
+}
+
+TEST_CASE("Matching SDK stamp preserves manifest bytes and write time", "[output_stamp]") {
+  Scratch scratch("manifest_noop");
+  const std::string content = "[project]\r\nsdk_version = \"0.10.0\"\r\nname = \"test\"\r\n";
+  auto manifest = scratch.WriteFile("manifest.toml", content);
+  const auto before = fs::last_write_time(manifest);
+  REQUIRE(ManifestConfig::WriteSdkVersionStamp(manifest, "0.10.0"));
+  CHECK(fs::last_write_time(manifest) == before);
+  std::ifstream in(manifest, std::ios::binary);
+  CHECK(std::string(std::istreambuf_iterator<char>(in), {}) == content);
+}
 
 TEST_CASE("Identical inputs produce identical fingerprints", "[output_stamp]") {
   Scratch scratch("stable");

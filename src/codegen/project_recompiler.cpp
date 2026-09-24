@@ -59,8 +59,7 @@ std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& c
                                                        const std::filesystem::path& manifestPath) {
   namespace fs = std::filesystem;
 
-  std::vector<fs::path> inputs;
-  inputs.push_back(configDir / cfg.filePath);
+  auto inputs = ExecutableInputPaths(configDir / cfg.filePath);
   inputs.push_back(manifestPath);
   for (const auto& loaded : cfg.loadedFiles) {
     inputs.emplace_back(loaded);
@@ -73,6 +72,7 @@ std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& c
     }
   }
   std::sort(inputs.begin(), inputs.end());
+  inputs.erase(std::unique(inputs.begin(), inputs.end()), inputs.end());
   return inputs;
 }
 
@@ -359,13 +359,30 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
   std::vector<std::string> fingerprints(contexts.size());
   std::vector<bool> skip(contexts.size(), false);
   std::vector<fs::path> allInputs;
+  const auto implementationInputs = CodegenImplementationPaths();
+  if (implementationInputs.empty())
+    return Err<void>(ErrorCategory::IO, "Could not identify codegen implementation files");
+  // Modules share the loader/export resolver. A changed DLL image can affect
+  // another module's emitted imports, so bind every loaded executable input.
+  std::vector<fs::path> executableInputs;
+  for (const auto& entry : contexts) {
+    const auto inputs = ExecutableInputPaths(entry.ctx.configDir() / entry.ctx.Config().filePath);
+    executableInputs.insert(executableInputs.end(), inputs.begin(), inputs.end());
+  }
 
   for (size_t i = 0; i < contexts.size(); ++i) {
     auto& entry = contexts[i];
     auto outDir = entry.ctx.configDir() / entry.ctx.Config().outDirectoryPath;
     auto inputs =
         CollectModuleInputs(entry.ctx.Config(), entry.ctx.configDir(), manifest_.manifestPath);
+    inputs.insert(inputs.end(), implementationInputs.begin(), implementationInputs.end());
+    inputs.insert(inputs.end(), executableInputs.begin(), executableInputs.end());
+    std::sort(inputs.begin(), inputs.end());
+    inputs.erase(std::unique(inputs.begin(), inputs.end()), inputs.end());
     fingerprints[i] = FingerprintModule(entry.ctx.Config(), inputs, opts.sdkVersion);
+    if (fingerprints[i].empty()) {
+      return Err<void>(ErrorCategory::IO, "Could not fingerprint codegen inputs");
+    }
     allInputs.insert(allInputs.end(), inputs.begin(), inputs.end());
 
     if (opts.ignoreStamp || opts.force)
@@ -464,7 +481,11 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     allInputs.erase(std::unique(allInputs.begin(), allInputs.end()), allInputs.end());
 
     auto buildStamp = fs::absolute(buildDir / kBuildStampFileName);
-    if (!WriteDepfile(buildDir / kDepfileName, buildStamp, allInputs)) {
+    const auto dependencies = ExistingInputDependencies(allInputs);
+    if (!WriteInputDependencies(buildDir / "codegen.inputs.cmake", allInputs)) {
+      return Err<void>(ErrorCategory::IO, "Failed to write codegen input existence watches");
+    }
+    if (!WriteDepfile(buildDir / kDepfileName, buildStamp, dependencies)) {
       return Err<void>(ErrorCategory::IO,
                        fmt::format("Failed to write {}", (buildDir / kDepfileName).string()));
     }

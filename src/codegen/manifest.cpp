@@ -223,6 +223,10 @@ bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
   }
 
   if (stamp_idx) {
+    // Do not dirty a codegen input after writing codegen.build.stamp when
+    // its version already matches. Preserve the original bytes and mtime.
+    if (lines[*stamp_idx] == stamp_line)
+      return true;
     lines[*stamp_idx] = stamp_line;
   } else if (project_header_idx) {
     lines.insert(lines.begin() + *project_header_idx + 1, stamp_line);

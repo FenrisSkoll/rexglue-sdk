@@ -114,10 +114,14 @@ endmacro()
 # codegen, including one a project assembles itself rather than taking the
 # library rexglue_setup_target() builds. The stamp comes first: the DEPFILE
 # names it.
+file(GLOB _REXGLUE_INPUT_MANIFEST CONFIGURE_DEPENDS
+    "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.inputs.cmake")
+include("{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.inputs.cmake" OPTIONAL)
 add_custom_command(
     OUTPUT "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
            {{ cmake_var("REXGLUE_ENTRYPOINT_GENERATED_SOURCES") }}
     COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
+    DEPENDS rex::rexglue {{ cmake_var("REXGLUE_CODEGEN_INPUTS") }}
     DEPFILE "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.d"
     WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
     COMMENT "Generating recompiled code for {{ names.snake_case }}"
