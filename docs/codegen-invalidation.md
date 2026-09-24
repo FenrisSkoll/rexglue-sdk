@@ -31,7 +31,9 @@ mtime.
 
 After upgrading an existing installation, run codegen once to refresh generated
 build glue and dependency metadata. Thereafter ordinary builds maintain both
-gates. The scheduler follows normal CMake/Ninja filesystem change detection;
+gates. If dependency metadata is subsequently deleted, configuration fails closed with
+instructions to restore it via direct codegen, rather than disabling watches.
+The scheduler follows normal CMake/Ninja filesystem change detection;
 deliberately restoring all timestamps after modifying files is outside that
 contract. Direct CLI invocations always compare content identities.
 

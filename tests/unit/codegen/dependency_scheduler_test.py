@@ -23,6 +23,10 @@ def main():
 project(dependency_fixture NONE)
 file(GLOB _REXGLUE_INPUT_MANIFEST CONFIGURE_DEPENDS "${{CMAKE_CURRENT_SOURCE_DIR}}/output/codegen.inputs.cmake")
 include("${{CMAKE_CURRENT_SOURCE_DIR}}/output/codegen.inputs.cmake" OPTIONAL)
+if(EXISTS "${{CMAKE_CURRENT_SOURCE_DIR}}/output/codegen.build.stamp"
+   AND NOT EXISTS "${{CMAKE_CURRENT_SOURCE_DIR}}/output/codegen.inputs.cmake")
+  message(FATAL_ERROR "Missing codegen dependency metadata")
+endif()
 add_custom_command(
   OUTPUT "${{CMAKE_CURRENT_SOURCE_DIR}}/output/codegen.build.stamp"
   COMMAND "{tool.as_posix()}" "${{CMAKE_CURRENT_SOURCE_DIR}}"
@@ -40,10 +44,11 @@ add_custom_target(generate ALL DEPENDS "${{CMAKE_CURRENT_SOURCE_DIR}}/output/cod
 
         run("cmake", "-S", str(root), "-B", str(root / "build"), "-G", "Ninja")
 
-        def build(expected):
+        def build(expected, generations=None):
             decision = run("cmake", "--build", str(root / "build"), "--", "-d", "explain")
             for name in ("invocations", "generations"):
-                assert len((root / name).read_text().splitlines()) == expected, (name, decision)
+                count = expected if name == "invocations" or generations is None else generations
+                assert len((root / name).read_text().splitlines()) == count, (name, decision)
             return (root / "output/image.identity").read_text()
 
         first = build(1)
@@ -59,8 +64,17 @@ add_custom_target(generate ALL DEPENDS "${{CMAKE_CURRENT_SOURCE_DIR}}/output/cod
         patch.write_bytes(b"delta two")
         assert second == build(4)
         assert second == build(4)
-        print(json.dumps({"status": "PASS", "invocations": 4, "generations": 4,
-                          "checks": ["XEXP change", "no-op", "remove", "absent no-op", "add", "restored no-op"]}))
+        (root / "output/codegen.inputs.cmake").unlink()
+        failed = subprocess.run(["cmake", "--build", str(root / "build")], capture_output=True, text=True)
+        assert failed.returncode != 0
+        assert "Missing codegen dependency metadata" in failed.stdout + failed.stderr
+        run(str(tool), str(root))  # documented metadata recovery, no retranslation
+        # A direct invocation changed the depfile completion time outside Ninja;
+        # Ninja imports it once more, but the content gate must not regenerate.
+        assert second == build(6, generations=4)
+        assert second == build(6, generations=4)
+        print(json.dumps({"status": "PASS", "invocations": 6, "generations": 4,
+                          "checks": ["XEXP change", "no-op", "remove", "absent no-op", "add", "restored no-op", "metadata repair"]}))
 
 
 if __name__ == "__main__":

@@ -117,6 +117,10 @@ endmacro()
 file(GLOB _REXGLUE_INPUT_MANIFEST CONFIGURE_DEPENDS
     "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.inputs.cmake")
 include("{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.inputs.cmake" OPTIONAL)
+if(EXISTS "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
+   AND NOT EXISTS "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.inputs.cmake")
+    message(FATAL_ERROR "Missing codegen dependency metadata; run rexglue codegen on the project manifest to restore it")
+endif()
 add_custom_command(
     OUTPUT "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
            {{ cmake_var("REXGLUE_ENTRYPOINT_GENERATED_SOURCES") }}
